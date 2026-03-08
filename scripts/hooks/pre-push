@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+remote_name="${1:-}"
+
+if [[ "${remote_name}" != "origin" ]]; then
+  exit 0
+fi
+
+ROOT_DIR="$(git rev-parse --show-toplevel)"
+release_script="${ROOT_DIR}/scripts/release/create-prerelease.sh"
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  if [[ "${local_ref}" == "refs/heads/main" && "${remote_ref}" == "refs/heads/main" ]]; then
+    if [[ "${local_sha}" == "0000000000000000000000000000000000000000" ]]; then
+      continue
+    fi
+    printf '[git-hook:pre-push] push to origin/main detected, creating prerelease\n'
+    bash "${release_script}"
+    break
+  fi
+done

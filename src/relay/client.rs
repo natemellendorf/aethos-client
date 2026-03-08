@@ -91,6 +91,7 @@ pub fn send_to_relay_v1(
 }
 
 #[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 pub fn send_to_relay_v1_with_auth(
     relay_ws: &str,
     wayfarer_id: &str,
@@ -296,7 +297,7 @@ fn send_json<T: serde::Serialize>(
 ) -> Result<(), String> {
     let text = serde_json::to_string(frame).map_err(|err| format!("json encode failed: {err}"))?;
     socket
-        .send(Message::Text(text.into()))
+        .send(Message::Text(text))
         .map_err(|err| format!("websocket send failed: {err}"))
 }
 

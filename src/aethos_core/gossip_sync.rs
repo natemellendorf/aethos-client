@@ -127,17 +127,9 @@ pub struct ImportTransferResult {
     pub new_messages: Vec<ImportedEnvelope>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct GossipStore {
     items: BTreeMap<String, StoredItem>,
-}
-
-impl Default for GossipStore {
-    fn default() -> Self {
-        Self {
-            items: BTreeMap::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

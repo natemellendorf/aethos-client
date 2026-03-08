@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(git rev-parse --show-toplevel)"
+cd "${ROOT_DIR}"
+
+printf '[git-hook:pre-commit] running project lint checks\n'
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings

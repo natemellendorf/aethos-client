@@ -11,7 +11,7 @@ use gtk4::{
     Popover, PositionType, ResponseType, Revealer, RevealerTransitionType, ScrolledWindow, Stack,
     StackSwitcher, TextView, STYLE_PROVIDER_PRIORITY_APPLICATION,
 };
-use image::{ImageBuffer, Luma, Rgba, RgbaImage};
+use image::{imageops::FilterType, ImageBuffer, Luma, Rgba, RgbaImage};
 use qrcode::QrCode;
 use serde_json::json;
 use std::cell::{Cell, RefCell};
@@ -23,7 +23,7 @@ use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
@@ -182,6 +182,8 @@ fn build_ui(app: &Application) {
     let app_settings = Rc::new(RefCell::new(initial_settings.clone()));
     let relay_sync_enabled = Arc::new(AtomicBool::new(initial_settings.relay_sync_enabled));
     let gossip_sync_enabled = Arc::new(AtomicBool::new(initial_settings.gossip_sync_enabled));
+    let gossip_last_activity_ms = Arc::new(AtomicU64::new(0));
+    let gossip_force_announce = Arc::new(AtomicBool::new(initial_settings.gossip_sync_enabled));
 
     let window = ApplicationWindow::builder()
         .application(app)
@@ -207,7 +209,6 @@ fn build_ui(app: &Application) {
     let relay_chip = GtkBox::new(Orientation::Horizontal, 6);
     relay_chip.add_css_class("relay-chip");
     relay_chip.set_halign(gtk4::Align::End);
-    relay_chip.set_hexpand(true);
     let relay_dot = Label::new(Some("*"));
     relay_dot.add_css_class("relay-dot");
     relay_dot.add_css_class("relay-dot-idle");
@@ -216,9 +217,23 @@ fn build_ui(app: &Application) {
     relay_chip.append(&relay_dot);
     relay_chip.append(&relay_chip_text);
 
+    let gossip_chip = GtkBox::new(Orientation::Horizontal, 6);
+    gossip_chip.add_css_class("gossip-chip");
+    let gossip_dot = Label::new(Some("*"));
+    gossip_dot.add_css_class("gossip-dot");
+    gossip_dot.add_css_class("gossip-dot-idle");
+    let gossip_chip_text = Label::new(Some("LAN Gossip: idle"));
+    gossip_chip_text.add_css_class("relay-chip-text");
+    gossip_chip.append(&gossip_dot);
+    gossip_chip.append(&gossip_chip_text);
+
     let top_bar = GtkBox::new(Orientation::Horizontal, 8);
+    let top_bar_spacer = GtkBox::new(Orientation::Horizontal, 0);
+    top_bar_spacer.set_hexpand(true);
     top_bar.set_hexpand(true);
     top_bar.append(&tab_switcher);
+    top_bar.append(&top_bar_spacer);
+    top_bar.append(&gossip_chip);
     top_bar.append(&relay_chip);
 
     let wave_strip = DrawingArea::new();
@@ -638,8 +653,8 @@ fn build_ui(app: &Application) {
 
     let footer_logo = Image::from_file("src/img/logo.png");
     footer_logo.add_css_class("footer-logo");
-    footer_logo.set_pixel_size(16);
-    footer_logo.set_size_request(16, 16);
+    footer_logo.set_pixel_size(22);
+    footer_logo.set_size_request(22, 22);
     footer_logo.set_hexpand(false);
     footer_logo.set_vexpand(false);
     footer_logo.set_halign(gtk4::Align::End);
@@ -677,7 +692,7 @@ fn build_ui(app: &Application) {
             if let Some(display) = Display::default() {
                 display
                     .clipboard()
-                    .set_text(&share_wayfarer_entry.text().to_string());
+                    .set_text(share_wayfarer_entry.text().as_ref());
                 show_copied_popover(&copy_wayfarer_popover_anchor);
             }
         });
@@ -698,6 +713,19 @@ fn build_ui(app: &Application) {
         );
     } else {
         update_relay_chip("idle", "idle", &relay_dot, &relay_chip_text, &relay_chip);
+    }
+
+    if !relay_sync_enabled.load(Ordering::SeqCst) {
+        relay_primary_label.set_text("Primary relay status: relay sync disabled in settings");
+        relay_secondary_label.set_text("Secondary relay status: relay sync disabled in settings");
+        set_relay_chip_disabled(&relay_dot, &relay_chip_text, &relay_chip);
+        connect_button.set_sensitive(false);
+    }
+
+    if gossip_sync_enabled.load(Ordering::SeqCst) {
+        set_gossip_chip_listening(&gossip_dot, &gossip_chip_text, &gossip_chip);
+    } else {
+        set_gossip_chip_disabled(&gossip_dot, &gossip_chip_text, &gossip_chip);
     }
 
     render_relay_list(
@@ -1524,11 +1552,32 @@ fn build_ui(app: &Application) {
     {
         let app_settings = Rc::clone(&app_settings);
         let relay_sync_enabled = Arc::clone(&relay_sync_enabled);
+        let relay_primary_label = relay_primary_label.clone();
+        let relay_secondary_label = relay_secondary_label.clone();
+        let relay_dot = relay_dot.clone();
+        let relay_chip_text = relay_chip_text.clone();
+        let relay_chip = relay_chip.clone();
+        let connect_button = connect_button.clone();
         relay_toggle.connect_toggled(move |toggle| {
-            let mut settings = app_settings.borrow_mut();
-            settings.relay_sync_enabled = toggle.is_active();
-            relay_sync_enabled.store(settings.relay_sync_enabled, Ordering::SeqCst);
-            if let Err(err) = save_app_settings(&settings) {
+            let settings_snapshot =
+                update_relay_sync_setting(&app_settings, &relay_sync_enabled, toggle.is_active());
+
+            if settings_snapshot.relay_sync_enabled {
+                relay_primary_label.set_text("Primary relay status: idle");
+                relay_secondary_label.set_text("Secondary relay status: idle");
+                update_relay_chip("idle", "idle", &relay_dot, &relay_chip_text, &relay_chip);
+                connect_button.set_sensitive(true);
+                connect_button.emit_clicked();
+            } else {
+                relay_primary_label
+                    .set_text("Primary relay status: relay sync disabled in settings");
+                relay_secondary_label
+                    .set_text("Secondary relay status: relay sync disabled in settings");
+                set_relay_chip_disabled(&relay_dot, &relay_chip_text, &relay_chip);
+                connect_button.set_sensitive(false);
+            }
+
+            if let Err(err) = save_app_settings(&settings_snapshot) {
                 append_local_log(&format!("save_settings_failed: {err}"));
             }
         });
@@ -1537,13 +1586,46 @@ fn build_ui(app: &Application) {
     {
         let app_settings = Rc::clone(&app_settings);
         let gossip_sync_enabled = Arc::clone(&gossip_sync_enabled);
+        let gossip_force_announce = Arc::clone(&gossip_force_announce);
+        let gossip_dot = gossip_dot.clone();
+        let gossip_chip_text = gossip_chip_text.clone();
+        let gossip_chip = gossip_chip.clone();
         gossip_toggle.connect_toggled(move |toggle| {
             let mut settings = app_settings.borrow_mut();
             settings.gossip_sync_enabled = toggle.is_active();
             gossip_sync_enabled.store(settings.gossip_sync_enabled, Ordering::SeqCst);
+            if settings.gossip_sync_enabled {
+                gossip_force_announce.store(true, Ordering::SeqCst);
+                set_gossip_chip_listening(&gossip_dot, &gossip_chip_text, &gossip_chip);
+            } else {
+                set_gossip_chip_disabled(&gossip_dot, &gossip_chip_text, &gossip_chip);
+            }
             if let Err(err) = save_app_settings(&settings) {
                 append_local_log(&format!("save_settings_failed: {err}"));
             }
+        });
+    }
+
+    {
+        let gossip_sync_enabled = Arc::clone(&gossip_sync_enabled);
+        let gossip_last_activity_ms = Arc::clone(&gossip_last_activity_ms);
+        let gossip_dot = gossip_dot.clone();
+        let gossip_chip_text = gossip_chip_text.clone();
+        let gossip_chip = gossip_chip.clone();
+        glib::timeout_add_local(Duration::from_millis(600), move || {
+            if !gossip_sync_enabled.load(Ordering::SeqCst) {
+                set_gossip_chip_disabled(&gossip_dot, &gossip_chip_text, &gossip_chip);
+                return glib::ControlFlow::Continue;
+            }
+
+            let now = now_unix_ms();
+            let last = gossip_last_activity_ms.load(Ordering::SeqCst);
+            if last > 0 && now.saturating_sub(last) < 6_000 {
+                set_gossip_chip_active(&gossip_dot, &gossip_chip_text, &gossip_chip);
+            } else {
+                set_gossip_chip_listening(&gossip_dot, &gossip_chip_text, &gossip_chip);
+            }
+            glib::ControlFlow::Continue
         });
     }
 
@@ -1938,7 +2020,12 @@ fn build_ui(app: &Application) {
         Arc::clone(&relay_sync_enabled),
         session_tx.clone(),
     );
-    start_background_gossip_sync(session_tx.clone(), Arc::clone(&gossip_sync_enabled));
+    start_background_gossip_sync(
+        session_tx.clone(),
+        Arc::clone(&gossip_sync_enabled),
+        Arc::clone(&gossip_last_activity_ms),
+        Arc::clone(&gossip_force_announce),
+    );
 
     window.present();
     force_initial_thread_bottom(messages_scroll, Rc::clone(&auto_scroll_locked));
@@ -2033,6 +2120,7 @@ fn spawn_relay_checks(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn attach_status_poller(
     rx: Receiver<RelayStatus>,
     connect_button: Button,
@@ -2106,6 +2194,8 @@ fn update_relay_chip(
     relay_dot.remove_css_class("relay-dot-ok");
     relay_dot.remove_css_class("relay-dot-warn");
     relay_dot.remove_css_class("relay-dot-down");
+    relay_dot.remove_css_class("relay-dot-disabled");
+    relay_chip.remove_css_class("relay-chip-disabled");
 
     let primary_ok = primary_status.contains("connected + hello_ok");
     let secondary_ok = secondary_status.contains("connected + hello_ok");
@@ -2137,6 +2227,50 @@ fn update_relay_chip(
     )));
 }
 
+fn set_relay_chip_disabled(relay_dot: &Label, relay_chip_text: &Label, relay_chip: &GtkBox) {
+    relay_dot.remove_css_class("relay-dot-idle");
+    relay_dot.remove_css_class("relay-dot-ok");
+    relay_dot.remove_css_class("relay-dot-warn");
+    relay_dot.remove_css_class("relay-dot-down");
+    relay_dot.remove_css_class("relay-dot-disabled");
+    relay_dot.add_css_class("relay-dot-disabled");
+    relay_chip.add_css_class("relay-chip-disabled");
+    relay_chip_text.set_text("Relays: disabled");
+    relay_chip.set_tooltip_text(Some("Relay sync is disabled in Settings"));
+}
+
+fn reset_gossip_chip_classes(gossip_dot: &Label, gossip_chip: &GtkBox) {
+    gossip_dot.remove_css_class("gossip-dot-idle");
+    gossip_dot.remove_css_class("gossip-dot-active");
+    gossip_dot.remove_css_class("gossip-dot-disabled");
+    gossip_chip.remove_css_class("gossip-chip-active");
+    gossip_chip.remove_css_class("gossip-chip-disabled");
+}
+
+fn set_gossip_chip_listening(gossip_dot: &Label, gossip_chip_text: &Label, gossip_chip: &GtkBox) {
+    reset_gossip_chip_classes(gossip_dot, gossip_chip);
+    gossip_dot.add_css_class("gossip-dot-idle");
+    gossip_chip_text.set_text("LAN Gossip: listening");
+    gossip_chip.set_tooltip_text(Some("LAN gossip is enabled and listening"));
+}
+
+fn set_gossip_chip_active(gossip_dot: &Label, gossip_chip_text: &Label, gossip_chip: &GtkBox) {
+    reset_gossip_chip_classes(gossip_dot, gossip_chip);
+    gossip_dot.add_css_class("gossip-dot-active");
+    gossip_chip.add_css_class("gossip-chip-active");
+    gossip_chip_text.set_text("LAN Gossip: active");
+    gossip_chip.set_tooltip_text(Some("Recent LAN gossip activity detected"));
+}
+
+fn set_gossip_chip_disabled(gossip_dot: &Label, gossip_chip_text: &Label, gossip_chip: &GtkBox) {
+    reset_gossip_chip_classes(gossip_dot, gossip_chip);
+    gossip_dot.add_css_class("gossip-dot-disabled");
+    gossip_chip.add_css_class("gossip-chip-disabled");
+    gossip_chip_text.set_text("LAN Gossip: disabled");
+    gossip_chip.set_tooltip_text(Some("LAN gossip is disabled in Settings"));
+}
+
+#[allow(clippy::too_many_arguments)]
 fn attach_session_poller(
     rx: Receiver<SessionStatus>,
     send_button: Button,
@@ -2429,6 +2563,8 @@ fn sync_inbox_once(relay_http: &str) -> Result<Vec<PulledMessagePreview>, String
 fn start_background_gossip_sync(
     session_tx: Sender<SessionStatus>,
     gossip_sync_enabled: Arc<AtomicBool>,
+    gossip_last_activity_ms: Arc<AtomicU64>,
+    gossip_force_announce: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
         let socket = match UdpSocket::bind(("0.0.0.0", GOSSIP_LAN_PORT)) {
@@ -2465,7 +2601,8 @@ fn start_background_gossip_sync(
                 continue;
             }
 
-            if last_inventory_broadcast.elapsed() >= Duration::from_secs(3) {
+            let force_announce = gossip_force_announce.swap(false, Ordering::SeqCst);
+            if force_announce || last_inventory_broadcast.elapsed() >= Duration::from_secs(3) {
                 if let Ok(identity) = ensure_local_identity() {
                     seq = seq.saturating_add(1);
                     let session_id = gossip_id("sess", seq);
@@ -2481,6 +2618,7 @@ fn start_background_gossip_sync(
                         },
                     );
                     let _ = send_gossip_frame(&socket, "255.255.255.255", GOSSIP_LAN_PORT, &frame);
+                    gossip_last_activity_ms.store(now_unix_ms(), Ordering::SeqCst);
                 }
                 last_inventory_broadcast = Instant::now();
             }
@@ -2488,6 +2626,7 @@ fn start_background_gossip_sync(
             let mut buf = [0u8; 65_535];
             match socket.recv_from(&mut buf) {
                 Ok((len, source)) => {
+                    gossip_last_activity_ms.store(now_unix_ms(), Ordering::SeqCst);
                     let frame = match parse_gossip_frame(&buf[..len]) {
                         Ok(frame) => frame,
                         Err(err) => {
@@ -2550,6 +2689,7 @@ fn start_background_gossip_sync(
                                 source.port(),
                                 &request,
                             );
+                            gossip_last_activity_ms.store(now_unix_ms(), Ordering::SeqCst);
                         }
                         GossipSyncFrame::MissingRequest(req)
                             if req.sender_wayfarer_id != local_wayfarer =>
@@ -2581,6 +2721,7 @@ fn start_background_gossip_sync(
                                 source.port(),
                                 &transfer,
                             );
+                            gossip_last_activity_ms.store(now_unix_ms(), Ordering::SeqCst);
                         }
                         GossipSyncFrame::Transfer(transfer)
                             if transfer.sender_wayfarer_id != local_wayfarer =>
@@ -2653,6 +2794,7 @@ fn start_background_gossip_sync(
                                     source.port(),
                                     &receipt,
                                 );
+                                gossip_last_activity_ms.store(now_unix_ms(), Ordering::SeqCst);
                             }
                         }
                         GossipSyncFrame::Receipt(receipt)
@@ -2850,7 +2992,8 @@ fn render_contacts(
         title.set_single_line_mode(true);
         title.add_css_class("contact-title");
 
-        let subtitle = Label::new(Some(&format!("{}", tiny_wayfarer(&contact))));
+        let subtitle_text = tiny_wayfarer(&contact);
+        let subtitle = Label::new(Some(&subtitle_text));
         subtitle.set_xalign(0.0);
         subtitle.set_ellipsize(EllipsizeMode::End);
         subtitle.set_width_chars(20);
@@ -3034,6 +3177,7 @@ fn attach_compact_adaptive_mode(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_messages(
     state: &ChatState,
     messages_list: &ListBox,
@@ -3493,17 +3637,31 @@ fn ensure_linux_desktop_integration() -> Result<(), String> {
             .map_err(|_| "HOME not set for desktop integration".to_string())?;
 
         let applications_dir = Path::new(&home).join(".local/share/applications");
-        let icon_dir = Path::new(&home).join(".local/share/icons/hicolor/256x256/apps");
+        let icon_root = Path::new(&home).join(".local/share/icons/hicolor");
 
         fs::create_dir_all(&applications_dir)
             .map_err(|err| format!("failed creating applications dir: {err}"))?;
-        fs::create_dir_all(&icon_dir).map_err(|err| format!("failed creating icon dir: {err}"))?;
 
-        let icon_target = icon_dir.join(format!("{}.png", APP_ID));
         let icon_source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/img/logo.png");
         if icon_source.exists() {
-            fs::copy(&icon_source, &icon_target)
-                .map_err(|err| format!("failed to copy app icon into icon theme path: {err}"))?;
+            let image = image::open(&icon_source)
+                .map_err(|err| format!("failed to decode app icon source: {err}"))?;
+            let icon_sizes: [u32; 9] = [16, 24, 32, 48, 64, 96, 128, 256, 512];
+
+            for size in icon_sizes {
+                let icon_dir = icon_root.join(format!("{size}x{size}/apps"));
+                fs::create_dir_all(&icon_dir).map_err(|err| {
+                    format!("failed creating icon dir {}: {err}", icon_dir.display())
+                })?;
+                let icon_target = icon_dir.join(format!("{}.png", APP_ID));
+                let resized = image.resize_exact(size, size, FilterType::Lanczos3);
+                resized.save(&icon_target).map_err(|err| {
+                    format!(
+                        "failed writing resized icon {}: {err}",
+                        icon_target.display()
+                    )
+                })?;
+            }
         }
 
         let desktop_path = applications_dir.join(format!("{}.desktop", APP_ID));
@@ -3764,6 +3922,17 @@ fn load_app_settings() -> Result<AppSettings, String> {
     settings.relay_endpoints.sort();
     settings.relay_endpoints.dedup();
     Ok(settings)
+}
+
+fn update_relay_sync_setting(
+    app_settings: &Rc<RefCell<AppSettings>>,
+    relay_sync_enabled: &Arc<AtomicBool>,
+    enabled: bool,
+) -> AppSettings {
+    let mut settings = app_settings.borrow_mut();
+    settings.relay_sync_enabled = enabled;
+    relay_sync_enabled.store(enabled, Ordering::SeqCst);
+    settings.clone()
 }
 
 fn save_app_settings(settings: &AppSettings) -> Result<(), String> {
@@ -4032,6 +4201,28 @@ fn apply_styles() {
             background: rgba(19, 24, 45, 0.84);
         }
 
+        .gossip-chip {
+            border-radius: 12px;
+            padding: 4px 10px;
+            border: 1px solid rgba(84, 127, 160, 0.34);
+            background: rgba(16, 28, 40, 0.82);
+        }
+
+        .gossip-chip-active {
+            border-color: rgba(116, 149, 255, 0.56);
+            background: rgba(29, 39, 78, 0.86);
+        }
+
+        .gossip-chip-disabled {
+            border-color: rgba(118, 124, 145, 0.32);
+            background: rgba(29, 31, 41, 0.8);
+        }
+
+        .relay-chip-disabled {
+            border-color: rgba(118, 124, 145, 0.32);
+            background: rgba(29, 31, 41, 0.8);
+        }
+
         .relay-dot {
             font-size: 12px;
             font-weight: 800;
@@ -4042,7 +4233,7 @@ fn apply_styles() {
         }
 
         .relay-dot-ok {
-            color: rgba(79, 219, 130, 0.95);
+            color: rgba(116, 184, 255, 0.96);
         }
 
         .relay-dot-warn {
@@ -4051,6 +4242,27 @@ fn apply_styles() {
 
         .relay-dot-down {
             color: rgba(251, 97, 124, 0.95);
+        }
+
+        .relay-dot-disabled {
+            color: rgba(168, 173, 191, 0.9);
+        }
+
+        .gossip-dot {
+            font-size: 12px;
+            font-weight: 800;
+        }
+
+        .gossip-dot-idle {
+            color: rgba(108, 179, 228, 0.9);
+        }
+
+        .gossip-dot-active {
+            color: rgba(170, 154, 255, 0.96);
+        }
+
+        .gossip-dot-disabled {
+            color: rgba(168, 173, 191, 0.9);
         }
 
         .relay-chip-text {
@@ -4334,7 +4546,7 @@ fn apply_styles() {
         }
 
         .bubble-meta-delivered {
-            color: rgba(120, 224, 156, 0.92);
+            color: rgba(156, 198, 255, 0.94);
         }
 
         .bubble-meta-failed {
@@ -4358,5 +4570,40 @@ fn apply_styles() {
             &provider,
             STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{update_relay_sync_setting, AppSettings};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn relay_toggle_helper_updates_state_and_atomic_flag() {
+        let app_settings = Rc::new(RefCell::new(AppSettings::default()));
+        let relay_sync_enabled = Arc::new(AtomicBool::new(true));
+
+        let snapshot = update_relay_sync_setting(&app_settings, &relay_sync_enabled, false);
+
+        assert!(!snapshot.relay_sync_enabled);
+        assert!(!app_settings.borrow().relay_sync_enabled);
+        assert!(!relay_sync_enabled.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn relay_toggle_helper_drops_mut_borrow_before_followup_work() {
+        let app_settings = Rc::new(RefCell::new(AppSettings::default()));
+        let relay_sync_enabled = Arc::new(AtomicBool::new(false));
+
+        let _snapshot = update_relay_sync_setting(&app_settings, &relay_sync_enabled, true);
+
+        let mut writable = app_settings.borrow_mut();
+        writable.relay_sync_enabled = false;
+        drop(writable);
+
+        assert!(!app_settings.borrow().relay_sync_enabled);
     }
 }

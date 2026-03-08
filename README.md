@@ -157,6 +157,66 @@ cargo fmt --all
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
+## Local dev lifecycle script
+
+Use `scripts/dev.sh` to manage local development lifecycle (start/stop/status/logs):
+
+```bash
+# Start app (builds by default)
+scripts/dev.sh start
+
+# Show current process state
+scripts/dev.sh status
+
+# Stop all managed processes
+scripts/dev.sh stop
+
+# Follow app logs
+scripts/dev.sh logs --service app
+```
+
+Optional relay process management (if you want script-managed relays too):
+
+```bash
+AETHOS_RELAY_PRIMARY_CMD="cargo run --manifest-path ../aethos-relay/Cargo.toml" \
+AETHOS_RELAY_SECONDARY_CMD="cargo run --manifest-path ../aethos-relay/Cargo.toml -- --port 9082" \
+scripts/dev.sh start
+```
+
+## Git hooks + release flow
+
+Install repository-managed hooks:
+
+```bash
+scripts/setup-git-hooks.sh
+```
+
+Hook behavior:
+
+- `pre-commit`: runs full lint gate (`cargo fmt --all -- --check` and `cargo clippy --all-targets --all-features -- -D warnings`)
+- `pre-merge-commit`: when merge includes local `main` tip, runs `cargo test`
+- `pre-push`: when pushing `origin/main`, creates a GitHub prerelease first
+
+Prerelease + release scripts:
+
+```bash
+# Create prerelease manually (also used by pre-push hook)
+scripts/release/create-prerelease.sh
+
+# Dry-run next official version inference
+scripts/release/create-release.sh --dry-run
+
+# Cut official release (updates Cargo.toml version, tests, commit, tag, GitHub release)
+scripts/release/create-release.sh
+```
+
+Versioning strategy:
+
+- Conventional-commit inspired bumping from commits since last `v*` tag:
+  - `major`: commit subject with `!` (e.g. `feat!:`) or `BREAKING CHANGE:` in body
+  - `minor`: `feat:` commits
+  - `patch`: all other changes
+
 ## Local relay testing
 
 The default `192.168.1.200` endpoints are placeholders. In local/dev environments,
