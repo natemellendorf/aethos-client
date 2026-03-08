@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DEFAULT_REPO="natemellendorf/aethos-linux"
+DEFAULT_REPO="natemellendorf/aethos-client"
 
 REPO="${AETHOS_REPO:-$DEFAULT_REPO}"
 REF="${AETHOS_REF:-}"
@@ -16,7 +16,7 @@ Usage:
   install.sh [options]
 
 Options:
-  --repo <owner/name>  GitHub repository (default: natemellendorf/aethos-linux)
+  --repo <owner/name>  GitHub repository (default: natemellendorf/aethos-client)
   --ref <tag>          Release tag to install (default: latest official release)
   --prefix <dir>       Install prefix (default: ~/.local)
   --bin-dir <dir>      Binary install dir (default: <prefix>/bin)
@@ -26,8 +26,8 @@ Environment overrides:
   AETHOS_REPO, AETHOS_REF, AETHOS_PREFIX, AETHOS_BIN_DIR
 
 Examples:
-  curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-linux/main/scripts/install.sh | bash
-  curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-linux/main/scripts/install.sh | bash -s -- --ref v0.2.1
+  curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-client/main/scripts/install.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-client/main/scripts/install.sh | bash -s -- --ref v0.2.1
 EOF
 }
 

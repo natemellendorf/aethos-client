@@ -11,7 +11,7 @@ Native Linux GUI client scaffold for Aethos.
 ### Linux/macOS (shell)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-linux/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-client/main/scripts/install.sh | bash
 ```
 
 ### Windows (PowerShell)
@@ -34,12 +34,12 @@ Optional flags/environment:
 
 ```bash
 # Install from a specific tag
-curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-linux/main/scripts/install.sh | bash -s -- --ref v0.2.0
+curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-client/main/scripts/install.sh | bash -s -- --ref v0.2.0
 ```
 
 ```bash
 # Custom binary directory
-curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-linux/main/scripts/install.sh | bash -s -- --bin-dir "$HOME/bin"
+curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-client/main/scripts/install.sh | bash -s -- --bin-dir "$HOME/bin"
 ```
 
 ```powershell

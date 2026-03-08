@@ -1,5 +1,5 @@
 param(
-  [string]$Repo = "natemellendorf/aethos-linux",
+  [string]$Repo = "natemellendorf/aethos-client",
   [string]$Ref = "",
   [string]$InstallDir = "$env:LOCALAPPDATA\Programs\Aethos\bin"
 )
