@@ -1,26 +1,30 @@
 mod aethos_core;
 mod relay;
 
+use base64::Engine;
 use gtk4::gdk::Display;
+use gtk4::pango::EllipsizeMode;
 use gtk4::prelude::*;
 use gtk4::{
     glib, Application, ApplicationWindow, Box as GtkBox, Button, ComboBoxText, CssProvider, Dialog,
-    Entry, Image, Label, ListBox, ListBoxRow, Orientation, Paned, ResponseType, Revealer,
-    RevealerTransitionType, ScrolledWindow, Stack, StackSwitcher, TextView,
-    STYLE_PROVIDER_PRIORITY_APPLICATION,
+    DrawingArea, Entry, Image, Label, ListBox, ListBoxRow, Orientation, Paned, Popover,
+    PositionType, ResponseType, Revealer, RevealerTransitionType, ScrolledWindow, Stack,
+    StackSwitcher, TextView, STYLE_PROVIDER_PRIORITY_APPLICATION,
 };
 use image::{ImageBuffer, Luma, Rgba, RgbaImage};
 use qrcode::QrCode;
 use serde_json::json;
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -28,11 +32,14 @@ use crate::aethos_core::identity_store::{
     delete_wayfarer_id, ensure_local_identity, load_contact_aliases, load_relay_session_cache,
     regenerate_local_identity, save_contact_aliases, save_relay_session_cache, RelaySessionCache,
 };
-use crate::aethos_core::protocol::{build_envelope_payload_b64_from_utf8, is_valid_wayfarer_id};
+use crate::aethos_core::protocol::{
+    build_envelope_payload_b64_from_utf8, decode_envelope_payload_b64,
+    decode_envelope_payload_utf8_preview, is_valid_wayfarer_id,
+};
 use crate::relay::client::{
-    connect_to_relay, connect_to_relay_with_auth, normalize_http_endpoint,
-    send_to_relay_v1_with_auth, to_ws_endpoint, RelayFrame, RelayRequestDispatcher,
-    RelaySessionConfig, RelaySessionManager,
+    ack_relay_message_v1_with_auth, connect_to_relay, connect_to_relay_with_auth,
+    normalize_http_endpoint, pull_from_relay_v1_with_auth, send_to_relay_v1_with_auth,
+    to_ws_endpoint, RelayFrame, RelayRequestDispatcher, RelaySessionConfig, RelaySessionManager,
 };
 
 const APP_ID: &str = "org.aethos.linux";
@@ -54,6 +61,7 @@ struct RelayStatus {
 #[derive(Clone, Copy, Debug)]
 enum SessionOp {
     Send,
+    Inbox,
 }
 
 #[derive(Clone, Debug)]
@@ -63,6 +71,7 @@ struct SessionStatus {
     ack_msg_id: Option<String>,
     outgoing_contact: Option<String>,
     outgoing_text: Option<String>,
+    outgoing_manifest_id: Option<String>,
     pulled_messages: Vec<PulledMessagePreview>,
 }
 
@@ -72,6 +81,8 @@ struct PulledMessagePreview {
     msg_id: String,
     text: String,
     received_at: i64,
+    receipt_manifest_id: Option<String>,
+    receipt_received_at_unix_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -86,6 +97,12 @@ struct ChatMessage {
     text: String,
     timestamp: String,
     direction: ChatDirection,
+    #[serde(default)]
+    seen: bool,
+    #[serde(default)]
+    manifest_id_hex: Option<String>,
+    #[serde(default)]
+    delivered_at: Option<String>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -100,6 +117,7 @@ struct ChatState {
     threads: BTreeMap<String, Vec<ChatMessage>>,
     show_full_contact_id: bool,
     contact_aliases: BTreeMap<String, String>,
+    new_contacts: BTreeSet<String>,
 }
 
 fn main() -> glib::ExitCode {
@@ -152,6 +170,24 @@ fn build_ui(app: &Application) {
     top_bar.set_hexpand(true);
     top_bar.append(&tab_switcher);
     top_bar.append(&relay_chip);
+
+    let wave_strip = DrawingArea::new();
+    wave_strip.add_css_class("wave-strip");
+    wave_strip.set_content_height(42);
+    wave_strip.set_hexpand(true);
+    wave_strip.set_vexpand(false);
+
+    let wave_mode_label = Label::new(Some("Ambient mesh active"));
+    wave_mode_label.add_css_class("wave-mode-label");
+    wave_mode_label.set_xalign(0.0);
+
+    let wave_phase = Rc::new(Cell::new(0.0_f64));
+    let wave_pending = Rc::new(Cell::new(false));
+    setup_wave_strip(
+        &wave_strip,
+        Rc::clone(&wave_phase),
+        Rc::clone(&wave_pending),
+    );
 
     let views = Stack::new();
     views.set_hexpand(true);
@@ -268,12 +304,15 @@ fn build_ui(app: &Application) {
     chat_shell.add_css_class("chat-shell");
     chat_shell.set_wide_handle(true);
     chat_shell.set_position(300);
+    chat_shell.set_resize_start_child(true);
+    chat_shell.set_resize_end_child(true);
     chat_shell.set_shrink_start_child(true);
     chat_shell.set_shrink_end_child(true);
     chat_shell.set_vexpand(true);
 
     let contacts_column = GtkBox::new(Orientation::Vertical, 8);
     contacts_column.add_css_class("contacts-pane");
+    contacts_column.set_hexpand(true);
     let contacts_title = Label::new(Some("Contacts"));
     contacts_title.add_css_class("section-title");
     contacts_title.set_xalign(0.0);
@@ -295,6 +334,7 @@ fn build_ui(app: &Application) {
 
     let thread_column = GtkBox::new(Orientation::Vertical, 10);
     thread_column.add_css_class("thread-pane");
+    thread_column.set_hexpand(true);
     let thread_title = Label::new(Some("Thread"));
     thread_title.add_css_class("section-title");
     thread_title.set_xalign(0.0);
@@ -321,6 +361,7 @@ fn build_ui(app: &Application) {
     thread_header.append(&id_toggle_button);
     let messages_list = ListBox::new();
     messages_list.add_css_class("messages-list");
+    messages_list.set_hexpand(true);
     let messages_scroll = ScrolledWindow::builder().build();
     messages_scroll.set_vexpand(true);
     messages_scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
@@ -382,8 +423,27 @@ fn build_ui(app: &Application) {
 
     let contact_id_entry = Entry::builder().hexpand(true).build();
     contact_id_entry.set_placeholder_text(Some("Wayfarer ID (64 lowercase hex)"));
+    let contact_id_label = Label::new(Some("Wayfarer ID"));
+    contact_id_label.add_css_class("field-label");
+    contact_id_label.set_xalign(0.0);
+    let contact_id_hint = Label::new(Some(
+        "Paste the contact's global Wayfarer address (64 lowercase hex characters).",
+    ));
+    contact_id_hint.add_css_class("field-hint");
+    contact_id_hint.set_xalign(0.0);
+    contact_id_hint.set_wrap(true);
+
     let contact_alias_entry = Entry::builder().hexpand(true).build();
     contact_alias_entry.set_placeholder_text(Some("Display name (optional, local only)"));
+    let contact_alias_label = Label::new(Some("Display Name (Local)"));
+    contact_alias_label.add_css_class("field-label");
+    contact_alias_label.set_xalign(0.0);
+    let contact_alias_hint = Label::new(Some(
+        "Optional nickname stored only on this Linux device. Leave blank to use Wayfarer ID.",
+    ));
+    contact_alias_hint.add_css_class("field-hint");
+    contact_alias_hint.set_xalign(0.0);
+    contact_alias_hint.set_wrap(true);
 
     let contacts_actions = GtkBox::new(Orientation::Horizontal, 8);
     let add_update_contact_button = Button::with_label("Add / Update Contact");
@@ -396,7 +456,11 @@ fn build_ui(app: &Application) {
     contacts_panel.append(&contacts_manage_title);
     contacts_panel.append(&contacts_manage_hint);
     contacts_panel.append(&contacts_manage_scroll);
+    contacts_panel.append(&contact_id_label);
+    contacts_panel.append(&contact_id_hint);
     contacts_panel.append(&contact_id_entry);
+    contacts_panel.append(&contact_alias_label);
+    contacts_panel.append(&contact_alias_hint);
     contacts_panel.append(&contact_alias_entry);
     contacts_panel.append(&contacts_actions);
 
@@ -490,6 +554,8 @@ fn build_ui(app: &Application) {
     footer.append(&footer_logo);
 
     root.append(&top_bar);
+    root.append(&wave_strip);
+    root.append(&wave_mode_label);
     root.append(&views);
     root.append(&footer);
     window.set_child(Some(&root));
@@ -552,6 +618,13 @@ fn build_ui(app: &Application) {
         state.selected_contact = saved_chat.selected_contact;
     }
 
+    wave_pending.set(has_pending_outbound(&chat_state.borrow()));
+    wave_mode_label.set_text(if wave_pending.get() {
+        "Outbound flow active"
+    } else {
+        "Ambient mesh active"
+    });
+
     let first_contact = chat_state.borrow().contact_aliases.keys().next().cloned();
     if let Some(first_contact) = first_contact {
         if chat_state.borrow().selected_contact.is_none() {
@@ -610,7 +683,12 @@ fn build_ui(app: &Application) {
 
             let selected = contact_order.borrow().get(idx as usize).cloned();
             if let Some(contact_id) = selected {
-                chat_state.borrow_mut().selected_contact = Some(contact_id);
+                {
+                    let mut state = chat_state.borrow_mut();
+                    state.selected_contact = Some(contact_id.clone());
+                    state.new_contacts.remove(&contact_id);
+                    mark_contact_seen(&mut state, &contact_id);
+                }
                 let _ = save_persisted_chat_state(&chat_state.borrow());
                 if let Some(selected_contact) = chat_state.borrow().selected_contact.as_ref() {
                     recipient_entry.set_text(selected_contact);
@@ -665,7 +743,12 @@ fn build_ui(app: &Application) {
                 return;
             }
 
-            chat_state.borrow_mut().selected_contact = Some(active_id.clone());
+            {
+                let mut state = chat_state.borrow_mut();
+                state.selected_contact = Some(active_id.clone());
+                state.new_contacts.remove(&active_id);
+                mark_contact_seen(&mut state, &active_id);
+            }
             let _ = save_persisted_chat_state(&chat_state.borrow());
             recipient_entry.set_text(&active_id);
             sync_contact_form(
@@ -703,11 +786,18 @@ fn build_ui(app: &Application) {
                 return;
             }
 
-            let alias = contact_alias_entry.text().trim().to_string();
+            let alias_input = contact_alias_entry.text().trim().to_string();
+            let alias = if alias_input.is_empty() {
+                contact_id.clone()
+            } else {
+                alias_input
+            };
             {
                 let mut state = chat_state.borrow_mut();
                 state.contact_aliases.insert(contact_id.clone(), alias);
                 state.selected_contact = Some(contact_id.clone());
+                state.new_contacts.remove(&contact_id);
+                mark_contact_seen(&mut state, &contact_id);
 
                 if let Err(err) = save_contact_aliases(&state.contact_aliases) {
                     chat_status_label.set_text(&format!("failed to save contact name: {err}"));
@@ -767,8 +857,12 @@ fn build_ui(app: &Application) {
                 let mut state = chat_state.borrow_mut();
                 state.contact_aliases.remove(&contact_id);
                 state.threads.remove(&contact_id);
+                state.new_contacts.remove(&contact_id);
                 if state.selected_contact.as_deref() == Some(contact_id.as_str()) {
                     state.selected_contact = state.contact_aliases.keys().next().cloned();
+                    if let Some(next_contact) = state.selected_contact.clone() {
+                        mark_contact_seen(&mut state, &next_contact);
+                    }
                 }
                 if let Err(err) = save_contact_aliases(&state.contact_aliases) {
                     chat_status_label.set_text(&format!("failed to remove contact: {err}"));
@@ -847,7 +941,12 @@ fn build_ui(app: &Application) {
             }
 
             if let Some(contact_id) = contacts_manage_order.borrow().get(idx as usize).cloned() {
-                chat_state.borrow_mut().selected_contact = Some(contact_id);
+                {
+                    let mut state = chat_state.borrow_mut();
+                    state.selected_contact = Some(contact_id.clone());
+                    state.new_contacts.remove(&contact_id);
+                    mark_contact_seen(&mut state, &contact_id);
+                }
                 let _ = save_persisted_chat_state(&chat_state.borrow());
                 if let Some(selected) = chat_state.borrow().selected_contact.as_ref() {
                     recipient_entry.set_text(selected);
@@ -1155,6 +1254,7 @@ fn build_ui(app: &Application) {
                         ack_msg_id: None,
                         outgoing_contact: None,
                         outgoing_text: None,
+                        outgoing_manifest_id: None,
                         pulled_messages: Vec::new(),
                     });
                     return;
@@ -1172,6 +1272,7 @@ fn build_ui(app: &Application) {
                         ack_msg_id: None,
                         outgoing_contact: None,
                         outgoing_text: None,
+                        outgoing_manifest_id: None,
                         pulled_messages: Vec::new(),
                     });
                     return;
@@ -1184,6 +1285,7 @@ fn build_ui(app: &Application) {
                     ack_msg_id: None,
                     outgoing_contact: None,
                     outgoing_text: None,
+                    outgoing_manifest_id: None,
                     pulled_messages: Vec::new(),
                 });
                 return;
@@ -1199,12 +1301,16 @@ fn build_ui(app: &Application) {
                         ack_msg_id: None,
                         outgoing_contact: None,
                         outgoing_text: None,
+                        outgoing_manifest_id: None,
                         pulled_messages: Vec::new(),
                     });
                     return;
                 }
             };
             body_entry.set_text("");
+            let outgoing_manifest_id = decode_envelope_payload_b64(&payload_b64)
+                .ok()
+                .map(|decoded| decoded.manifest_id_hex);
 
             let auth = std::env::var("AETHOS_RELAY_AUTH_TOKEN").ok();
             let session_tx = session_tx.clone();
@@ -1230,6 +1336,7 @@ fn build_ui(app: &Application) {
                         ack_msg_id: Some(msg_id),
                         outgoing_contact: Some(to),
                         outgoing_text: Some(outgoing_text),
+                        outgoing_manifest_id,
                         pulled_messages: Vec::new(),
                     },
                     Err(err) => SessionStatus {
@@ -1238,6 +1345,7 @@ fn build_ui(app: &Application) {
                         ack_msg_id: None,
                         outgoing_contact: None,
                         outgoing_text: None,
+                        outgoing_manifest_id: None,
                         pulled_messages: Vec::new(),
                     },
                 };
@@ -1279,6 +1387,8 @@ fn build_ui(app: &Application) {
         thread_contact_id_label,
         compact_contact_picker.clone(),
         Rc::clone(&picker_syncing),
+        Rc::clone(&wave_pending),
+        wave_mode_label,
     );
 
     attach_compact_adaptive_mode(
@@ -1287,6 +1397,8 @@ fn build_ui(app: &Application) {
         contacts_revealer,
         compact_picker_revealer,
     );
+
+    start_background_inbox_sync(relay_http_primary_entry, session_tx);
 
     window.present();
 }
@@ -1496,11 +1608,14 @@ fn attach_session_poller(
     thread_contact_id_label: Label,
     compact_contact_picker: ComboBoxText,
     picker_syncing: Rc<Cell<bool>>,
+    wave_pending: Rc<Cell<bool>>,
+    wave_mode_label: Label,
 ) {
     glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
         while let Ok(status) = rx.try_recv() {
             match status.op {
                 SessionOp::Send => send_button.set_sensitive(true),
+                SessionOp::Inbox => {}
             }
 
             chat_status_label.set_text(&status.text);
@@ -1508,6 +1623,7 @@ fn attach_session_poller(
 
             {
                 let mut state = chat_state.borrow_mut();
+                let mut aliases_changed = false;
 
                 if let (Some(contact), Some(text)) = (
                     status.outgoing_contact.as_ref(),
@@ -1526,11 +1642,27 @@ fn attach_session_poller(
                             text: text.clone(),
                             timestamp: format_timestamp_from_unix(now_unix_secs()),
                             direction: ChatDirection::Outgoing,
+                            seen: true,
+                            manifest_id_hex: status.outgoing_manifest_id.clone(),
+                            delivered_at: None,
                         });
                     state.selected_contact = Some(contact.clone());
+                    mark_contact_seen(&mut state, contact);
                 }
 
                 for pulled in &status.pulled_messages {
+                    if !state.contact_aliases.contains_key(&pulled.from_wayfarer_id) {
+                        state.contact_aliases.insert(
+                            pulled.from_wayfarer_id.clone(),
+                            pulled.from_wayfarer_id.clone(),
+                        );
+                        state.new_contacts.insert(pulled.from_wayfarer_id.clone());
+                        aliases_changed = true;
+                    }
+
+                    let is_seen_on_insert =
+                        state.selected_contact.as_deref() == Some(pulled.from_wayfarer_id.as_str());
+
                     state
                         .threads
                         .entry(pulled.from_wayfarer_id.clone())
@@ -1540,16 +1672,48 @@ fn attach_session_poller(
                             text: pulled.text.clone(),
                             timestamp: format_timestamp_from_unix(pulled.received_at),
                             direction: ChatDirection::Incoming,
+                            seen: is_seen_on_insert,
+                            manifest_id_hex: None,
+                            delivered_at: None,
                         });
+
+                    if let Some(manifest) = pulled.receipt_manifest_id.as_ref() {
+                        let delivered_time = pulled
+                            .receipt_received_at_unix_ms
+                            .map(format_timestamp_from_unix_ms)
+                            .unwrap_or_else(|| format_timestamp_from_unix(pulled.received_at));
+                        if let Some(thread) = state.threads.get_mut(&pulled.from_wayfarer_id) {
+                            for item in thread.iter_mut().rev() {
+                                if matches!(item.direction, ChatDirection::Outgoing)
+                                    && item.manifest_id_hex.as_deref() == Some(manifest.as_str())
+                                {
+                                    item.delivered_at = Some(delivered_time.clone());
+                                    break;
+                                }
+                            }
+                        }
+                    }
 
                     if state.selected_contact.is_none() {
                         state.selected_contact = Some(pulled.from_wayfarer_id.clone());
+                        mark_contact_seen(&mut state, &pulled.from_wayfarer_id);
                     }
+                }
+
+                if aliases_changed {
+                    let _ = save_contact_aliases(&state.contact_aliases);
                 }
             }
 
             if let Err(err) = save_persisted_chat_state(&chat_state.borrow()) {
                 append_local_log(&format!("persist_chat_state_failed: {err}"));
+            }
+            let pending = has_pending_outbound(&chat_state.borrow());
+            wave_pending.set(pending);
+            if pending {
+                wave_mode_label.set_text("Outbound flow active");
+            } else {
+                wave_mode_label.set_text("Ambient mesh active");
             }
 
             render_contacts(&chat_state.borrow(), &contacts_list, &contact_order);
@@ -1585,6 +1749,204 @@ fn attach_session_poller(
     });
 }
 
+fn start_background_inbox_sync(relay_http_primary_entry: Entry, session_tx: Sender<SessionStatus>) {
+    let inflight = Arc::new(AtomicBool::new(false));
+    glib::timeout_add_local(Duration::from_millis(2200), move || {
+        if inflight.swap(true, Ordering::SeqCst) {
+            return glib::ControlFlow::Continue;
+        }
+
+        let relay_http = normalize_http_endpoint(&relay_http_primary_entry.text());
+        let session_tx = session_tx.clone();
+        let inflight_done = Arc::clone(&inflight);
+        thread::spawn(move || {
+            let result = sync_inbox_once(&relay_http);
+            match result {
+                Ok(previews) if !previews.is_empty() => {
+                    let _ = session_tx.send(SessionStatus {
+                        op: SessionOp::Inbox,
+                        text: format!("received {} message(s)", previews.len()),
+                        ack_msg_id: previews.first().map(|item| item.msg_id.clone()),
+                        outgoing_contact: None,
+                        outgoing_text: None,
+                        outgoing_manifest_id: None,
+                        pulled_messages: previews,
+                    });
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    append_local_log(&format!("inbox_sync_failed: {err}"));
+                }
+            }
+            inflight_done.store(false, Ordering::SeqCst);
+        });
+
+        glib::ControlFlow::Continue
+    });
+}
+
+fn sync_inbox_once(relay_http: &str) -> Result<Vec<PulledMessagePreview>, String> {
+    let identity = ensure_local_identity()?;
+    let relay_ws = to_ws_endpoint(relay_http);
+    let auth = std::env::var("AETHOS_RELAY_AUTH_TOKEN").ok();
+    let messages = pull_from_relay_v1_with_auth(
+        &relay_ws,
+        &identity.wayfarer_id,
+        &identity.device_id,
+        Some(50),
+        auth.as_deref(),
+    )?;
+
+    let mut previews = Vec::with_capacity(messages.len());
+    for message in &messages {
+        let text = decode_message_text_for_display(&message.payload_b64);
+
+        previews.push(PulledMessagePreview {
+            from_wayfarer_id: message.from_wayfarer_id.clone(),
+            msg_id: message.msg_id.clone(),
+            text,
+            received_at: message.received_at,
+            receipt_manifest_id: extract_receipt_manifest_id(&message.payload_b64),
+            receipt_received_at_unix_ms: extract_receipt_received_at_ms(&message.payload_b64),
+        });
+    }
+
+    for message in messages {
+        let _ = ack_relay_message_v1_with_auth(
+            &relay_ws,
+            &identity.wayfarer_id,
+            &identity.device_id,
+            &message.msg_id,
+            auth.as_deref(),
+        );
+    }
+
+    Ok(previews)
+}
+
+fn decode_message_text_for_display(payload_b64: &str) -> String {
+    match decode_envelope_payload_utf8_preview(payload_b64) {
+        Ok(text) => extract_chat_text_if_json(&text),
+        Err(_) => match decode_envelope_payload_b64(payload_b64) {
+            Ok(decoded) => {
+                if let Ok(body_text) = String::from_utf8(decoded.body) {
+                    return extract_chat_text_if_json(&body_text);
+                }
+                let manifest_preview: String = decoded.manifest_id_hex.chars().take(12).collect();
+                format!("[binary body manifest={}…]", manifest_preview)
+            }
+            Err(err) => format!("[decode_error={err}]"),
+        },
+    }
+}
+
+fn extract_chat_text_if_json(input: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(input) else {
+        return input.to_string();
+    };
+
+    if let Some((manifest, ts)) = parse_receipt_like_json(&value) {
+        let at = ts
+            .map(format_timestamp_from_unix_ms)
+            .unwrap_or_else(|| "unknown".to_string());
+        let manifest_short: String = manifest.chars().take(10).collect();
+        return format!("Delivered ✓ ({manifest_short}… at {at})");
+    }
+
+    if let Some(text) = value.get("text").and_then(|v| v.as_str()) {
+        return text.to_string();
+    }
+
+    input.to_string()
+}
+
+fn extract_receipt_manifest_id(payload_b64: &str) -> Option<String> {
+    let text = decode_envelope_payload_utf8_preview(payload_b64).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    parse_receipt_like_json(&value).map(|tuple| tuple.0)
+}
+
+fn extract_receipt_received_at_ms(payload_b64: &str) -> Option<u64> {
+    let text = decode_envelope_payload_utf8_preview(payload_b64).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    parse_receipt_like_json(&value).and_then(|tuple| tuple.1)
+}
+
+fn parse_receipt_like_json(value: &serde_json::Value) -> Option<(String, Option<u64>)> {
+    if value
+        .get("type")
+        .and_then(|v| v.as_str())
+        .map(|v| v == "receipt")
+        .unwrap_or(false)
+    {
+        let manifest = value
+            .get("manifestId")
+            .or_else(|| value.get("manifest_id"))
+            .and_then(|v| v.as_str())?
+            .to_string();
+        let ts = value
+            .get("receivedAtUnixMs")
+            .or_else(|| value.get("received_at_unix_ms"))
+            .and_then(|v| v.as_u64());
+        return Some((manifest, ts));
+    }
+
+    if value
+        .get("receipt_scope")
+        .and_then(|v| v.as_str())
+        .is_some()
+    {
+        let receipt_b64 = value.get("receipt_v1_b64").and_then(|v| v.as_str())?;
+        return decode_receipt_v1_b64(receipt_b64).ok();
+    }
+
+    None
+}
+
+fn decode_receipt_v1_b64(receipt_b64: &str) -> Result<(String, Option<u64>), String> {
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(receipt_b64)
+        .map_err(|err| format!("failed decoding receipt_v1_b64: {err}"))?;
+    let mut cursor = if raw.len() >= 2 && raw[0] == 1 && raw[1] == 4 {
+        2usize
+    } else {
+        0usize
+    };
+
+    let mut manifest: Option<String> = None;
+    let mut received_ms: Option<u64> = None;
+
+    while cursor + 5 <= raw.len() {
+        let field_id = raw[cursor];
+        cursor += 1;
+        let len = u32::from_be_bytes(
+            raw[cursor..cursor + 4]
+                .try_into()
+                .map_err(|_| "invalid receipt field length".to_string())?,
+        ) as usize;
+        cursor += 4;
+        if cursor + len > raw.len() {
+            return Err("truncated receipt field payload".to_string());
+        }
+        let value = &raw[cursor..cursor + len];
+        cursor += len;
+
+        match field_id {
+            2 => manifest = Some(bytes_to_hex_lower(value)),
+            3 if len == 8 => {
+                received_ms =
+                    Some(u64::from_be_bytes(value.try_into().map_err(|_| {
+                        "invalid receipt timestamp bytes".to_string()
+                    })?))
+            }
+            _ => {}
+        }
+    }
+
+    let manifest = manifest.ok_or_else(|| "receipt missing manifestId".to_string())?;
+    Ok((manifest, received_ms))
+}
+
 fn render_contacts(
     state: &ChatState,
     contacts_list: &ListBox,
@@ -1607,10 +1969,18 @@ fn render_contacts(
         let label_column = GtkBox::new(Orientation::Vertical, 1);
         let title = Label::new(Some(&contact_display_name(state, &contact)));
         title.set_xalign(0.0);
+        title.set_ellipsize(EllipsizeMode::End);
+        title.set_width_chars(20);
+        title.set_max_width_chars(24);
+        title.set_single_line_mode(true);
         title.add_css_class("contact-title");
 
         let subtitle = Label::new(Some(&format!("{}", tiny_wayfarer(&contact))));
         subtitle.set_xalign(0.0);
+        subtitle.set_ellipsize(EllipsizeMode::End);
+        subtitle.set_width_chars(20);
+        subtitle.set_max_width_chars(24);
+        subtitle.set_single_line_mode(true);
         subtitle.add_css_class("contact-subtitle");
 
         label_column.append(&title);
@@ -1622,12 +1992,19 @@ fn render_contacts(
             .map(|messages| {
                 messages
                     .iter()
-                    .filter(|msg| matches!(msg.direction, ChatDirection::Incoming))
+                    .filter(|msg| matches!(msg.direction, ChatDirection::Incoming) && !msg.seen)
                     .count()
             })
             .unwrap_or(0);
 
-        if unread_count > 0 && state.selected_contact.as_deref() != Some(contact.as_str()) {
+        let is_new = state.new_contacts.contains(&contact);
+        if is_new && state.selected_contact.as_deref() != Some(contact.as_str()) {
+            let badge = Label::new(Some("NEW"));
+            badge.add_css_class("new-badge");
+            row_box.append(&avatar);
+            row_box.append(&label_column);
+            row_box.append(&badge);
+        } else if unread_count > 0 && state.selected_contact.as_deref() != Some(contact.as_str()) {
             let badge = Label::new(Some(&unread_count.to_string()));
             badge.add_css_class("unread-badge");
             row_box.append(&avatar);
@@ -1657,12 +2034,23 @@ fn render_contacts_manager(
         let row = ListBoxRow::new();
         row.add_css_class("contact-row");
 
+        let marker = if state.new_contacts.contains(&contact) {
+            " [NEW]"
+        } else {
+            ""
+        };
+
         let label = Label::new(Some(&format!(
-            "{} · {}",
+            "{}{} · {}",
             contact_display_name(state, &contact),
+            marker,
             tiny_wayfarer(&contact)
         )));
         label.set_xalign(0.0);
+        label.set_ellipsize(EllipsizeMode::End);
+        label.set_width_chars(28);
+        label.set_max_width_chars(38);
+        label.set_single_line_mode(true);
         row.set_child(Some(&label));
         contacts_list.append(&row);
     }
@@ -1712,13 +2100,15 @@ fn attach_compact_adaptive_mode(
         let width = window.width();
         let compact_mode = width > 0 && width < 900;
 
+        if compact_mode {
+            let suggested = (width / 3).clamp(150, 260);
+            chat_shell.set_position(suggested);
+        }
+
         if last_compact.get() != Some(compact_mode) {
             contacts_revealer.set_reveal_child(true);
             compact_picker_revealer.set_reveal_child(compact_mode);
-            if compact_mode {
-                let suggested = (width / 3).clamp(170, 260);
-                chat_shell.set_position(suggested);
-            } else {
+            if !compact_mode {
                 chat_shell.set_position(300);
             }
             last_compact.set(Some(compact_mode));
@@ -1761,14 +2151,38 @@ fn render_messages(
             let bubble_wrap = GtkBox::new(Orientation::Horizontal, 8);
             let bubble = Label::new(Some(&message.text));
             bubble.set_wrap(true);
+            bubble.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+            bubble.set_max_width_chars(54);
             bubble.set_xalign(0.0);
             bubble.add_css_class("chat-bubble");
+            bubble.set_tooltip_text(Some("Click to copy message"));
+
+            let copy_text = message.text.clone();
+            let bubble_for_click = bubble.clone();
+            let click = gtk4::GestureClick::new();
+            click.set_button(0);
+            click.connect_released(move |_, _, _, _| {
+                if let Some(display) = Display::default() {
+                    display.clipboard().set_text(&copy_text);
+                }
+                show_copied_popover(&bubble_for_click);
+            });
+            bubble.add_controller(click);
 
             let metadata = Label::new(Some(&format!("id={}", message.msg_id)));
+            let delivery_suffix = match message.direction {
+                ChatDirection::Outgoing => message
+                    .delivered_at
+                    .as_ref()
+                    .map(|at| format!(" · delivered {at}"))
+                    .unwrap_or_else(|| " · pending delivery".to_string()),
+                ChatDirection::Incoming => String::new(),
+            };
             metadata.set_text(&format!(
-                "{} · {}",
+                "{} · {}{}",
                 message.timestamp,
-                short_msg_id(&message.msg_id)
+                short_msg_id(&message.msg_id),
+                delivery_suffix
             ));
             metadata.add_css_class("bubble-meta");
             metadata.set_xalign(0.0);
@@ -1779,7 +2193,11 @@ fn render_messages(
 
             match message.direction {
                 ChatDirection::Outgoing => {
-                    bubble.add_css_class("chat-bubble-outgoing");
+                    if message.delivered_at.is_some() {
+                        bubble.add_css_class("chat-bubble-outgoing");
+                    } else {
+                        bubble.add_css_class("chat-bubble-pending");
+                    }
                     bubble_wrap.set_halign(gtk4::Align::End);
                 }
                 ChatDirection::Incoming => {
@@ -1816,6 +2234,16 @@ fn scroll_thread_to_bottom(messages_scroll: ScrolledWindow) {
     });
 }
 
+fn mark_contact_seen(state: &mut ChatState, contact_id: &str) {
+    if let Some(messages) = state.threads.get_mut(contact_id) {
+        for message in messages {
+            if matches!(message.direction, ChatDirection::Incoming) {
+                message.seen = true;
+            }
+        }
+    }
+}
+
 fn short_wayfarer(value: &str) -> String {
     if value.len() <= 14 {
         return value.to_string();
@@ -1824,12 +2252,29 @@ fn short_wayfarer(value: &str) -> String {
 }
 
 fn contact_display_name(state: &ChatState, wayfarer_id: &str) -> String {
-    state
+    let raw = state
         .contact_aliases
         .get(wayfarer_id)
         .cloned()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| short_wayfarer(wayfarer_id))
+        .unwrap_or_else(|| wayfarer_id.to_string());
+
+    if raw == wayfarer_id {
+        short_wayfarer(wayfarer_id)
+    } else if raw.chars().count() > 28 {
+        let head: String = raw.chars().take(18).collect();
+        let tail: String = raw
+            .chars()
+            .rev()
+            .take(6)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        format!("{}…{}", head, tail)
+    } else {
+        raw
+    }
 }
 
 fn tiny_wayfarer(value: &str) -> String {
@@ -1866,6 +2311,20 @@ fn format_timestamp_from_unix(unix_secs: i64) -> String {
     "--:--".to_string()
 }
 
+fn format_timestamp_from_unix_ms(unix_ms: u64) -> String {
+    format_timestamp_from_unix((unix_ms / 1000) as i64)
+}
+
+fn bytes_to_hex_lower(input: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(input.len() * 2);
+    for byte in input {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 fn now_unix_secs() -> i64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => duration.as_secs() as i64,
@@ -1881,6 +2340,28 @@ where
     widget.add_css_class(class_name);
     glib::timeout_add_local(Duration::from_millis(240), move || {
         widget.remove_css_class(class_name);
+        glib::ControlFlow::Break
+    });
+}
+
+fn show_copied_popover<W>(widget: &W)
+where
+    W: IsA<gtk4::Widget> + Clone + 'static,
+{
+    let popover = Popover::new();
+    popover.set_has_arrow(true);
+    popover.set_autohide(true);
+    popover.set_position(PositionType::Top);
+    popover.set_parent(widget);
+
+    let label = Label::new(Some("Copied"));
+    label.add_css_class("compact");
+    popover.set_child(Some(&label));
+    popover.popup();
+
+    glib::timeout_add_local(Duration::from_millis(800), move || {
+        popover.popdown();
+        popover.unparent();
         glib::ControlFlow::Break
     });
 }
@@ -1993,6 +2474,97 @@ fn open_log_folder() -> Result<(), String> {
         .spawn()
         .map(|_| ())
         .map_err(|err| format!("{err}"))
+}
+
+fn setup_wave_strip(wave_strip: &DrawingArea, phase: Rc<Cell<f64>>, pending: Rc<Cell<bool>>) {
+    let phase_draw = Rc::clone(&phase);
+    let pending_draw = Rc::clone(&pending);
+    wave_strip.set_draw_func(move |_area, cr, width, height| {
+        let w = width as f64;
+        let h = height as f64;
+        let t = phase_draw.get();
+        let active = pending_draw.get();
+
+        cr.set_source_rgba(0.31, 0.43, 0.86, if active { 0.12 } else { 0.08 });
+        cr.rectangle(0.0, 0.0, w, h);
+        let _ = cr.fill();
+
+        let base_alpha = if active { 0.58 } else { 0.30 };
+        let amp = if active { 5.0 } else { 3.0 };
+        let speed_scale = if active { 1.0 } else { 0.5 };
+
+        for idx in 0..3 {
+            let y = 10.0 + (idx as f64 * 10.0);
+            let freq = 0.022 + (idx as f64 * 0.004);
+            let phase_offset = (idx as f64) * 1.15;
+            let dir = if idx == 1 { -1.0 } else { 1.0 };
+            let drift = ((t * 0.18) + (idx as f64 * 0.7)).sin() * 0.18;
+
+            let (r, g, b) = if idx == 0 {
+                (0.33, 0.67, 0.98)
+            } else if idx == 1 {
+                (0.49, 0.48, 0.98)
+            } else {
+                (0.67, 0.42, 0.98)
+            };
+            let rr = (r + drift * 0.35).clamp(0.0, 1.0);
+            let gg = (g - drift * 0.22).clamp(0.0, 1.0);
+            let bb = (b + drift * 0.27).clamp(0.0, 1.0);
+            cr.set_source_rgba(rr, gg, bb, (base_alpha - (idx as f64 * 0.08)).max(0.08));
+            cr.set_line_width(if active { 1.8 } else { 1.3 });
+
+            let mut x = 0.0;
+            cr.move_to(x, y);
+            while x <= w {
+                let wave = (x * freq + (t * speed_scale * dir) + phase_offset).sin() * amp;
+                cr.line_to(x, y + wave);
+                x += 6.0;
+            }
+            let _ = cr.stroke();
+
+            let bead_count = if active { 4 } else { 3 };
+            for bead_idx in 0..bead_count {
+                let lane_speed = if idx == 0 {
+                    10.2
+                } else if idx == 1 {
+                    8.2
+                } else {
+                    6.9
+                };
+                let bead_speed = lane_speed + (bead_idx as f64 * 0.85);
+                let travel = ((t * speed_scale * bead_speed * dir)
+                    + (bead_idx as f64 * (w / bead_count as f64))
+                    + (idx as f64 * 21.0))
+                    .rem_euclid(w + 32.0);
+                let bx = travel - 16.0;
+                let by = y + (bx * freq + (t * speed_scale * dir) + phase_offset).sin() * amp;
+                let radius = if active { 1.55 } else { 1.3 };
+                let pulse =
+                    0.74 + 0.26 * ((t * 0.55) + (idx as f64 * 0.9) + (bead_idx as f64 * 1.1)).sin();
+                let bead_alpha = (if active { 0.56 } else { 0.40 }) * pulse;
+
+                cr.set_source_rgba(0.97, 0.98, 1.0, bead_alpha.clamp(0.24, 0.62));
+                cr.arc(bx, by, radius, 0.0, std::f64::consts::TAU);
+                let _ = cr.fill();
+            }
+        }
+    });
+
+    let wave_strip_tick = wave_strip.clone();
+    glib::timeout_add_local(Duration::from_millis(45), move || {
+        let speed = if pending.get() { 0.20 } else { 0.08 };
+        phase.set(phase.get() + speed);
+        wave_strip_tick.queue_draw();
+        glib::ControlFlow::Continue
+    });
+}
+
+fn has_pending_outbound(state: &ChatState) -> bool {
+    state.threads.values().any(|messages| {
+        messages.iter().any(|message| {
+            matches!(message.direction, ChatDirection::Outgoing) && message.delivered_at.is_none()
+        })
+    })
 }
 
 fn load_persisted_chat_state() -> Result<Option<PersistedChatState>, String> {
@@ -2308,6 +2880,20 @@ fn apply_styles() {
             color: rgba(198, 207, 239, 0.94);
         }
 
+        .wave-strip {
+            border-radius: 12px;
+            margin-top: 2px;
+            margin-bottom: 2px;
+            border: 1px solid rgba(116, 129, 213, 0.26);
+            background: linear-gradient(90deg, rgba(48, 74, 174, 0.22), rgba(97, 66, 201, 0.2));
+        }
+
+        .wave-mode-label {
+            font-size: 11px;
+            color: rgba(162, 174, 223, 0.92);
+            margin-bottom: 6px;
+        }
+
         .settings-shell {
             padding: 8px;
         }
@@ -2324,6 +2910,18 @@ fn apply_styles() {
             font-size: 12px;
             color: rgba(150, 161, 197, 0.9);
             margin-bottom: 2px;
+        }
+
+        .field-label {
+            font-size: 12px;
+            font-weight: 700;
+            color: rgba(192, 203, 238, 0.96);
+            margin-top: 4px;
+        }
+
+        .field-hint {
+            font-size: 11px;
+            color: rgba(143, 155, 192, 0.9);
         }
 
         .settings-card {
@@ -2496,6 +3094,15 @@ fn apply_styles() {
             padding: 2px 7px;
         }
 
+        .new-badge {
+            border-radius: 10px;
+            background: rgba(103, 84, 235, 0.92);
+            color: #f8f5ff;
+            font-size: 10px;
+            font-weight: 800;
+            padding: 2px 7px;
+        }
+
         .messages-list row {
             background: transparent;
             border: none;
@@ -2517,6 +3124,12 @@ fn apply_styles() {
         .chat-bubble-outgoing {
             background: rgba(67, 60, 115, 0.94);
             color: #eff2ff;
+        }
+
+        .chat-bubble-pending {
+            background: rgba(67, 60, 115, 0.58);
+            color: rgba(239, 242, 255, 0.88);
+            border: 1px dashed rgba(164, 170, 210, 0.45);
         }
 
         .bubble-meta {

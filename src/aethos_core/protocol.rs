@@ -247,11 +247,27 @@ pub fn decode_envelope_payload_b64(payload_b64: &str) -> Result<DecodedEnvelopeV
     if raw.len() < 2 {
         return Err("envelope too short".to_string());
     }
-    if raw[0] != 1 || raw[1] != 1 {
-        return Err("unsupported envelope canonical version".to_string());
+
+    if raw[0] == 1 && raw[1] == 1 {
+        return parse_envelope_fields(&raw, 2);
     }
 
-    let mut cursor = 2usize;
+    if raw[0] <= 3 {
+        return parse_envelope_fields(&raw, 0);
+    }
+
+    Err(format!(
+        "unsupported envelope canonical version (prefix={:02x}{:02x})",
+        raw[0], raw[1]
+    ))
+}
+
+fn parse_envelope_fields(raw: &[u8], start_offset: usize) -> Result<DecodedEnvelopeV1, String> {
+    if raw.len() < start_offset + 5 {
+        return Err("envelope too short".to_string());
+    }
+
+    let mut cursor = start_offset;
     let mut to_wayfarer_id: Option<Vec<u8>> = None;
     let mut manifest_id: Option<Vec<u8>> = None;
     let mut body: Option<Vec<u8>> = None;
@@ -304,10 +320,17 @@ pub fn decode_envelope_payload_b64(payload_b64: &str) -> Result<DecodedEnvelopeV
 
 #[allow(dead_code)]
 pub fn decode_envelope_payload_utf8_preview(payload_b64: &str) -> Result<String, String> {
-    let decoded = decode_envelope_payload_b64(payload_b64)?;
-    match String::from_utf8(decoded.body) {
-        Ok(text) => Ok(text),
-        Err(_) => Err("envelope body is not valid UTF-8".to_string()),
+    match decode_envelope_payload_b64(payload_b64) {
+        Ok(decoded) => match String::from_utf8(decoded.body) {
+            Ok(text) => Ok(text),
+            Err(_) => Err("envelope body is not valid UTF-8".to_string()),
+        },
+        Err(_) => {
+            let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(payload_b64)
+                .map_err(|err| format!("failed to decode payload_b64: {err}"))?;
+            String::from_utf8(raw).map_err(|_| "payload is not UTF-8".to_string())
+        }
     }
 }
 
@@ -352,6 +375,7 @@ mod tests {
         is_valid_wayfarer_id, AckFrame, EnvelopeV1, HelloFrame, PullFrame, RelayInboundFrame,
         SendFrame,
     };
+    use base64::Engine;
 
     #[test]
     fn hello_frame_serializes_to_v1_shape() {
@@ -463,5 +487,24 @@ mod tests {
         let decoded = decode_envelope_payload_b64(&payload).expect("decode envelope");
         assert_eq!(decoded.to_wayfarer_id_hex.len(), 64);
         assert!(!decoded.manifest_id_hex.is_empty());
+    }
+
+    #[test]
+    fn decodes_legacy_envelope_without_version_prefix() {
+        let payload = build_envelope_payload_b64_from_utf8(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "legacy payload",
+        )
+        .expect("build payload");
+
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .expect("decode built payload");
+        let legacy_raw = raw[2..].to_vec();
+        let legacy_payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(legacy_raw);
+
+        let preview =
+            decode_envelope_payload_utf8_preview(&legacy_payload).expect("decode legacy payload");
+        assert_eq!(preview, "legacy payload");
     }
 }
