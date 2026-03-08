@@ -105,25 +105,22 @@ asset_download_url() {
   local release_json="$1"
   local asset_name="$2"
 
-  python3 - "$asset_name" <<'PY' <<<"${release_json}"
-import json
-import sys
-
+  python3 -c 'import json,sys
 asset = sys.argv[1]
 data = json.loads(sys.stdin.read())
 for item in data.get("assets", []):
     if item.get("name") == asset:
         print(item.get("browser_download_url", ""))
-        sys.exit(0)
-print("")
-PY
+        break
+else:
+    print("")' "$asset_name" <<<"${release_json}"
 }
 
 install_from_release_asset() {
   local tmp_dir release_json asset_name asset_url archive_path
 
   tmp_dir="$(mktemp -d)"
-  trap 'rm -rf "$tmp_dir"' EXIT
+  trap "rm -rf '$tmp_dir'" EXIT
 
   release_json="$(fetch_release_json)"
   asset_name="aethos-${REF}-${TARGET_TRIPLE}.${ARCHIVE_EXT}"
