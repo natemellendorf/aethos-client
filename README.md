@@ -63,6 +63,8 @@ Native Linux GUI client scaffold for Aethos.
 - Added animated adaptive transitions between sidebar and compact contact-picker modes for smoother, mobile-like resizing behavior.
 - Added local contact naming: users can assign friendly names to wayfarer IDs, and aliases persist locally on that Linux device.
 - Added a dedicated `Contacts` tab for add/update/remove contact management; `Chats` is now message-only and uses selected managed contacts.
+- Added local chat-history persistence so sent/received thread messages survive app restart.
+- Added a `Share` tab with QR generation for Wayfarer ID and centered feather mark overlay.
 
 ## Identity persistence
 

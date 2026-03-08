@@ -9,6 +9,8 @@ use gtk4::{
     RevealerTransitionType, ScrolledWindow, Stack, StackSwitcher, TextView,
     STYLE_PROVIDER_PRIORITY_APPLICATION,
 };
+use image::{ImageBuffer, Luma, Rgba, RgbaImage};
+use qrcode::QrCode;
 use serde_json::json;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -37,6 +39,8 @@ const APP_ID: &str = "org.aethos.linux";
 const DEFAULT_RELAY_HTTP_PRIMARY: &str = "http://192.168.1.200:8082";
 const DEFAULT_RELAY_HTTP_SECONDARY: &str = "http://192.168.1.200:9082";
 const APP_LOG_FILE_NAME: &str = "aethos-linux.log";
+const CHAT_HISTORY_FILE_NAME: &str = "chat-history.json";
+const SHARE_QR_FILE_NAME: &str = "share-wayfarer-qr.png";
 
 #[derive(Clone, Debug)]
 struct RelayStatus {
@@ -70,18 +74,24 @@ struct PulledMessagePreview {
     received_at: i64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 enum ChatDirection {
     Incoming,
     Outgoing,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct ChatMessage {
     msg_id: String,
     text: String,
     timestamp: String,
     direction: ChatDirection,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct PersistedChatState {
+    selected_contact: Option<String>,
+    threads: BTreeMap<String, Vec<ChatMessage>>,
 }
 
 #[derive(Default, Debug)]
@@ -258,6 +268,8 @@ fn build_ui(app: &Application) {
     chat_shell.add_css_class("chat-shell");
     chat_shell.set_wide_handle(true);
     chat_shell.set_position(300);
+    chat_shell.set_shrink_start_child(true);
+    chat_shell.set_shrink_end_child(true);
     chat_shell.set_vexpand(true);
 
     let contacts_column = GtkBox::new(Orientation::Vertical, 8);
@@ -341,25 +353,16 @@ fn build_ui(app: &Application) {
     chat_status_label.set_xalign(0.0);
     chat_status_label.set_hexpand(true);
 
-    let copy_status_button = Button::with_label("Copy");
-    copy_status_button.add_css_class("compact");
-    copy_status_button.set_visible(false);
-
-    let status_row = GtkBox::new(Orientation::Horizontal, 8);
-    status_row.append(&chat_status_label);
-    status_row.append(&copy_status_button);
+    let open_chat_logs_button = Button::with_label("Diagnostics Logs");
+    open_chat_logs_button.add_css_class("compact");
 
     let composer_bar = GtkBox::new(Orientation::Horizontal, 8);
     composer_bar.add_css_class("composer-bar");
     composer_bar.append(&body_entry);
     composer_bar.append(&send_button);
 
-    let recipient_row = GtkBox::new(Orientation::Horizontal, 8);
-    recipient_row.append(&recipient_entry);
-
-    thread_column.append(&recipient_row);
     thread_column.append(&composer_bar);
-    thread_column.append(&status_row);
+    thread_column.append(&open_chat_logs_button);
 
     let contacts_panel = GtkBox::new(Orientation::Vertical, 10);
     contacts_panel.add_css_class("glass-panel");
@@ -397,6 +400,33 @@ fn build_ui(app: &Application) {
     contacts_panel.append(&contact_alias_entry);
     contacts_panel.append(&contacts_actions);
 
+    let share_panel = GtkBox::new(Orientation::Vertical, 10);
+    share_panel.add_css_class("glass-panel");
+    let share_title = Label::new(Some("Share"));
+    share_title.add_css_class("section-title");
+    share_title.set_xalign(0.0);
+    let share_hint = Label::new(Some(
+        "Share your Wayfarer ID via QR. The code includes your address with Aethos feather mark.",
+    ));
+    share_hint.set_xalign(0.0);
+    share_hint.set_wrap(true);
+    let share_wayfarer_entry = Entry::builder().hexpand(true).editable(false).build();
+    let copy_wayfarer_button = Button::with_label("Copy Wayfarer ID");
+    copy_wayfarer_button.add_css_class("compact");
+    let share_qr_image = Image::new();
+    share_qr_image.set_pixel_size(280);
+    share_qr_image.set_halign(gtk4::Align::Center);
+    let share_status_label = Label::new(Some("QR pending identity"));
+    share_status_label.set_xalign(0.0);
+    share_status_label.add_css_class("chat-status");
+
+    share_panel.append(&share_title);
+    share_panel.append(&share_hint);
+    share_panel.append(&share_wayfarer_entry);
+    share_panel.append(&copy_wayfarer_button);
+    share_panel.append(&share_qr_image);
+    share_panel.append(&share_status_label);
+
     let settings_panel = GtkBox::new(Orientation::Vertical, 12);
     settings_panel.add_css_class("settings-shell");
 
@@ -433,6 +463,7 @@ fn build_ui(app: &Application) {
 
     views.add_titled(&conversations_panel, Some("sessions"), "Chats");
     views.add_titled(&contacts_panel, Some("contacts"), "Contacts");
+    views.add_titled(&share_panel, Some("share"), "Share");
     views.add_titled(&settings_scroll, Some("settings"), "Settings");
 
     let footer = GtkBox::new(Orientation::Horizontal, 10);
@@ -466,6 +497,8 @@ fn build_ui(app: &Application) {
 
     if let Ok(identity) = ensure_local_identity() {
         wayfarer_id_entry.set_text(&identity.wayfarer_id);
+        share_wayfarer_entry.set_text(&identity.wayfarer_id);
+        refresh_share_qr(&identity.wayfarer_id, &share_qr_image, &share_status_label);
         let key_preview: String = identity.verifying_key_b64.chars().take(16).collect();
         let device_preview: String = identity.device_id.chars().take(12).collect();
         identity_meta_label.set_text(&format!(
@@ -474,6 +507,17 @@ fn build_ui(app: &Application) {
         ));
         onboarding_status
             .set_text("Step 2/2 · Identity provisioned. Proceed to relay diagnostics.");
+    }
+
+    {
+        let share_wayfarer_entry = share_wayfarer_entry.clone();
+        copy_wayfarer_button.connect_clicked(move |_| {
+            if let Some(display) = Display::default() {
+                display
+                    .clipboard()
+                    .set_text(&share_wayfarer_entry.text().to_string());
+            }
+        });
     }
 
     if let Ok(Some(cache)) = load_relay_session_cache() {
@@ -502,9 +546,17 @@ fn build_ui(app: &Application) {
         chat_state.borrow_mut().contact_aliases = aliases;
     }
 
+    if let Ok(Some(saved_chat)) = load_persisted_chat_state() {
+        let mut state = chat_state.borrow_mut();
+        state.threads = saved_chat.threads;
+        state.selected_contact = saved_chat.selected_contact;
+    }
+
     let first_contact = chat_state.borrow().contact_aliases.keys().next().cloned();
     if let Some(first_contact) = first_contact {
-        chat_state.borrow_mut().selected_contact = Some(first_contact.clone());
+        if chat_state.borrow().selected_contact.is_none() {
+            chat_state.borrow_mut().selected_contact = Some(first_contact.clone());
+        }
         recipient_entry.set_text(&first_contact);
     }
 
@@ -559,6 +611,7 @@ fn build_ui(app: &Application) {
             let selected = contact_order.borrow().get(idx as usize).cloned();
             if let Some(contact_id) = selected {
                 chat_state.borrow_mut().selected_contact = Some(contact_id);
+                let _ = save_persisted_chat_state(&chat_state.borrow());
                 if let Some(selected_contact) = chat_state.borrow().selected_contact.as_ref() {
                     recipient_entry.set_text(selected_contact);
                 }
@@ -613,6 +666,7 @@ fn build_ui(app: &Application) {
             }
 
             chat_state.borrow_mut().selected_contact = Some(active_id.clone());
+            let _ = save_persisted_chat_state(&chat_state.borrow());
             recipient_entry.set_text(&active_id);
             sync_contact_form(
                 &chat_state.borrow(),
@@ -659,6 +713,10 @@ fn build_ui(app: &Application) {
                     chat_status_label.set_text(&format!("failed to save contact name: {err}"));
                     return;
                 }
+            }
+            if let Err(err) = save_persisted_chat_state(&chat_state.borrow()) {
+                chat_status_label.set_text(&format!("failed to persist chat state: {err}"));
+                return;
             }
 
             render_contacts(&chat_state.borrow(), &contacts_list, &contact_order);
@@ -716,6 +774,10 @@ fn build_ui(app: &Application) {
                     chat_status_label.set_text(&format!("failed to remove contact: {err}"));
                     return;
                 }
+            }
+            if let Err(err) = save_persisted_chat_state(&chat_state.borrow()) {
+                chat_status_label.set_text(&format!("failed to persist chat state: {err}"));
+                return;
             }
 
             render_contacts(&chat_state.borrow(), &contacts_list, &contact_order);
@@ -786,6 +848,7 @@ fn build_ui(app: &Application) {
 
             if let Some(contact_id) = contacts_manage_order.borrow().get(idx as usize).cloned() {
                 chat_state.borrow_mut().selected_contact = Some(contact_id);
+                let _ = save_persisted_chat_state(&chat_state.borrow());
                 if let Some(selected) = chat_state.borrow().selected_contact.as_ref() {
                     recipient_entry.set_text(selected);
                 }
@@ -847,6 +910,9 @@ fn build_ui(app: &Application) {
         let wayfarer_id_entry = wayfarer_id_entry.clone();
         let identity_meta_label = identity_meta_label.clone();
         let onboarding_status = onboarding_status.clone();
+        let share_wayfarer_entry = share_wayfarer_entry.clone();
+        let share_qr_image = share_qr_image.clone();
+        let share_status_label = share_status_label.clone();
         generate_button.connect_clicked(move |_| {
             let dialog = Dialog::builder()
                 .transient_for(&window)
@@ -868,6 +934,9 @@ fn build_ui(app: &Application) {
             let wayfarer_id_entry = wayfarer_id_entry.clone();
             let identity_meta_label = identity_meta_label.clone();
             let onboarding_status = onboarding_status.clone();
+            let share_wayfarer_entry = share_wayfarer_entry.clone();
+            let share_qr_image = share_qr_image.clone();
+            let share_status_label = share_status_label.clone();
             dialog.connect_response(move |dialog, response| {
                 if response == ResponseType::Accept {
                     match regenerate_local_identity() {
@@ -876,6 +945,12 @@ fn build_ui(app: &Application) {
                                 identity.verifying_key_b64.chars().take(16).collect();
                             let device_preview: String = identity.device_id.chars().take(12).collect();
                             wayfarer_id_entry.set_text(&identity.wayfarer_id);
+                            share_wayfarer_entry.set_text(&identity.wayfarer_id);
+                            refresh_share_qr(
+                                &identity.wayfarer_id,
+                                &share_qr_image,
+                                &share_status_label,
+                            );
                             identity_meta_label.set_text(&format!(
                                 "Identity metadata: device={} · device_id={}… · verify_key={}…",
                                 identity.device_name, device_preview, key_preview
@@ -898,6 +973,9 @@ fn build_ui(app: &Application) {
         let wayfarer_id_entry = wayfarer_id_entry.clone();
         let identity_meta_label = identity_meta_label.clone();
         let onboarding_status = onboarding_status.clone();
+        let share_wayfarer_entry = share_wayfarer_entry.clone();
+        let share_qr_image = share_qr_image.clone();
+        let share_status_label = share_status_label.clone();
         delete_button.connect_clicked(move |_| {
             let dialog = Dialog::builder()
                 .transient_for(&window)
@@ -919,6 +997,9 @@ fn build_ui(app: &Application) {
             let wayfarer_id_entry = wayfarer_id_entry.clone();
             let identity_meta_label = identity_meta_label.clone();
             let onboarding_status = onboarding_status.clone();
+            let share_wayfarer_entry = share_wayfarer_entry.clone();
+            let share_qr_image = share_qr_image.clone();
+            let share_status_label = share_status_label.clone();
             dialog.connect_response(move |dialog, response| {
                 if response == ResponseType::Accept {
                     if let Err(err) = delete_wayfarer_id() {
@@ -931,6 +1012,12 @@ fn build_ui(app: &Application) {
                                 identity.verifying_key_b64.chars().take(16).collect();
                             let device_preview: String = identity.device_id.chars().take(12).collect();
                             wayfarer_id_entry.set_text(&identity.wayfarer_id);
+                            share_wayfarer_entry.set_text(&identity.wayfarer_id);
+                            refresh_share_qr(
+                                &identity.wayfarer_id,
+                                &share_qr_image,
+                                &share_status_label,
+                            );
                             identity_meta_label.set_text(&format!(
                                 "Identity metadata: device={} · device_id={}… · verify_key={}…",
                                 identity.device_name, device_preview, key_preview
@@ -942,6 +1029,9 @@ fn build_ui(app: &Application) {
                         Err(err) => {
                             eprintln!("{err}");
                             wayfarer_id_entry.set_text("");
+                            share_wayfarer_entry.set_text("");
+                            share_qr_image.set_from_file(Option::<&str>::None);
+                            share_status_label.set_text("QR unavailable: identity missing");
                             identity_meta_label.set_text("Identity metadata: unavailable");
                         }
                     }
@@ -961,26 +1051,40 @@ fn build_ui(app: &Application) {
     }
 
     {
-        let relay_secondary_label = relay_secondary_label.clone();
-        open_logs_button.connect_clicked(move |_| {
-            let log_dir = app_log_file_path()
-                .parent()
-                .map(|path| path.to_path_buf())
-                .unwrap_or_else(|| PathBuf::from("."));
+        let contact_id_entry = contact_id_entry.clone();
+        let contact_alias_entry = contact_alias_entry.clone();
+        let contacts_manage_list = contacts_manage_list.clone();
+        views.connect_visible_child_name_notify(move |stack| {
+            if stack.visible_child_name().as_deref() == Some("contacts") {
+                contact_id_entry.set_text("");
+                contact_alias_entry.set_text("");
+                contacts_manage_list.select_row(Option::<&ListBoxRow>::None);
+            }
+        });
+    }
 
-            let result = Command::new("xdg-open").arg(&log_dir).spawn();
-            match result {
-                Ok(_) => {
-                    relay_secondary_label.set_text(&format!(
-                        "Secondary relay status: opened logs at {}",
-                        log_dir.display()
-                    ));
-                }
-                Err(err) => {
-                    relay_secondary_label.set_text(&format!(
-                        "Secondary relay status: failed to open log folder: {err}"
-                    ));
-                }
+    {
+        let relay_secondary_label = relay_secondary_label.clone();
+        open_logs_button.connect_clicked(move |_| match open_log_folder() {
+            Ok(_) => {
+                relay_secondary_label.set_text("Secondary relay status: opened logs folder");
+            }
+            Err(err) => {
+                relay_secondary_label.set_text(&format!(
+                    "Secondary relay status: failed to open log folder: {err}"
+                ));
+            }
+        });
+    }
+
+    {
+        let chat_status_label = chat_status_label.clone();
+        open_chat_logs_button.connect_clicked(move |_| match open_log_folder() {
+            Ok(_) => {
+                chat_status_label.set_text("Opened log folder");
+            }
+            Err(err) => {
+                chat_status_label.set_text(&format!("Failed to open log folder: {err}"));
             }
         });
     }
@@ -990,6 +1094,9 @@ fn build_ui(app: &Application) {
         let wayfarer_id_entry = wayfarer_id_entry.clone();
         let identity_meta_label = identity_meta_label.clone();
         let onboarding_status = onboarding_status.clone();
+        let share_wayfarer_entry = share_wayfarer_entry.clone();
+        let share_qr_image = share_qr_image.clone();
+        let share_status_label = share_status_label.clone();
         let relay_http_primary_entry = relay_http_primary_entry.clone();
         let relay_http_secondary_entry = relay_http_secondary_entry.clone();
         connect_button.connect_clicked(move |button| {
@@ -1007,6 +1114,8 @@ fn build_ui(app: &Application) {
             let key_preview: String = identity.verifying_key_b64.chars().take(16).collect();
             let device_preview: String = identity.device_id.chars().take(12).collect();
             wayfarer_id_entry.set_text(&identity.wayfarer_id);
+            share_wayfarer_entry.set_text(&identity.wayfarer_id);
+            refresh_share_qr(&identity.wayfarer_id, &share_qr_image, &share_status_label);
             identity_meta_label.set_text(&format!(
                 "Identity metadata: device={} · device_id={}… · verify_key={}…",
                 identity.device_name, device_preview, key_preview
@@ -1095,6 +1204,7 @@ fn build_ui(app: &Application) {
                     return;
                 }
             };
+            body_entry.set_text("");
 
             let auth = std::env::var("AETHOS_RELAY_AUTH_TOKEN").ok();
             let session_tx = session_tx.clone();
@@ -1143,16 +1253,6 @@ fn build_ui(app: &Application) {
         });
     }
 
-    {
-        let chat_status_label = chat_status_label.clone();
-        copy_status_button.connect_clicked(move |_| {
-            if let Some(display) = Display::default() {
-                let clipboard = display.clipboard();
-                clipboard.set_text(&chat_status_label.text());
-            }
-        });
-    }
-
     attach_status_poller(
         rx,
         connect_button,
@@ -1168,7 +1268,6 @@ fn build_ui(app: &Application) {
         session_rx,
         send_button,
         chat_status_label,
-        copy_status_button,
         Rc::clone(&chat_state),
         contacts_list,
         Rc::clone(&contact_order),
@@ -1386,7 +1485,6 @@ fn attach_session_poller(
     rx: Receiver<SessionStatus>,
     send_button: Button,
     chat_status_label: Label,
-    copy_status_button: Button,
     chat_state: Rc<RefCell<ChatState>>,
     contacts_list: ListBox,
     contact_order: Rc<RefCell<Vec<String>>>,
@@ -1406,8 +1504,6 @@ fn attach_session_poller(
             }
 
             chat_status_label.set_text(&status.text);
-            let is_send_failure = status.text.starts_with("send failed:");
-            copy_status_button.set_visible(is_send_failure);
             append_local_log(&format!("session_status: {}", status.text));
 
             {
@@ -1450,6 +1546,10 @@ fn attach_session_poller(
                         state.selected_contact = Some(pulled.from_wayfarer_id.clone());
                     }
                 }
+            }
+
+            if let Err(err) = save_persisted_chat_state(&chat_state.borrow()) {
+                append_local_log(&format!("persist_chat_state_failed: {err}"));
             }
 
             render_contacts(&chat_state.borrow(), &contacts_list, &contact_order);
@@ -1613,9 +1713,12 @@ fn attach_compact_adaptive_mode(
         let compact_mode = width > 0 && width < 900;
 
         if last_compact.get() != Some(compact_mode) {
-            contacts_revealer.set_reveal_child(!compact_mode);
+            contacts_revealer.set_reveal_child(true);
             compact_picker_revealer.set_reveal_child(compact_mode);
-            if !compact_mode {
+            if compact_mode {
+                let suggested = (width / 3).clamp(170, 260);
+                chat_shell.set_position(suggested);
+            } else {
                 chat_shell.set_position(300);
             }
             last_compact.set(Some(compact_mode));
@@ -1878,6 +1981,261 @@ fn app_log_file_path() -> PathBuf {
     }
 
     std::env::temp_dir().join(APP_LOG_FILE_NAME)
+}
+
+fn open_log_folder() -> Result<(), String> {
+    let log_dir = app_log_file_path()
+        .parent()
+        .map(|path| path.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    Command::new("xdg-open")
+        .arg(&log_dir)
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("{err}"))
+}
+
+fn load_persisted_chat_state() -> Result<Option<PersistedChatState>, String> {
+    let path = chat_history_file_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let content = fs::read_to_string(&path).map_err(|err| {
+        format!(
+            "failed to read chat history file at {}: {err}",
+            path.display()
+        )
+    })?;
+    let data: PersistedChatState = serde_json::from_str(&content).map_err(|err| {
+        format!(
+            "failed to parse chat history file at {}: {err}",
+            path.display()
+        )
+    })?;
+    Ok(Some(data))
+}
+
+fn save_persisted_chat_state(state: &ChatState) -> Result<(), String> {
+    let path = chat_history_file_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed creating chat history directory: {err}"))?;
+    }
+
+    let payload = PersistedChatState {
+        selected_contact: state.selected_contact.clone(),
+        threads: state.threads.clone(),
+    };
+    let serialized = serde_json::to_string_pretty(&payload)
+        .map_err(|err| format!("failed to serialize chat history: {err}"))?;
+    fs::write(&path, serialized).map_err(|err| {
+        format!(
+            "failed to write chat history file at {}: {err}",
+            path.display()
+        )
+    })
+}
+
+fn chat_history_file_path() -> PathBuf {
+    if let Ok(xdg_state_home) = std::env::var("XDG_STATE_HOME") {
+        if !xdg_state_home.trim().is_empty() {
+            return Path::new(&xdg_state_home)
+                .join("aethos-linux")
+                .join(CHAT_HISTORY_FILE_NAME);
+        }
+    }
+
+    if let Ok(home) = std::env::var("HOME") {
+        return Path::new(&home)
+            .join(".local")
+            .join("state")
+            .join("aethos-linux")
+            .join(CHAT_HISTORY_FILE_NAME);
+    }
+
+    std::env::temp_dir().join(CHAT_HISTORY_FILE_NAME)
+}
+
+fn share_qr_file_path() -> PathBuf {
+    if let Ok(xdg_state_home) = std::env::var("XDG_STATE_HOME") {
+        if !xdg_state_home.trim().is_empty() {
+            return Path::new(&xdg_state_home)
+                .join("aethos-linux")
+                .join(SHARE_QR_FILE_NAME);
+        }
+    }
+
+    if let Ok(home) = std::env::var("HOME") {
+        return Path::new(&home)
+            .join(".local")
+            .join("state")
+            .join("aethos-linux")
+            .join(SHARE_QR_FILE_NAME);
+    }
+
+    std::env::temp_dir().join(SHARE_QR_FILE_NAME)
+}
+
+fn refresh_share_qr(wayfarer_id: &str, share_qr_image: &Image, share_status_label: &Label) {
+    match generate_share_qr_png(wayfarer_id) {
+        Ok(path) => {
+            share_qr_image.set_from_file(path.to_str());
+            share_status_label.set_text("QR ready to share");
+        }
+        Err(err) => {
+            share_qr_image.set_from_file(Option::<&str>::None);
+            share_status_label.set_text(&format!("QR generation failed: {err}"));
+        }
+    }
+}
+
+fn generate_share_qr_png(wayfarer_id: &str) -> Result<PathBuf, String> {
+    let code = QrCode::new(wayfarer_id.as_bytes())
+        .map_err(|err| format!("failed generating QR payload: {err}"))?;
+    let scale: u32 = 8;
+    let border: u32 = 4;
+    let luma: ImageBuffer<Luma<u8>, Vec<u8>> = code
+        .render::<Luma<u8>>()
+        .quiet_zone(false)
+        .module_dimensions(scale, scale)
+        .build();
+
+    let inner_w = luma.width();
+    let inner_h = luma.height();
+    let width = inner_w + border * scale * 2;
+    let height = inner_h + border * scale * 2;
+    let mut rgba = RgbaImage::from_pixel(width, height, Rgba([255, 255, 255, 255]));
+
+    for y in 0..inner_h {
+        for x in 0..inner_w {
+            let px = luma.get_pixel(x, y).0[0];
+            let color = if px < 128 {
+                Rgba([16, 18, 28, 255])
+            } else {
+                Rgba([255, 255, 255, 255])
+            };
+            rgba.put_pixel(x + border * scale, y + border * scale, color);
+        }
+    }
+
+    let monogram = a_monogram_icon_rgba((width / 6).max(36));
+    overlay_center(&mut rgba, &monogram);
+
+    let path = share_qr_file_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| format!("failed creating share qr dir: {err}"))?;
+    }
+    rgba.save(&path)
+        .map_err(|err| format!("failed saving share QR image: {err}"))?;
+    Ok(path)
+}
+
+fn overlay_center(base: &mut RgbaImage, overlay: &RgbaImage) {
+    let offset_x = base.width().saturating_sub(overlay.width()) / 2;
+    let offset_y = base.height().saturating_sub(overlay.height()) / 2;
+
+    for y in 0..overlay.height() {
+        for x in 0..overlay.width() {
+            let src = overlay.get_pixel(x, y);
+            let alpha = src[3] as f32 / 255.0;
+            if alpha <= 0.0 {
+                continue;
+            }
+
+            let dst = base.get_pixel_mut(x + offset_x, y + offset_y);
+            for i in 0..3 {
+                let blended = (src[i] as f32 * alpha) + (dst[i] as f32 * (1.0 - alpha));
+                dst[i] = blended.round() as u8;
+            }
+            dst[3] = 255;
+        }
+    }
+}
+
+fn a_monogram_icon_rgba(size: u32) -> RgbaImage {
+    let mut img = RgbaImage::from_pixel(size, size, Rgba([255, 255, 255, 0]));
+    let cx = size as f32 * 0.5;
+    let cy = size as f32 * 0.5;
+    let radius = size as f32 * 0.44;
+
+    for y in 0..size {
+        for x in 0..size {
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist <= radius {
+                img.put_pixel(x, y, Rgba([250, 252, 255, 245]));
+            }
+        }
+    }
+
+    let stroke = Rgba([33, 79, 188, 255]);
+    let left_x = (size as f32 * 0.32) as i32;
+    let right_x = (size as f32 * 0.68) as i32;
+    let top_y = (size as f32 * 0.28) as i32;
+    let bottom_y = (size as f32 * 0.74) as i32;
+    let cross_y = (size as f32 * 0.54) as i32;
+
+    draw_line(
+        &mut img,
+        left_x,
+        bottom_y,
+        (size as f32 * 0.5) as i32,
+        top_y,
+        stroke,
+    );
+    draw_line(
+        &mut img,
+        right_x,
+        bottom_y,
+        (size as f32 * 0.5) as i32,
+        top_y,
+        stroke,
+    );
+    draw_line(
+        &mut img,
+        (size as f32 * 0.39) as i32,
+        cross_y,
+        (size as f32 * 0.61) as i32,
+        cross_y,
+        stroke,
+    );
+
+    img
+}
+
+fn draw_line(img: &mut RgbaImage, mut x0: i32, mut y0: i32, x1: i32, y1: i32, color: Rgba<u8>) {
+    let dx = (x1 - x0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let dy = -(y1 - y0).abs();
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+
+    loop {
+        for oy in -1..=1 {
+            for ox in -1..=1 {
+                let px = x0 + ox;
+                let py = y0 + oy;
+                if px >= 0 && py >= 0 && (px as u32) < img.width() && (py as u32) < img.height() {
+                    img.put_pixel(px as u32, py as u32, color);
+                }
+            }
+        }
+
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x0 += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y0 += sy;
+        }
+    }
 }
 
 fn apply_styles() {
