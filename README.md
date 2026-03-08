@@ -6,7 +6,7 @@ Native Linux GUI client scaffold for Aethos.
 
 - Build all Linux work in this repository.
 - Provide a native GUI scaffold for Ubuntu/Debian.
-- Generate a local Wayfair ID.
+- Generate a local Wayfarer ID.
 - Communicate with Aethos Relays listening at:
   - `http://192.168.1.200:8082`
   - `http://192.168.1.200:9082`
@@ -16,8 +16,8 @@ Native Linux GUI client scaffold for Aethos.
 
 - Introduced `aethos_core` module for protocol message scaffolding.
 - Introduced `relay` module for endpoint normalization, `/ws` WS derivation, and relay transport probing.
-- Hello envelope now includes a Wayfair ID and serializes as JSON before send.
-- Wayfair ID now persists to native Linux user data storage (`$XDG_DATA_HOME` or `~/.local/share`).
+- Hello frame now follows `CLIENT_RELAY_PROTOCOL_V1` with `type`, `wayfarer_id`, and `device_id`.
+- Wayfarer ID now persists to native Linux user data storage (`$XDG_DATA_HOME` or `~/.local/share`).
 - UI includes explicit delete action and warning about key backup/data loss implications.
 - Applied first-pass cockpit/glass visual theme (blue/purple gradients + glass panel styling).
 
@@ -31,7 +31,7 @@ Native Linux GUI client scaffold for Aethos.
 
 ## Milestone 3 progress
 
-- Promoted identity persistence to include a generated Ed25519 signing key stored alongside Wayfair ID metadata with secure file permissions on Linux (0600).
+- Promoted identity persistence to include a generated Ed25519 signing key stored alongside Wayfarer ID metadata with secure file permissions on Linux (0600).
 - Added device profile persistence (device name + platform) as part of local identity lifecycle records.
 - Added encrypted local relay session cache storage using ChaCha20-Poly1305 at rest, keyed from local identity material.
 
@@ -42,14 +42,36 @@ Native Linux GUI client scaffold for Aethos.
 - Added relay diagnostics timeline view to keep a running log of per-relay probe outcomes and dispatcher metadata.
 - Added conversation/session list scaffold to start Milestone 4 session-view groundwork for later message-exchange integration.
 
+## Protocol migration progress
+
+- Added v1 client frame models for `send`, `pull`, and `ack` with input validation.
+- Added relay frame parser support for `hello_ok`, `send_ok`, `message`, `messages`, `ack_ok`, and `error`.
+- Added relay client helper APIs to execute v1 `send`/`pull`/`ack` exchanges after `hello`/`hello_ok` handshake.
+- Added Sessions view controls to trigger v1 `send`, `pull`, and `ack` calls against the configured relay and log outcomes.
+- Added a mock-relay integration-style test that exercises `send` -> `pull` -> `ack` over real local WebSocket sessions.
+- Added a local EnvelopeV1 composer utility so plaintext body + recipient can be encoded into canonical `payload_b64` before send.
+- Added EnvelopeV1 decode helpers so pulled `payload_b64` can be inspected as UTF-8 preview (or binary metadata fallback).
+- Performed a quick Sessions UI cleanup pass by grouping compose and relay operations into clearer sections.
+- Updated the Linux UI theme toward the iOS cosmic look (dark navy cards, cyan action buttons, violet accents).
+- Sessions view now presents desktop chat UX with contacts, thread pane, and bubble-style incoming/outgoing messages grouped by contact wayfarer ID.
+- App now opens directly to Chats for chat-first behavior.
+- Wayfarer identity is auto-provisioned on first launch and reset now requires an explicit destructive confirmation prompt.
+- Advanced send options were removed from the primary composer; sending now uses recipient + text body with automatic EnvelopeV1 payload composition.
+- Relay end-user send flow is now chat-only (recipient + text), with relay protocol controls removed from the primary UI to reduce misconfiguration risk.
+- Added chat interaction polish: auto-scroll to newest message, formatted message timestamps, and subtle visual pulse feedback on send/receive.
+- Added responsive compact behavior: on narrower windows, contacts collapse into a top contact picker and return to sidebar mode on wider layouts.
+- Added animated adaptive transitions between sidebar and compact contact-picker modes for smoother, mobile-like resizing behavior.
+- Added local contact naming: users can assign friendly names to wayfarer IDs, and aliases persist locally on that Linux device.
+- Added a dedicated `Contacts` tab for add/update/remove contact management; `Chats` is now message-only and uses selected managed contacts.
+
 ## Identity persistence
 
-Wayfair IDs are stored on disk so they survive app restarts:
+Wayfarer IDs are stored on disk so they survive app restarts:
 
 - Preferred path: `$XDG_DATA_HOME/aethos-linux/identity.json`
 - Fallback path: `~/.local/share/aethos-linux/identity.json`
 
-Deleting the Wayfair ID removes this local identity file. This is effectively like changing your email address; if users do not back up their keypair, they can lose access to data addressed to the old identity.
+Deleting the Wayfarer ID removes this local identity file. This is effectively like changing your email address; if users do not back up their keypair, they can lose access to data addressed to the old identity.
 
 ## Project layout
 

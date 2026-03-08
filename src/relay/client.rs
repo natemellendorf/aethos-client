@@ -5,7 +5,10 @@ use std::time::{Duration, Instant};
 use tungstenite::{client, Message};
 use url::Url;
 
-use crate::aethos_core::protocol::HelloEnvelope;
+use crate::aethos_core::protocol::{
+    is_valid_device_id, is_valid_wayfarer_id, AckFrame, HelloFrame, MessageItem, PullFrame,
+    RelayInboundFrame, SendFrame,
+};
 
 pub const RELAY_CONNECT_TIMEOUT_SECS: u64 = 5;
 
@@ -41,21 +44,186 @@ pub fn to_ws_endpoint(http_like: &str) -> String {
     url.to_string()
 }
 
-pub fn connect_to_relay(relay_ws: &str, wayfair_id: &str) -> String {
-    connect_to_relay_with_auth(relay_ws, wayfair_id, None)
+pub fn connect_to_relay(relay_ws: &str, wayfarer_id: &str, device_id: &str) -> String {
+    connect_to_relay_with_auth(relay_ws, wayfarer_id, device_id, None)
 }
 
 pub fn connect_to_relay_with_auth(
     relay_ws: &str,
-    wayfair_id: &str,
+    wayfarer_id: &str,
+    device_id: &str,
     auth_token: Option<&str>,
 ) -> String {
+    let mut socket = match open_relay_socket(relay_ws, auth_token) {
+        Ok(socket) => socket,
+        Err(err) => return err,
+    };
+
+    match complete_hello_handshake(&mut socket, wayfarer_id, device_id) {
+        Ok(relay_id) => match relay_id {
+            Some(relay_id) => format!("connected + hello_ok ({relay_id})"),
+            None => "connected + hello_ok".to_string(),
+        },
+        Err(err) => err,
+    }
+}
+
+#[allow(dead_code)]
+pub fn send_to_relay_v1(
+    relay_ws: &str,
+    wayfarer_id: &str,
+    device_id: &str,
+    to: &str,
+    payload_b64: &str,
+    client_msg_id: Option<&str>,
+    ttl_seconds: Option<i64>,
+) -> Result<(String, Option<i64>, Option<i64>), String> {
+    send_to_relay_v1_with_auth(
+        relay_ws,
+        wayfarer_id,
+        device_id,
+        to,
+        payload_b64,
+        client_msg_id,
+        ttl_seconds,
+        None,
+    )
+}
+
+#[allow(dead_code)]
+pub fn send_to_relay_v1_with_auth(
+    relay_ws: &str,
+    wayfarer_id: &str,
+    device_id: &str,
+    to: &str,
+    payload_b64: &str,
+    client_msg_id: Option<&str>,
+    ttl_seconds: Option<i64>,
+    auth_token: Option<&str>,
+) -> Result<(String, Option<i64>, Option<i64>), String> {
+    let frame = SendFrame::new(
+        to,
+        payload_b64,
+        client_msg_id.map(ToString::to_string),
+        ttl_seconds,
+    )?;
+
+    let mut socket = open_relay_socket(relay_ws, auth_token)?;
+    complete_hello_handshake(&mut socket, wayfarer_id, device_id)?;
+    send_json(&mut socket, &frame)?;
+
+    let (frame, raw) = read_relay_frame(&mut socket)?;
+    match frame {
+        RelayInboundFrame::SendOk {
+            msg_id,
+            received_at,
+            expires_at,
+        } => Ok((msg_id, received_at, expires_at)),
+        RelayInboundFrame::Message {
+            msg_id,
+            received_at,
+            ..
+        } => Ok((msg_id, Some(received_at), None)),
+        RelayInboundFrame::Error { code, message } => Err(format!(
+            "relay error {code} while sending: {message} (raw={raw})"
+        )),
+        other => Err(format!(
+            "unexpected relay frame after send: {other:?} (raw={raw})"
+        )),
+    }
+}
+
+#[allow(dead_code)]
+pub fn pull_from_relay_v1(
+    relay_ws: &str,
+    wayfarer_id: &str,
+    device_id: &str,
+    limit: Option<i64>,
+) -> Result<Vec<MessageItem>, String> {
+    pull_from_relay_v1_with_auth(relay_ws, wayfarer_id, device_id, limit, None)
+}
+
+#[allow(dead_code)]
+pub fn pull_from_relay_v1_with_auth(
+    relay_ws: &str,
+    wayfarer_id: &str,
+    device_id: &str,
+    limit: Option<i64>,
+    auth_token: Option<&str>,
+) -> Result<Vec<MessageItem>, String> {
+    let frame = PullFrame::new(limit)?;
+    let mut socket = open_relay_socket(relay_ws, auth_token)?;
+    complete_hello_handshake(&mut socket, wayfarer_id, device_id)?;
+    send_json(&mut socket, &frame)?;
+
+    let (frame, raw) = read_relay_frame(&mut socket)?;
+    match frame {
+        RelayInboundFrame::Message {
+            msg_id,
+            from_wayfarer_id,
+            payload_b64,
+            received_at,
+        } => Ok(vec![MessageItem {
+            msg_id,
+            from_wayfarer_id,
+            payload_b64,
+            received_at,
+        }]),
+        RelayInboundFrame::Messages { messages } => Ok(messages),
+        RelayInboundFrame::Error { code, message } => Err(format!(
+            "relay error {code} while pulling: {message} (raw={raw})"
+        )),
+        other => Err(format!(
+            "unexpected relay frame after pull: {other:?} (raw={raw})"
+        )),
+    }
+}
+
+#[allow(dead_code)]
+pub fn ack_relay_message_v1(
+    relay_ws: &str,
+    wayfarer_id: &str,
+    device_id: &str,
+    msg_id: &str,
+) -> Result<String, String> {
+    ack_relay_message_v1_with_auth(relay_ws, wayfarer_id, device_id, msg_id, None)
+}
+
+#[allow(dead_code)]
+pub fn ack_relay_message_v1_with_auth(
+    relay_ws: &str,
+    wayfarer_id: &str,
+    device_id: &str,
+    msg_id: &str,
+    auth_token: Option<&str>,
+) -> Result<String, String> {
+    let frame = AckFrame::new(msg_id)?;
+    let mut socket = open_relay_socket(relay_ws, auth_token)?;
+    complete_hello_handshake(&mut socket, wayfarer_id, device_id)?;
+    send_json(&mut socket, &frame)?;
+
+    let (frame, raw) = read_relay_frame(&mut socket)?;
+    match frame {
+        RelayInboundFrame::AckOk { msg_id } => Ok(msg_id),
+        RelayInboundFrame::Error { code, message } => Err(format!(
+            "relay error {code} while acking: {message} (raw={raw})"
+        )),
+        other => Err(format!(
+            "unexpected relay frame after ack: {other:?} (raw={raw})"
+        )),
+    }
+}
+
+fn open_relay_socket(
+    relay_ws: &str,
+    auth_token: Option<&str>,
+) -> Result<tungstenite::WebSocket<TcpStream>, String> {
     let Ok(url) = Url::parse(relay_ws) else {
-        return "invalid relay URL".to_string();
+        return Err("invalid relay URL".to_string());
     };
 
     let Some(host) = url.host_str() else {
-        return "relay URL missing host".to_string();
+        return Err("relay URL missing host".to_string());
     };
 
     let port = url.port_or_known_default().unwrap_or(80);
@@ -65,11 +233,11 @@ pub fn connect_to_relay_with_auth(
     let Ok(stream) = TcpStream::connect_timeout(
         &match socket_addr.parse() {
             Ok(addr) => addr,
-            Err(err) => return format!("invalid socket address: {err}"),
+            Err(err) => return Err(format!("invalid socket address: {err}")),
         },
         timeout,
     ) else {
-        return format!("tcp connection timeout/failure to {socket_addr}");
+        return Err(format!("tcp connection timeout/failure to {socket_addr}"));
     };
 
     let _ = stream.set_read_timeout(Some(timeout));
@@ -77,7 +245,7 @@ pub fn connect_to_relay_with_auth(
 
     let mut request = match tungstenite::client::IntoClientRequest::into_client_request(relay_ws) {
         Ok(request) => request,
-        Err(err) => return format!("invalid websocket request: {err}"),
+        Err(err) => return Err(format!("invalid websocket request: {err}")),
     };
 
     if let Some(token) = auth_token {
@@ -85,26 +253,64 @@ pub fn connect_to_relay_with_auth(
             Ok(header_value) => {
                 request.headers_mut().insert("Authorization", header_value);
             }
-            Err(err) => return format!("invalid auth token header: {err}"),
+            Err(err) => return Err(format!("invalid auth token header: {err}")),
         }
     }
 
     match client(request, stream) {
-        Ok((mut socket, _response)) => {
-            let envelope = HelloEnvelope::new(wayfair_id);
-            match envelope
-                .to_json()
-                .map_err(|err| err.to_string())
-                .and_then(|json| {
-                    socket
-                        .send(Message::Text(json))
-                        .map_err(|err| err.to_string())
-                }) {
-                Ok(_) => "connected + hello sent".to_string(),
-                Err(err) => format!("connected; hello send failed: {err}"),
-            }
+        Ok((socket, _response)) => Ok(socket),
+        Err(err) => Err(format!("websocket handshake failed: {err}")),
+    }
+}
+
+fn complete_hello_handshake(
+    socket: &mut tungstenite::WebSocket<TcpStream>,
+    wayfarer_id: &str,
+    device_id: &str,
+) -> Result<Option<String>, String> {
+    if !is_valid_wayfarer_id(wayfarer_id) {
+        return Err("invalid wayfarer_id format; expected 64 lowercase hex chars".to_string());
+    }
+    if !is_valid_device_id(device_id) {
+        return Err("invalid device_id format; expected non-empty value".to_string());
+    }
+
+    let hello = HelloFrame::new(wayfarer_id, device_id);
+    send_json(socket, &hello)?;
+
+    let (frame, raw) = read_relay_frame(socket)?;
+    match frame {
+        RelayInboundFrame::HelloOk { relay_id } => Ok(relay_id),
+        RelayInboundFrame::Error { code, message } => Err(format!(
+            "connected; relay error {code}: {message} (raw={raw})"
+        )),
+        other => Err(format!(
+            "connected; unexpected first frame after hello: {other:?} (raw={raw})"
+        )),
+    }
+}
+
+fn send_json<T: serde::Serialize>(
+    socket: &mut tungstenite::WebSocket<TcpStream>,
+    frame: &T,
+) -> Result<(), String> {
+    let text = serde_json::to_string(frame).map_err(|err| format!("json encode failed: {err}"))?;
+    socket
+        .send(Message::Text(text.into()))
+        .map_err(|err| format!("websocket send failed: {err}"))
+}
+
+fn read_relay_frame(
+    socket: &mut tungstenite::WebSocket<TcpStream>,
+) -> Result<(RelayInboundFrame, String), String> {
+    match socket.read() {
+        Ok(Message::Text(text)) => {
+            let parsed = RelayInboundFrame::from_json(&text)
+                .map_err(|err| format!("failed to parse relay frame: {err}; raw={text}"))?;
+            Ok((parsed, text.to_string()))
         }
-        Err(err) => format!("websocket handshake failed: {err}"),
+        Ok(other) => Err(format!("unexpected non-text relay frame: {other:?}")),
+        Err(err) => Err(format!("websocket read failed: {err}")),
     }
 }
 
@@ -300,14 +506,19 @@ impl RelayRequestDispatcher {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
     use std::time::{Duration, Instant};
 
     use serde_json::json;
+    use tungstenite::accept;
 
     use super::{
-        normalize_http_endpoint, to_ws_endpoint, DispatcherError, RelayRequestDispatcher,
-        RelaySessionConfig, RelaySessionManager,
+        ack_relay_message_v1, normalize_http_endpoint, pull_from_relay_v1, send_to_relay_v1,
+        to_ws_endpoint, DispatcherError, RelayRequestDispatcher, RelaySessionConfig,
+        RelaySessionManager,
     };
+    use crate::aethos_core::protocol::HelloFrame;
 
     #[test]
     fn normalizes_without_scheme() {
@@ -425,5 +636,162 @@ mod tests {
 
         let result = dispatcher.resolve_response(response);
         assert_eq!(result.err(), Some(DispatcherError::UnknownCorrelationId));
+    }
+
+    #[test]
+    fn hello_frame_uses_type_field() {
+        let frame = HelloFrame::new(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "device-1",
+        );
+        let serialized = frame.to_json().expect("serialize hello frame");
+        assert!(serialized.contains("\"type\":\"hello\""));
+        assert!(!serialized.contains("message_type"));
+    }
+
+    #[test]
+    fn send_pull_and_ack_roundtrip_against_mock_relay() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock relay listener");
+        let addr = listener.local_addr().expect("mock relay local addr");
+        let relay_ws = format!("ws://{addr}/ws");
+
+        let server = thread::spawn(move || {
+            for phase in 0..3 {
+                let (stream, _) = listener.accept().expect("accept mock relay connection");
+                handle_mock_session(stream, phase);
+            }
+        });
+
+        let local_wayfarer_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let peer_wayfarer_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let send_result = send_to_relay_v1(
+            &relay_ws,
+            local_wayfarer_id,
+            "device-1",
+            peer_wayfarer_id,
+            "SGVsbG8",
+            Some("550e8400-e29b-41d4-a716-446655440000"),
+            Some(3600),
+        )
+        .expect("send frame through mock relay");
+        assert_eq!(send_result.0, "msg-1");
+        assert_eq!(send_result.1, Some(1_700_000_000));
+        assert_eq!(send_result.2, Some(1_700_003_600));
+
+        let pulled = pull_from_relay_v1(&relay_ws, local_wayfarer_id, "device-1", Some(10))
+            .expect("pull frames through mock relay");
+        assert_eq!(pulled.len(), 1);
+        assert_eq!(pulled[0].msg_id, "msg-1");
+        assert_eq!(pulled[0].from_wayfarer_id, peer_wayfarer_id);
+
+        let acked = ack_relay_message_v1(&relay_ws, local_wayfarer_id, "device-1", "msg-1")
+            .expect("ack frame through mock relay");
+        assert_eq!(acked, "msg-1");
+
+        server.join().expect("mock relay server join");
+    }
+
+    #[test]
+    fn send_accepts_message_frame_fallback() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock relay listener");
+        let addr = listener.local_addr().expect("mock relay local addr");
+        let relay_ws = format!("ws://{addr}/ws");
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept mock relay connection");
+            let mut socket = accept(stream).expect("accept websocket");
+
+            let _ = read_text_frame(&mut socket);
+            socket
+                .send(tungstenite::Message::Text(
+                    "{\"type\":\"hello_ok\",\"relay_id\":\"relay-mock\"}".into(),
+                ))
+                .expect("send hello_ok");
+
+            let request_text = read_text_frame(&mut socket);
+            let request: serde_json::Value =
+                serde_json::from_str(&request_text).expect("parse send request");
+            assert_eq!(request["type"], "send");
+
+            socket
+                .send(tungstenite::Message::Text(
+                    "{\"type\":\"message\",\"msg_id\":\"msg-fallback\",\"from\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"payload_b64\":\"SGVsbG8\",\"received_at\":1700001111}".into(),
+                ))
+                .expect("send fallback message frame");
+        });
+
+        let result = send_to_relay_v1(
+            &relay_ws,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "device-1",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "SGVsbG8",
+            None,
+            Some(3600),
+        )
+        .expect("send succeeds with message frame fallback");
+
+        assert_eq!(result.0, "msg-fallback");
+        assert_eq!(result.1, Some(1_700_001_111));
+        assert_eq!(result.2, None);
+
+        server.join().expect("mock relay server join");
+    }
+
+    fn handle_mock_session(stream: TcpStream, phase: usize) {
+        let mut socket = accept(stream).expect("accept websocket");
+
+        let hello_text = read_text_frame(&mut socket);
+        let hello: serde_json::Value = serde_json::from_str(&hello_text).expect("parse hello");
+        assert_eq!(hello["type"], "hello");
+        assert!(hello.get("wayfarer_id").is_some());
+        assert!(hello.get("device_id").is_some());
+
+        socket
+            .send(tungstenite::Message::Text(
+                "{\"type\":\"hello_ok\",\"relay_id\":\"relay-mock\"}".into(),
+            ))
+            .expect("send hello_ok");
+
+        let request_text = read_text_frame(&mut socket);
+        let request: serde_json::Value =
+            serde_json::from_str(&request_text).expect("parse request frame");
+
+        match phase {
+            0 => {
+                assert_eq!(request["type"], "send");
+                socket
+                    .send(tungstenite::Message::Text(
+                        "{\"type\":\"send_ok\",\"msg_id\":\"msg-1\",\"received_at\":1700000000,\"expires_at\":1700003600}".into(),
+                    ))
+                    .expect("send send_ok");
+            }
+            1 => {
+                assert_eq!(request["type"], "pull");
+                socket
+                    .send(tungstenite::Message::Text(
+                        "{\"type\":\"messages\",\"messages\":[{\"msg_id\":\"msg-1\",\"from\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"payload_b64\":\"SGVsbG8\",\"received_at\":1700000000}]}".into(),
+                    ))
+                    .expect("send messages");
+            }
+            2 => {
+                assert_eq!(request["type"], "ack");
+                assert_eq!(request["msg_id"], "msg-1");
+                socket
+                    .send(tungstenite::Message::Text(
+                        "{\"type\":\"ack_ok\",\"msg_id\":\"msg-1\"}".into(),
+                    ))
+                    .expect("send ack_ok");
+            }
+            _ => panic!("unexpected mock phase"),
+        }
+    }
+
+    fn read_text_frame(socket: &mut tungstenite::WebSocket<TcpStream>) -> String {
+        match socket.read().expect("read websocket frame") {
+            tungstenite::Message::Text(text) => text.to_string(),
+            other => panic!("expected text frame, got {other:?}"),
+        }
     }
 }
