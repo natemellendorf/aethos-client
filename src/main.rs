@@ -7,9 +7,10 @@ use gtk4::pango::EllipsizeMode;
 use gtk4::prelude::*;
 use gtk4::{
     glib, Application, ApplicationWindow, Box as GtkBox, Button, CheckButton, ComboBoxText,
-    CssProvider, Dialog, DrawingArea, Entry, Image, Label, ListBox, ListBoxRow, Orientation, Paned,
-    Popover, PositionType, ResponseType, Revealer, RevealerTransitionType, ScrolledWindow, Stack,
-    StackSwitcher, TextView, STYLE_PROVIDER_PRIORITY_APPLICATION,
+    CssProvider, Dialog, DrawingArea, Entry, FileChooserAction, FileChooserNative, Image, Label,
+    ListBox, ListBoxRow, Orientation, Paned, Popover, PositionType, ResponseType, Revealer,
+    RevealerTransitionType, ScrolledWindow, Stack, StackSwitcher, TextView,
+    STYLE_PROVIDER_PRIORITY_APPLICATION,
 };
 use image::{imageops::FilterType, ImageBuffer, Luma, Rgba, RgbaImage};
 use qrcode::QrCode;
@@ -484,6 +485,8 @@ fn build_ui(app: &Application) {
     compact_picker_revealer.set_child(Some(&compact_contact_picker));
     let id_toggle_button = Button::with_label("Show Full ID");
     id_toggle_button.add_css_class("compact");
+    let quick_add_contact_button = Button::with_label("Add Contact");
+    quick_add_contact_button.add_css_class("compact");
 
     let thread_header = GtkBox::new(Orientation::Horizontal, 8);
     let thread_header_labels = GtkBox::new(Orientation::Vertical, 0);
@@ -491,6 +494,7 @@ fn build_ui(app: &Application) {
     thread_header_labels.append(&thread_contact_id_label);
     thread_header_labels.append(&compact_picker_revealer);
     thread_header.append(&thread_header_labels);
+    thread_header.append(&quick_add_contact_button);
     thread_header.append(&id_toggle_button);
     let messages_list = ListBox::new();
     messages_list.add_css_class("messages-list");
@@ -603,7 +607,10 @@ fn build_ui(app: &Application) {
     add_update_contact_button.add_css_class("action");
     let remove_contact_button = Button::with_label("Remove Contact");
     remove_contact_button.add_css_class("danger");
+    let import_qr_button = Button::with_label("Import QR");
+    import_qr_button.add_css_class("compact");
     contacts_actions.append(&add_update_contact_button);
+    contacts_actions.append(&import_qr_button);
     contacts_actions.append(&remove_contact_button);
 
     contacts_panel.append(&contacts_manage_title);
@@ -632,6 +639,8 @@ fn build_ui(app: &Application) {
     let share_wayfarer_entry = Entry::builder().hexpand(true).editable(false).build();
     let copy_wayfarer_button = Button::with_label("Copy Wayfarer ID");
     copy_wayfarer_button.add_css_class("compact");
+    let save_qr_button = Button::with_label("Save QR Image");
+    save_qr_button.add_css_class("compact");
     let share_qr_image = Image::new();
     share_qr_image.set_pixel_size(280);
     share_qr_image.set_halign(gtk4::Align::Center);
@@ -643,6 +652,7 @@ fn build_ui(app: &Application) {
     share_panel.append(&share_hint);
     share_panel.append(&share_wayfarer_entry);
     share_panel.append(&copy_wayfarer_button);
+    share_panel.append(&save_qr_button);
     share_panel.append(&share_qr_image);
     share_panel.append(&share_status_label);
 
@@ -741,6 +751,58 @@ fn build_ui(app: &Application) {
                     .set_text(share_wayfarer_entry.text().as_ref());
                 show_copied_popover(&copy_wayfarer_popover_anchor);
             }
+        });
+    }
+
+    {
+        let window = window.clone();
+        let share_wayfarer_entry = share_wayfarer_entry.clone();
+        let share_status_label = share_status_label.clone();
+        save_qr_button.connect_clicked(move |_| {
+            let wayfarer_id = share_wayfarer_entry.text().trim().to_string();
+            if !is_valid_wayfarer_id(&wayfarer_id) {
+                share_status_label.set_text("QR save unavailable: identity not ready");
+                return;
+            }
+
+            let source_path = match generate_share_qr_png(&wayfarer_id) {
+                Ok(path) => path,
+                Err(err) => {
+                    share_status_label.set_text(&format!("QR generation failed: {err}"));
+                    return;
+                }
+            };
+
+            let chooser = FileChooserNative::builder()
+                .title("Save Your QR Code")
+                .transient_for(&window)
+                .action(FileChooserAction::Save)
+                .accept_label("Save")
+                .cancel_label("Cancel")
+                .build();
+            chooser.set_current_name(&format!(
+                "aethos-wayfarer-{}.png",
+                tiny_wayfarer(&wayfarer_id)
+            ));
+
+            let share_status_label = share_status_label.clone();
+            chooser.connect_response(move |dialog, response| {
+                if response == ResponseType::Accept {
+                    if let Some(file) = dialog.file() {
+                        if let Some(target_path) = file.path() {
+                            match fs::copy(&source_path, &target_path) {
+                                Ok(_) => share_status_label
+                                    .set_text(&format!("QR saved: {}", target_path.display())),
+                                Err(err) => {
+                                    share_status_label.set_text(&format!("QR save failed: {err}"))
+                                }
+                            }
+                        }
+                    }
+                }
+                dialog.hide();
+            });
+            chooser.show();
         });
     }
 
@@ -1078,6 +1140,60 @@ fn build_ui(app: &Application) {
                 recipient_entry.set_text(selected);
             }
             chat_status_label.set_text("Contact saved locally");
+        });
+    }
+
+    {
+        let chat_state = Rc::clone(&chat_state);
+        let new_contact_id_entry = new_contact_id_entry.clone();
+        let add_update_contact_button = add_update_contact_button.clone();
+        let chat_status_label = chat_status_label.clone();
+        quick_add_contact_button.connect_clicked(move |_| {
+            let Some(contact_id) = chat_state.borrow().selected_contact.clone() else {
+                chat_status_label.set_text("Select a chat thread first to add that contact");
+                return;
+            };
+            new_contact_id_entry.set_text(&contact_id);
+            add_update_contact_button.emit_clicked();
+        });
+    }
+
+    {
+        let window = window.clone();
+        let new_contact_id_entry = new_contact_id_entry.clone();
+        let add_update_contact_button = add_update_contact_button.clone();
+        let chat_status_label = chat_status_label.clone();
+        import_qr_button.connect_clicked(move |_| {
+            let chooser = FileChooserNative::builder()
+                .title("Import Contact QR")
+                .transient_for(&window)
+                .action(FileChooserAction::Open)
+                .accept_label("Import")
+                .cancel_label("Cancel")
+                .build();
+
+            let new_contact_id_entry = new_contact_id_entry.clone();
+            let add_update_contact_button = add_update_contact_button.clone();
+            let chat_status_label = chat_status_label.clone();
+            chooser.connect_response(move |dialog, response| {
+                if response == ResponseType::Accept {
+                    if let Some(file) = dialog.file() {
+                        if let Some(path) = file.path() {
+                            match decode_wayfarer_id_from_qr_file(&path) {
+                                Ok(wayfarer_id) => {
+                                    new_contact_id_entry.set_text(&wayfarer_id);
+                                    add_update_contact_button.emit_clicked();
+                                }
+                                Err(err) => {
+                                    chat_status_label.set_text(&format!("QR import failed: {err}"));
+                                }
+                            }
+                        }
+                    }
+                }
+                dialog.hide();
+            });
+            chooser.show();
         });
     }
 
@@ -4072,6 +4188,59 @@ fn refresh_share_qr(wayfarer_id: &str, share_qr_image: &Image, share_status_labe
     }
 }
 
+fn decode_wayfarer_id_from_qr_file(path: &Path) -> Result<String, String> {
+    let image = image::open(path)
+        .map_err(|err| format!("failed to open image {}: {err}", path.display()))?
+        .to_luma8();
+
+    let mut prepared = rqrr::PreparedImage::prepare(image);
+    let grids = prepared.detect_grids();
+    if grids.is_empty() {
+        return Err("no QR code detected in image".to_string());
+    }
+
+    for grid in grids {
+        let Ok((_meta, content)) = grid.decode() else {
+            continue;
+        };
+        if let Some(wayfarer_id) = extract_wayfarer_id_from_text(&content) {
+            return Ok(wayfarer_id);
+        }
+    }
+
+    Err("QR payload does not contain a valid Wayfarer ID".to_string())
+}
+
+fn extract_wayfarer_id_from_text(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if is_valid_wayfarer_id(trimmed) {
+        return Some(trimmed.to_string());
+    }
+
+    let lowered = trimmed.to_ascii_lowercase();
+    for prefix in ["aethos:", "wayfarer:", "aethos://"] {
+        if let Some(rest) = lowered.strip_prefix(prefix) {
+            let candidate = rest.trim_matches('/').trim();
+            if is_valid_wayfarer_id(candidate) {
+                return Some(candidate.to_string());
+            }
+        }
+    }
+
+    let bytes = lowered.as_bytes();
+    for start in 0..bytes.len() {
+        if start + 64 > bytes.len() {
+            break;
+        }
+        let candidate = &lowered[start..start + 64];
+        if is_valid_wayfarer_id(candidate) {
+            return Some(candidate.to_string());
+        }
+    }
+
+    None
+}
+
 fn generate_share_qr_png(wayfarer_id: &str) -> Result<PathBuf, String> {
     let code = QrCode::new(wayfarer_id.as_bytes())
         .map_err(|err| format!("failed generating QR payload: {err}"))?;
@@ -4638,7 +4807,7 @@ fn apply_styles() {
 
 #[cfg(test)]
 mod tests {
-    use super::{update_relay_sync_setting, AppSettings};
+    use super::{extract_wayfarer_id_from_text, update_relay_sync_setting, AppSettings};
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -4668,5 +4837,29 @@ mod tests {
         drop(writable);
 
         assert!(!app_settings.borrow().relay_sync_enabled);
+    }
+
+    #[test]
+    fn extracts_wayfarer_id_from_plain_payload() {
+        let id = "a".repeat(64);
+        assert_eq!(extract_wayfarer_id_from_text(&id), Some(id));
+    }
+
+    #[test]
+    fn extracts_wayfarer_id_from_prefixed_payload() {
+        let id = "b".repeat(64);
+        assert_eq!(
+            extract_wayfarer_id_from_text(&format!("aethos:{id}")),
+            Some(id)
+        );
+    }
+
+    #[test]
+    fn extracts_wayfarer_id_from_embedded_text() {
+        let id = "c".repeat(64);
+        assert_eq!(
+            extract_wayfarer_id_from_text(&format!("scan={id}&source=camera")),
+            Some(id)
+        );
     }
 }

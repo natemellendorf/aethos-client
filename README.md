@@ -108,6 +108,9 @@ powershell -ExecutionPolicy Bypass -Command "$tmp = Join-Path $env:TEMP 'install
 - Added a dedicated `Contacts` tab for add/update/remove contact management; `Chats` is now message-only and uses selected managed contacts.
 - Added local chat-history persistence so sent/received thread messages survive app restart.
 - Added a `Share` tab with QR generation for Wayfarer ID and centered feather mark overlay.
+- Added a `Save QR Image` action in Share so users can export their QR code for out-of-band contact exchange.
+- Added QR contact import from image files in `Contacts` so Wayfarer IDs can be scanned instead of typed manually.
+- Added quick one-click contact add from active chat thread header.
 - Added Gossip Sync v1 frame models and validation for `inventory_summary`, `missing_request`, `transfer`, and `receipt`.
 - Added local gossip inventory persistence for canonical `EnvelopeV1` payload metadata and deduped `item_id` storage.
 - Added direct LAN gossip sync over UDP broadcast (`47655`) so Linux clients can exchange pending Aethos envelopes without a relay path.
