@@ -2,9 +2,9 @@
   <img src="https://raw.githubusercontent.com/natemellendorf/aethos/refs/heads/main/docs/img/banner.jpg" alt="Aethos banner" width="960">
 </p>
 
-# aethos-linux
+# aethos-client
 
-Native Linux GUI client scaffold for Aethos.
+Cross-platform desktop client for Aethos (Linux, macOS, Windows).
 
 ## Install
 
@@ -17,16 +17,13 @@ curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-client/main/s
 ### Windows (PowerShell)
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
+powershell -ExecutionPolicy Bypass -Command "$tmp = Join-Path $env:TEMP 'install-aethos.ps1'; iwr https://raw.githubusercontent.com/natemellendorf/aethos-client/main/scripts/install.ps1 -UseBasicParsing -OutFile $tmp; & $tmp"
 ```
 
 This installer will:
 
-- install required Ubuntu/Debian packages (when `apt-get` is available)
-- install Rust via rustup if `cargo` is missing
-- download the selected source ref from GitHub
-- build `aethos` in release mode
-- install the binary to `~/.local/bin/aethos` (with compatibility alias `aethos-linux`)
+- download the selected release artifact from GitHub for the local OS/arch
+- install the binary to your local bin directory as `aethos` (with compatibility alias `aethos-linux`)
 - on macOS, validate Homebrew + `gtk4` runtime availability (and fail with install guidance if missing)
 
 By default, if `--ref` is not provided, installers resolve the latest official GitHub release tag and download a prebuilt binary artifact for the local OS/arch.
@@ -45,13 +42,13 @@ curl -fsSL https://raw.githubusercontent.com/natemellendorf/aethos-client/main/s
 
 ```powershell
 # Windows specific tag install
-powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Ref v0.2.0
+powershell -ExecutionPolicy Bypass -Command "$tmp = Join-Path $env:TEMP 'install-aethos.ps1'; iwr https://raw.githubusercontent.com/natemellendorf/aethos-client/main/scripts/install.ps1 -UseBasicParsing -OutFile $tmp; & $tmp -Ref v0.2.0"
 ```
 
 ## MVP 0 goals
 
-- Build all Linux work in this repository.
-- Provide a native GUI scaffold for Ubuntu/Debian.
+- Build all desktop client work in this repository.
+- Provide a native GUI scaffold for Linux/macOS/Windows.
 - Generate a local Wayfarer ID.
 - Communicate with Aethos Relays listening at:
   - `http://192.168.1.200:8082`
@@ -63,7 +60,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Ref v0.2.0
 - Introduced `aethos_core` module for protocol message scaffolding.
 - Introduced `relay` module for endpoint normalization, `/ws` WS derivation, and relay transport probing.
 - Hello frame now follows `CLIENT_RELAY_PROTOCOL_V1` with `type`, `wayfarer_id`, and `device_id`.
-- Wayfarer ID now persists to native Linux user data storage (`$XDG_DATA_HOME` or `~/.local/share`).
+- Wayfarer ID now persists to native local user data storage (`$XDG_DATA_HOME` or `~/.local/share` on Linux).
 - UI includes explicit delete action and warning about key backup/data loss implications.
 - Applied first-pass cockpit/glass visual theme (blue/purple gradients + glass panel styling).
 
@@ -123,6 +120,8 @@ Wayfarer IDs are stored on disk so they survive app restarts:
 - Preferred path: `$XDG_DATA_HOME/aethos-linux/identity.json`
 - Fallback path: `~/.local/share/aethos-linux/identity.json`
 
+These paths currently keep the `aethos-linux` directory name for backward compatibility.
+
 Deleting the Wayfarer ID removes this local identity file. This is effectively like changing your email address; if users do not back up their keypair, they can lose access to data addressed to the old identity.
 
 ## Project layout
@@ -138,9 +137,11 @@ src/
   main.rs
 ```
 
-## Prerequisites (Ubuntu/Debian)
+## Prerequisites (source build)
 
-Install Rust and GTK4 development packages:
+If building from source, install Rust and platform GTK4 development/runtime dependencies.
+
+Ubuntu/Debian example:
 
 ```bash
 sudo apt update

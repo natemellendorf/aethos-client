@@ -136,7 +136,7 @@ perl -0777 -i -pe 's/^version = "[0-9]+\.[0-9]+\.[0-9]+"/version = "'"${next}"'"
 
 cargo test
 
-git add Cargo.toml
+git add Cargo.toml Cargo.lock
 git commit -m "chore(release): ${tag}"
 git tag -a "${tag}" -m "Release ${tag}"
 

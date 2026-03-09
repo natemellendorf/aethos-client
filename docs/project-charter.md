@@ -1,20 +1,20 @@
-# Aethos Linux Client Charter (MVP 0 -> MVP 1)
+# Aethos Client Charter (MVP 0 -> MVP 1)
 
 ## Purpose
 
-Create a native Linux GUI client that implements the Aethos protocol natively (without Swift),
-starting with Ubuntu/Debian and extending to broader targets later.
+Create a native desktop GUI client that implements the Aethos protocol natively (without Swift),
+with Linux as the first platform and macOS/Windows support as part of distribution milestones.
 
 ## Principles
 
-1. **Native implementation**: Linux-specific library and app logic should not depend on Swift runtime.
+1. **Native implementation**: Client library and app logic should not depend on Swift runtime.
 2. **Protocol fidelity**: Keep behavior aligned with Aethos protocol and relay contract.
 3. **Transport abstraction**: Decouple relay transport from local radio transport.
 4. **Incremental delivery**: Land small, testable milestones.
 
 ## MVP 0 Scope (this repository state)
 
-- Rust GTK GUI scaffold for Linux desktop.
+- Rust GTK GUI scaffold for desktop targets.
 - Wayfair ID generation in-client (UUID v4 placeholder).
 - Relay connectivity checks over WebSocket, derived from configured HTTP relay addresses.
 - Runtime-editable relay endpoint configuration (IP/host and port).
@@ -23,7 +23,7 @@ starting with Ubuntu/Debian and extending to broader targets later.
 
 ## MVP 0 Exit Criteria
 
-- [x] App launches on Linux desktop with GTK.
+- [x] App launches on desktop with GTK runtime available.
 - [x] User can generate a Wayfair ID from the GUI.
 - [x] App attempts relay WebSocket connections to both configured endpoints.
 - [x] App surfaces connection status in the GUI for each relay.
@@ -36,7 +36,7 @@ starting with Ubuntu/Debian and extending to broader targets later.
 - [x] Create `aethos_core::protocol` for hello envelope schema + serialization.
 - [x] Create `relay::client` for endpoint normalization and relay probe transport logic.
 - [x] Wire GUI to use module APIs instead of inline transport/protocol code.
-- [x] Add initial cockpit/glass visual direction pass for Linux desktop UI.
+- [x] Add initial cockpit/glass visual direction pass for desktop UI.
 
 
 ### Milestone 1: Core protocol crate
@@ -69,7 +69,7 @@ starting with Ubuntu/Debian and extending to broader targets later.
 ### Milestone 5: Local radio transports
 
 - [~] Abstract transport interfaces for Wi-Fi/Bluetooth/Cellular pathways (Gossip Sync v1 LAN profile landed over UDP).
-- [~] Integrate Linux-compatible transport plugins (LAN direct gossip path landed; Bluetooth pending).
+- [~] Integrate desktop-compatible transport plugins (LAN direct gossip path landed; Bluetooth pending).
 - [~] Route peer communication direct-first, relay fallback second (relay + LAN inventory convergence landed; policy tuning pending).
 
 ### Milestone 6: Packaging and distribution
@@ -82,4 +82,4 @@ starting with Ubuntu/Debian and extending to broader targets later.
 
 - **Spec drift risk**: Track upstream protocol changes with version gates.
 - **Transport complexity**: Keep clear adapter boundaries and conformance tests.
-- **Desktop dependency variance**: Document Ubuntu/Debian package prerequisites.
+- **Desktop dependency variance**: Document Linux/macOS/Windows runtime prerequisites.
