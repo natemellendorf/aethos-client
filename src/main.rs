@@ -230,7 +230,7 @@ fn build_ui(app: &Application) {
 
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("Aethos Chat · Linux")
+        .title("Aethos")
         .default_width(980)
         .default_height(680)
         .build();
@@ -592,7 +592,7 @@ fn build_ui(app: &Application) {
     contact_alias_label.add_css_class("field-label");
     contact_alias_label.set_xalign(0.0);
     let contact_alias_hint = Label::new(Some(
-        "Optional nickname stored only on this Linux device. Leave blank to use Wayfarer ID.",
+        "Optional nickname stored only on this device. Leave blank to use Wayfarer ID.",
     ));
     contact_alias_hint.add_css_class("field-hint");
     contact_alias_hint.set_xalign(0.0);
@@ -3727,7 +3727,7 @@ fn ensure_linux_desktop_integration() -> Result<(), String> {
             .map_err(|err| format!("failed to determine executable path: {err}"))?;
 
         let desktop = format!(
-            "[Desktop Entry]\nType=Application\nName=Aethos Linux\nExec={}\nIcon={}\nTerminal=false\nCategories=Network;Chat;\nStartupNotify=true\nStartupWMClass={}\n",
+            "[Desktop Entry]\nType=Application\nName=Aethos\nExec={}\nIcon={}\nTerminal=false\nCategories=Network;Chat;\nStartupNotify=true\nStartupWMClass={}\n",
             shell_escape(exec.as_os_str().to_string_lossy().as_ref()),
             APP_ID,
             APP_ID,
@@ -3749,7 +3749,7 @@ fn shell_escape(value: &str) -> String {
 
 fn build_version_text() -> String {
     let git_sha = option_env!("AETHOS_GIT_SHA").unwrap_or("dev");
-    format!("Aethos Linux v{APP_VERSION} (build {git_sha})")
+    format!("Aethos v{APP_VERSION} (build {git_sha})")
 }
 
 fn append_local_log(message: &str) {
