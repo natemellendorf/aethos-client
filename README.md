@@ -27,6 +27,7 @@ This installer will:
 - download the selected source ref from GitHub
 - build `aethos` in release mode
 - install the binary to `~/.local/bin/aethos` (with compatibility alias `aethos-linux`)
+- on macOS, validate Homebrew + `gtk4` runtime availability (and fail with install guidance if missing)
 
 By default, if `--ref` is not provided, installers resolve the latest official GitHub release tag and download a prebuilt binary artifact for the local OS/arch.
 

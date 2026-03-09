@@ -234,6 +234,7 @@ fn build_ui(app: &Application) {
         .default_width(980)
         .default_height(680)
         .build();
+    window.set_resizable(true);
     window.set_icon_name(Some(APP_ID));
 
     let root = GtkBox::new(Orientation::Vertical, 12);
@@ -300,6 +301,8 @@ fn build_ui(app: &Application) {
     let views = Stack::new();
     views.set_hexpand(true);
     views.set_vexpand(true);
+    views.set_hhomogeneous(false);
+    views.set_vhomogeneous(false);
     tab_switcher.set_stack(Some(&views));
 
     let onboarding_panel = GtkBox::new(Orientation::Vertical, 10);
@@ -442,13 +445,13 @@ fn build_ui(app: &Application) {
 
     let contacts_column = GtkBox::new(Orientation::Vertical, 8);
     contacts_column.add_css_class("contacts-pane");
-    contacts_column.set_hexpand(true);
+    contacts_column.set_hexpand(false);
     let contacts_title = Label::new(Some("Contacts"));
     contacts_title.add_css_class("section-title");
     contacts_title.set_xalign(0.0);
     let contacts_list = ListBox::new();
     contacts_list.add_css_class("contact-list");
-    let contacts_scroll = ScrolledWindow::builder().min_content_width(260).build();
+    let contacts_scroll = ScrolledWindow::builder().min_content_width(150).build();
     contacts_scroll.set_vexpand(true);
     contacts_scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
     contacts_scroll.set_child(Some(&contacts_list));
@@ -559,7 +562,7 @@ fn build_ui(app: &Application) {
 
     let contacts_manage_list = ListBox::new();
     contacts_manage_list.add_css_class("contact-list");
-    let contacts_manage_scroll = ScrolledWindow::builder().min_content_height(280).build();
+    let contacts_manage_scroll = ScrolledWindow::builder().min_content_height(160).build();
     contacts_manage_scroll.set_child(Some(&contacts_manage_list));
     contacts_manage_scroll.set_vexpand(true);
 
@@ -4459,11 +4462,11 @@ fn apply_styles() {
         }
 
         .chat-shell {
-            min-height: 300px;
+            min-height: 160px;
         }
 
         .contacts-pane {
-            min-width: 230px;
+            min-width: 140px;
         }
 
         .composer-bar {

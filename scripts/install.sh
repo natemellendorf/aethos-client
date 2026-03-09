@@ -50,6 +50,28 @@ need_prereqs() {
   has_cmd tar || fail "tar is required"
 }
 
+ensure_runtime_deps() {
+  local os
+  os="$(uname -s)"
+
+  case "$os" in
+    Darwin)
+      has_cmd brew || fail "Homebrew is required on macOS. Install from https://brew.sh then run: brew install gtk4 pkg-config"
+      if ! brew list --versions gtk4 >/dev/null 2>&1; then
+        fail "Missing macOS runtime dependency: gtk4. Install with: brew install gtk4 pkg-config"
+      fi
+      if ! has_cmd pkg-config; then
+        fail "Missing pkg-config. Install with: brew install pkg-config"
+      fi
+      ;;
+    Linux)
+      # Linux runtime packages vary by distro. If GTK runtime is missing,
+      # launch will fail with a dynamic linker error and package manager should
+      # be used to install gtk4/glib runtime packages.
+      ;;
+  esac
+}
+
 detect_target() {
   local os arch
   os="$(uname -s)"
@@ -190,6 +212,7 @@ main() {
   parse_args "$@"
   need_prereqs
   detect_target
+  ensure_runtime_deps
   resolve_ref
   install_from_release_asset
   log "Done. Run 'aethos'"
