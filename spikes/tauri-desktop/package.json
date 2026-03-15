@@ -1,0 +1,17 @@
+{
+  "name": "aethos-tauri-spike",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "python3 -m http.server 1420 --bind 127.0.0.1 --directory web",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2"
+  }
+}
