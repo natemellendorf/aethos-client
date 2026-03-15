@@ -880,6 +880,10 @@ fn build_ui(app: &Application) {
         relay_secondary_label.set_text("Secondary relay status: relay sync disabled in settings");
         set_relay_chip_disabled(&relay_dot, &relay_chip_text, &relay_chip);
         connect_button.set_sensitive(false);
+    } else if app_settings.borrow().relay_endpoints.is_empty() {
+        relay_primary_label.set_text("Primary relay status: no relay configured");
+        relay_secondary_label.set_text("Secondary relay status: no relay configured");
+        set_relay_chip_no_config(&relay_dot, &relay_chip_text, &relay_chip);
     }
 
     if gossip_sync_enabled.load(Ordering::SeqCst) {
@@ -1787,9 +1791,15 @@ fn build_ui(app: &Application) {
                 update_relay_sync_setting(&app_settings, &relay_sync_enabled, toggle.is_active());
 
             if settings_snapshot.relay_sync_enabled {
-                relay_primary_label.set_text("Primary relay status: idle");
-                relay_secondary_label.set_text("Secondary relay status: idle");
-                update_relay_chip("idle", "idle", &relay_dot, &relay_chip_text, &relay_chip);
+                if settings_snapshot.relay_endpoints.is_empty() {
+                    relay_primary_label.set_text("Primary relay status: no relay configured");
+                    relay_secondary_label.set_text("Secondary relay status: no relay configured");
+                    set_relay_chip_no_config(&relay_dot, &relay_chip_text, &relay_chip);
+                } else {
+                    relay_primary_label.set_text("Primary relay status: idle");
+                    relay_secondary_label.set_text("Secondary relay status: idle");
+                    update_relay_chip("idle", "idle", &relay_dot, &relay_chip_text, &relay_chip);
+                }
                 connect_button.set_sensitive(true);
                 connect_button.emit_clicked();
             } else {
@@ -1933,6 +1943,11 @@ fn build_ui(app: &Application) {
         let relay_list_order = Rc::clone(&relay_list_order);
         let relay_entry = relay_entry.clone();
         let remove_relay_button = remove_relay_button.clone();
+        let relay_primary_label = relay_primary_label.clone();
+        let relay_secondary_label = relay_secondary_label.clone();
+        let relay_dot = relay_dot.clone();
+        let relay_chip_text = relay_chip_text.clone();
+        let relay_chip = relay_chip.clone();
         add_relay_button.connect_clicked(move |_| {
             let candidate = normalize_http_endpoint(&relay_entry.text());
             if candidate.trim().is_empty() {
@@ -1954,6 +1969,9 @@ fn build_ui(app: &Application) {
             render_relay_list(&settings.relay_endpoints, &relay_list, &relay_list_order);
             select_relay_row_by_value(&relay_list, &relay_list_order, &candidate);
             remove_relay_button.set_sensitive(true);
+            relay_primary_label.set_text("Primary relay status: idle");
+            relay_secondary_label.set_text("Secondary relay status: idle");
+            update_relay_chip("idle", "idle", &relay_dot, &relay_chip_text, &relay_chip);
         });
     }
 
@@ -1964,6 +1982,11 @@ fn build_ui(app: &Application) {
         let relay_entry = relay_entry.clone();
         let remove_relay_button_for_click = remove_relay_button.clone();
         let remove_relay_button_state = remove_relay_button_for_click.clone();
+        let relay_primary_label = relay_primary_label.clone();
+        let relay_secondary_label = relay_secondary_label.clone();
+        let relay_dot = relay_dot.clone();
+        let relay_chip_text = relay_chip_text.clone();
+        let relay_chip = relay_chip.clone();
         remove_relay_button_for_click.connect_clicked(move |_| {
             let idx = relay_list
                 .selected_row()
@@ -1982,6 +2005,15 @@ fn build_ui(app: &Application) {
             render_relay_list(&settings.relay_endpoints, &relay_list, &relay_list_order);
             relay_entry.set_text("");
             remove_relay_button_state.set_sensitive(false);
+            if settings.relay_endpoints.is_empty() {
+                relay_primary_label.set_text("Primary relay status: no relay configured");
+                relay_secondary_label.set_text("Secondary relay status: no relay configured");
+                set_relay_chip_no_config(&relay_dot, &relay_chip_text, &relay_chip);
+            } else {
+                relay_primary_label.set_text("Primary relay status: idle");
+                relay_secondary_label.set_text("Secondary relay status: idle");
+                update_relay_chip("idle", "idle", &relay_dot, &relay_chip_text, &relay_chip);
+            }
         });
     }
 
@@ -2002,7 +2034,11 @@ fn build_ui(app: &Application) {
         let share_status_label = share_status_label.clone();
         let app_settings = Rc::clone(&app_settings);
         let relay_sync_enabled = Arc::clone(&relay_sync_enabled);
+        let relay_primary_label = relay_primary_label.clone();
         let relay_secondary_label = relay_secondary_label.clone();
+        let relay_dot = relay_dot.clone();
+        let relay_chip_text = relay_chip_text.clone();
+        let relay_chip = relay_chip.clone();
         connect_button.connect_clicked(move |button| {
             button.set_sensitive(false);
 
@@ -2036,7 +2072,9 @@ fn build_ui(app: &Application) {
 
             let relay_endpoints = app_settings.borrow().relay_endpoints.clone();
             if relay_endpoints.is_empty() {
+                relay_primary_label.set_text("Primary relay status: no relay configured");
                 relay_secondary_label.set_text("Secondary relay status: no relay configured");
+                set_relay_chip_no_config(&relay_dot, &relay_chip_text, &relay_chip);
                 button.set_sensitive(true);
                 return;
             }
@@ -2058,22 +2096,6 @@ fn build_ui(app: &Application) {
             button.set_sensitive(false);
             shared_log_verbose("send_click: user initiated outbound send");
 
-            if !relay_sync_enabled.load(Ordering::SeqCst) {
-                let _ = session_tx.send(SessionStatus {
-                    op: SessionOp::Send,
-                    text: "send failed: relay sync disabled in settings".to_string(),
-                    ack_msg_id: None,
-                    outgoing_contact: None,
-                    outgoing_text: None,
-                    outgoing_manifest_id: None,
-                    outgoing_local_id: None,
-                    outgoing_expiry_unix_ms: None,
-                    outgoing_error: None,
-                    pulled_messages: Vec::new(),
-                });
-                return;
-            }
-
             let identity = match ensure_local_identity() {
                 Ok(identity) => identity,
                 Err(err) => {
@@ -2093,25 +2115,16 @@ fn build_ui(app: &Application) {
                 }
             };
 
-            let relay_http = match app_settings.borrow().relay_endpoints.first().cloned() {
-                Some(endpoint) => endpoint,
-                None => {
-                    let _ = session_tx.send(SessionStatus {
-                        op: SessionOp::Send,
-                        text: "send failed: no relay configured".to_string(),
-                        ack_msg_id: None,
-                        outgoing_contact: None,
-                        outgoing_text: None,
-                        outgoing_manifest_id: None,
-                        outgoing_local_id: None,
-                        outgoing_expiry_unix_ms: None,
-                        outgoing_error: None,
-                        pulled_messages: Vec::new(),
-                    });
-                    return;
-                }
+            let relay_ws = if relay_sync_enabled.load(Ordering::SeqCst) {
+                app_settings
+                    .borrow()
+                    .relay_endpoints
+                    .first()
+                    .cloned()
+                    .map(|endpoint| to_ws_endpoint(&normalize_http_endpoint(&endpoint)))
+            } else {
+                None
             };
-            let relay_ws = to_ws_endpoint(&normalize_http_endpoint(&relay_http));
             let to = match chat_state.borrow().selected_contact.clone() {
                 Some(contact) => contact,
                 None => {
@@ -2216,7 +2229,7 @@ fn build_ui(app: &Application) {
             let local_outgoing_id = next_local_outgoing_id();
             shared_log_verbose(&format!(
                 "send_composed: relay_ws={} to={} local_id={} ttl_seconds={} expiry_ms={} payload_chars={}",
-                relay_ws,
+                relay_ws.as_deref().unwrap_or("none"),
                 to,
                 local_outgoing_id,
                 ttl_seconds,
@@ -2224,9 +2237,29 @@ fn build_ui(app: &Application) {
                 payload_b64.len()
             ));
 
+            if relay_ws.is_none() {
+                shared_log_verbose(&format!(
+                    "send_local_only: to={} local_id={} item_id={} relay_attempt=false",
+                    to, local_outgoing_id, recorded_item_id
+                ));
+                let _ = session_tx.send(SessionStatus {
+                    op: SessionOp::Send,
+                    text: "message queued locally (LAN-only); gossip delivery active".to_string(),
+                    ack_msg_id: Some(recorded_item_id),
+                    outgoing_contact: Some(to),
+                    outgoing_text: Some(outgoing_text),
+                    outgoing_manifest_id,
+                    outgoing_local_id: Some(local_outgoing_id),
+                    outgoing_expiry_unix_ms: Some(expires_at_unix_ms),
+                    outgoing_error: None,
+                    pulled_messages: Vec::new(),
+                });
+                return;
+            }
+
             let _ = session_tx.send(SessionStatus {
                 op: SessionOp::Send,
-                text: "sending message...".to_string(),
+                text: "sending message (relay+LAN)...".to_string(),
                 ack_msg_id: None,
                 outgoing_contact: Some(to.clone()),
                 outgoing_text: Some(outgoing_text.clone()),
@@ -2239,6 +2272,7 @@ fn build_ui(app: &Application) {
 
             let auth = std::env::var("AETHOS_RELAY_AUTH_TOKEN").ok();
             let session_tx = session_tx.clone();
+            let relay_ws = relay_ws.expect("checked above");
             thread::spawn(move || {
                 shared_log_verbose(&format!(
                     "encounter_start: relay_ws={} to={} local_id={}",
@@ -2258,7 +2292,7 @@ fn build_ui(app: &Application) {
                     Ok(report) => SessionStatus {
                         op: SessionOp::Send,
                         text: format!(
-                            "encounter complete: pushed item {} ({} transfer(s))",
+                            "encounter complete (relay+LAN): pushed item {} ({} transfer(s))",
                             short_msg_id(&recorded_item_id),
                             report.transferred_items
                         ),
@@ -2285,7 +2319,9 @@ fn build_ui(app: &Application) {
                     },
                     Err(err) => SessionStatus {
                         op: SessionOp::Send,
-                        text: format!("encounter failed: {err}"),
+                        text: format!(
+                            "relay encounter failed; message remains queued for LAN gossip: {err}"
+                        ),
                         ack_msg_id: None,
                         outgoing_contact: Some(to_for_status),
                         outgoing_text: Some(text_for_status),
@@ -2554,6 +2590,7 @@ fn update_relay_chip(
     relay_dot.remove_css_class("relay-dot-down");
     relay_dot.remove_css_class("relay-dot-disabled");
     relay_chip.remove_css_class("relay-chip-disabled");
+    set_connectivity_chip_highlight(relay_chip, "relay-chip-active", true);
 
     let primary_ok = primary_status.contains("connected + HELLO");
     let secondary_ok = secondary_status.contains("connected + HELLO");
@@ -2593,15 +2630,36 @@ fn set_relay_chip_disabled(relay_dot: &Label, relay_chip_text: &Label, relay_chi
     relay_dot.remove_css_class("relay-dot-disabled");
     relay_dot.add_css_class("relay-dot-disabled");
     relay_chip.add_css_class("relay-chip-disabled");
+    set_connectivity_chip_highlight(relay_chip, "relay-chip-active", false);
     relay_chip_text.set_text("Relays: disabled");
     relay_chip.set_tooltip_text(Some("Relay sync is disabled in Settings"));
+}
+
+fn set_relay_chip_no_config(relay_dot: &Label, relay_chip_text: &Label, relay_chip: &GtkBox) {
+    relay_dot.remove_css_class("relay-dot-idle");
+    relay_dot.remove_css_class("relay-dot-ok");
+    relay_dot.remove_css_class("relay-dot-warn");
+    relay_dot.remove_css_class("relay-dot-down");
+    relay_dot.remove_css_class("relay-dot-disabled");
+    relay_chip.remove_css_class("relay-chip-disabled");
+    relay_dot.add_css_class("relay-dot-idle");
+    set_connectivity_chip_highlight(relay_chip, "relay-chip-active", false);
+    relay_chip_text.set_text("Relays: none configured (0/0)");
+    relay_chip.set_tooltip_text(Some("No relay endpoints configured in Settings"));
+}
+
+fn set_connectivity_chip_highlight(chip: &GtkBox, active_class: &str, active: bool) {
+    chip.remove_css_class(active_class);
+    if active {
+        chip.add_css_class(active_class);
+    }
 }
 
 fn reset_gossip_chip_classes(gossip_dot: &Label, gossip_chip: &GtkBox) {
     gossip_dot.remove_css_class("gossip-dot-idle");
     gossip_dot.remove_css_class("gossip-dot-active");
     gossip_dot.remove_css_class("gossip-dot-disabled");
-    gossip_chip.remove_css_class("gossip-chip-active");
+    set_connectivity_chip_highlight(gossip_chip, "gossip-chip-active", false);
     gossip_chip.remove_css_class("gossip-chip-disabled");
 }
 
@@ -2615,7 +2673,7 @@ fn set_gossip_chip_listening(gossip_dot: &Label, gossip_chip_text: &Label, gossi
 fn set_gossip_chip_active(gossip_dot: &Label, gossip_chip_text: &Label, gossip_chip: &GtkBox) {
     reset_gossip_chip_classes(gossip_dot, gossip_chip);
     gossip_dot.add_css_class("gossip-dot-active");
-    gossip_chip.add_css_class("gossip-chip-active");
+    set_connectivity_chip_highlight(gossip_chip, "gossip-chip-active", true);
     gossip_chip_text.set_text("LAN Gossip: active");
     gossip_chip.set_tooltip_text(Some("Recent LAN gossip activity detected"));
 }
@@ -2710,6 +2768,10 @@ fn attach_session_poller(rx: Receiver<SessionStatus>, ui: SessionPollerUi) {
                         } else if let Some(server_msg_id) = status.ack_msg_id.as_ref() {
                             item.msg_id = server_msg_id.clone();
                             item.outbound_state = Some(OutboundState::Sent);
+                            if item.delivered_at.is_none() {
+                                item.delivered_at =
+                                    Some(format_timestamp_from_unix_ms(now_unix_ms()));
+                            }
                             item.last_sync_error = None;
                         }
                         shared_log_verbose(&format!(
@@ -4608,6 +4670,11 @@ fn apply_styles() {
         .relay-chip-disabled {
             border-color: rgba(118, 124, 145, 0.32);
             background: rgba(29, 31, 41, 0.8);
+        }
+
+        .relay-chip-active {
+            border-color: rgba(96, 170, 255, 0.5);
+            background: rgba(22, 36, 72, 0.86);
         }
 
         .relay-dot {

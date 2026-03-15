@@ -114,7 +114,7 @@ pub fn run_relay_encounter_gossipv1(
     while Instant::now() <= deadline {
         let frame = match read_binary_frame(&mut socket) {
             Ok(frame) => frame,
-            Err(err) if err.contains("WouldBlock") || err.contains("timed out") => break,
+            Err(err) if is_nonfatal_read_timeout(&err) => break,
             Err(err) => return Err(err),
         };
 
@@ -274,6 +274,14 @@ pub fn run_relay_encounter_gossipv1(
         transferred_items,
         pulled_messages,
     })
+}
+
+fn is_nonfatal_read_timeout(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("wouldblock")
+        || lower.contains("timed out")
+        || lower.contains("resource temporarily unavailable")
+        || lower.contains("os error 11")
 }
 
 fn open_relay_socket(
