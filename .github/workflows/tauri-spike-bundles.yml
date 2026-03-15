@@ -2,6 +2,12 @@ name: Tauri Spike Bundles
 
 on:
   workflow_dispatch:
+    inputs:
+      notarize_macos:
+        description: "Sign and notarize macOS bundle (requires Apple secrets)"
+        required: false
+        default: false
+        type: boolean
   push:
     paths:
       - "spikes/tauri-desktop/**"
@@ -60,9 +66,38 @@ jobs:
         run: npm ci
         working-directory: spikes/tauri-desktop
 
+      - name: Validate Apple signing secrets
+        if: runner.os == 'macOS' && github.event_name == 'workflow_dispatch' && inputs.notarize_macos
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!name:-}" ]; then
+              echo "Missing required secret: $name" >&2
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
       - name: Build Tauri spike bundles
         run: npm run tauri:build -- --bundles ${{ matrix.bundles }}
         working-directory: spikes/tauri-desktop
+        env:
+          APPLE_CERTIFICATE: ${{ runner.os == 'macOS' && github.event_name == 'workflow_dispatch' && inputs.notarize_macos && secrets.APPLE_CERTIFICATE || '' }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ runner.os == 'macOS' && github.event_name == 'workflow_dispatch' && inputs.notarize_macos && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
+          APPLE_SIGNING_IDENTITY: ${{ runner.os == 'macOS' && github.event_name == 'workflow_dispatch' && inputs.notarize_macos && secrets.APPLE_SIGNING_IDENTITY || '' }}
+          APPLE_ID: ${{ runner.os == 'macOS' && github.event_name == 'workflow_dispatch' && inputs.notarize_macos && secrets.APPLE_ID || '' }}
+          APPLE_PASSWORD: ${{ runner.os == 'macOS' && github.event_name == 'workflow_dispatch' && inputs.notarize_macos && secrets.APPLE_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ runner.os == 'macOS' && github.event_name == 'workflow_dispatch' && inputs.notarize_macos && secrets.APPLE_TEAM_ID || '' }}
 
       - name: Upload bundle artifacts
         uses: actions/upload-artifact@v4

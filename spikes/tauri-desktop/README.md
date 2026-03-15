@@ -31,6 +31,27 @@ npm run tauri:dev
 npm run tauri:build
 ```
 
+## macOS signing/notarization (CI)
+
+Unsigned macOS artifacts can show "app is damaged" on first launch.
+
+To produce a signed + notarized `.dmg` from GitHub Actions, add these repository secrets:
+
+- `APPLE_CERTIFICATE` (base64-encoded `.p12` certificate)
+- `APPLE_CERTIFICATE_PASSWORD`
+- `APPLE_SIGNING_IDENTITY` (for example: `Developer ID Application: Your Name (TEAMID)`)
+- `APPLE_ID` (Apple account email)
+- `APPLE_PASSWORD` (app-specific password)
+- `APPLE_TEAM_ID`
+
+Then run workflow `Tauri Spike Bundles` with `notarize_macos=true`.
+
+CLI example:
+
+```bash
+gh workflow run tauri-spike-bundles.yml --ref spike/tauri-bundles -f notarize_macos=true
+```
+
 ## Evaluation Checklist
 
 1. App launches on each platform without manual GTK/Homebrew/MSYS runtime setup.
