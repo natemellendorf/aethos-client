@@ -18,8 +18,6 @@ use serde_json::json;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -31,34 +29,43 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::aethos_core::gossip_sync::{
-    has_item as gossip_has_item, import_transfer_items,
-    inventory_entries as gossip_inventory_entries, parse_frame as parse_gossip_frame,
-    record_local_payload as gossip_record_local_payload, serialize_frame as serialize_gossip_frame,
-    transfer_items_for_request as gossip_transfer_items, GossipSyncFrame, GOSSIP_LAN_PORT,
-    GOSSIP_SYNC_VERSION,
+    build_hello_frame as build_gossip_hello_frame,
+    build_relay_ingest_frame as build_gossip_relay_ingest_frame,
+    build_request_frame as build_gossip_request_frame,
+    build_summary_frame as build_gossip_summary_frame, has_item as gossip_has_item,
+    import_transfer_items, parse_frame as parse_gossip_frame,
+    record_local_payload as gossip_record_local_payload,
+    select_request_item_ids_from_summary as gossip_select_request_item_ids_from_summary,
+    serialize_frame as serialize_gossip_frame, transfer_items_for_request as gossip_transfer_items,
+    GossipSyncFrame, GOSSIP_LAN_PORT,
 };
 use crate::aethos_core::identity_store::{
     delete_wayfarer_id, ensure_local_identity, load_contact_aliases, load_relay_session_cache,
     regenerate_local_identity, save_contact_aliases, save_relay_session_cache, RelaySessionCache,
 };
+use crate::aethos_core::logging::{
+    app_log_file_path as shared_app_log_file_path, log_info as shared_log_info,
+    log_verbose as shared_log_verbose, set_verbose_logging_enabled,
+};
 use crate::aethos_core::protocol::{
-    build_envelope_payload_b64_from_utf8, decode_envelope_payload_b64,
-    decode_envelope_payload_utf8_preview, is_valid_wayfarer_id,
+    build_envelope_payload_b64_from_utf8, decode_envelope_payload_b64, is_valid_wayfarer_id,
 };
 use crate::relay::client::{
-    ack_relay_message_v1_with_auth, connect_to_relay, connect_to_relay_with_auth,
-    normalize_http_endpoint, pull_from_relay_v1_with_auth, send_to_relay_v1_with_auth,
-    to_ws_endpoint, RelayFrame, RelayRequestDispatcher, RelaySessionConfig, RelaySessionManager,
+    connect_to_relay_gossipv1, connect_to_relay_gossipv1_with_auth, normalize_http_endpoint,
+    run_relay_encounter_gossipv1, to_ws_endpoint, RelayFrame, RelayRequestDispatcher,
+    RelaySessionConfig, RelaySessionManager,
 };
 
 const APP_ID: &str = "org.aethos.linux";
 const DEFAULT_RELAY_HTTP_PRIMARY: &str = "http://192.168.1.200:8082";
 const DEFAULT_RELAY_HTTP_SECONDARY: &str = "http://192.168.1.200:9082";
-const APP_LOG_FILE_NAME: &str = "aethos-linux.log";
 const CHAT_HISTORY_FILE_NAME: &str = "chat-history.json";
 const SHARE_QR_FILE_NAME: &str = "share-wayfarer-qr.png";
 const APP_SETTINGS_FILE_NAME: &str = "settings.json";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const DEFAULT_MESSAGE_TTL_SECONDS: u64 = 3600;
+const MIN_MESSAGE_TTL_SECONDS: u64 = 60;
+const MAX_MESSAGE_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 
 #[derive(Clone, Debug)]
 struct RelayStatus {
@@ -85,6 +92,7 @@ struct SessionStatus {
     outgoing_text: Option<String>,
     outgoing_manifest_id: Option<String>,
     outgoing_local_id: Option<String>,
+    outgoing_expiry_unix_ms: Option<u64>,
     outgoing_error: Option<String>,
     pulled_messages: Vec<PulledMessagePreview>,
 }
@@ -129,6 +137,12 @@ struct ChatMessage {
     delivered_at: Option<String>,
     #[serde(default)]
     outbound_state: Option<OutboundState>,
+    #[serde(default)]
+    expires_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    last_sync_attempt_unix_ms: Option<u64>,
+    #[serde(default)]
+    last_sync_error: Option<String>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -151,7 +165,11 @@ struct ChatState {
 struct AppSettings {
     relay_sync_enabled: bool,
     gossip_sync_enabled: bool,
+    #[serde(default)]
+    verbose_logging_enabled: bool,
     relay_endpoints: Vec<String>,
+    #[serde(default = "default_message_ttl_seconds")]
+    message_ttl_seconds: u64,
 }
 
 impl Default for AppSettings {
@@ -159,10 +177,12 @@ impl Default for AppSettings {
         Self {
             relay_sync_enabled: true,
             gossip_sync_enabled: true,
+            verbose_logging_enabled: false,
             relay_endpoints: vec![
                 DEFAULT_RELAY_HTTP_PRIMARY.to_string(),
                 DEFAULT_RELAY_HTTP_SECONDARY.to_string(),
             ],
+            message_ttl_seconds: DEFAULT_MESSAGE_TTL_SECONDS,
         }
     }
 }
@@ -223,6 +243,11 @@ fn build_ui(app: &Application) {
     apply_styles();
 
     let initial_settings = load_app_settings().unwrap_or_default();
+    set_verbose_logging_enabled(initial_settings.verbose_logging_enabled);
+    shared_log_info(&format!(
+        "app_start verbose_logging_enabled={} ttl_seconds={}",
+        initial_settings.verbose_logging_enabled, initial_settings.message_ttl_seconds
+    ));
     let app_settings = Rc::new(RefCell::new(initial_settings.clone()));
     let relay_sync_enabled = Arc::new(AtomicBool::new(initial_settings.relay_sync_enabled));
     let gossip_sync_enabled = Arc::new(AtomicBool::new(initial_settings.gossip_sync_enabled));
@@ -363,6 +388,28 @@ fn build_ui(app: &Application) {
     relay_toggle.set_active(initial_settings.relay_sync_enabled);
     let gossip_toggle = CheckButton::with_label("Enable LAN Gossip Sync");
     gossip_toggle.set_active(initial_settings.gossip_sync_enabled);
+    let verbose_logging_toggle = CheckButton::with_label("Enable Verbose Logging");
+    verbose_logging_toggle.set_active(initial_settings.verbose_logging_enabled);
+
+    let message_ttl_label = Label::new(Some("Outbound Message TTL (seconds)"));
+    message_ttl_label.add_css_class("field-label");
+    message_ttl_label.set_xalign(0.0);
+    let message_ttl_hint = Label::new(Some(
+        "Controls how long outbound objects remain eligible for encounter transfer.",
+    ));
+    message_ttl_hint.add_css_class("field-hint");
+    message_ttl_hint.set_xalign(0.0);
+    message_ttl_hint.set_wrap(true);
+    let message_ttl_entry = Entry::builder().hexpand(true).build();
+    message_ttl_entry.add_css_class("recipient-entry");
+    message_ttl_entry.set_placeholder_text(Some("3600"));
+    message_ttl_entry.set_text(&initial_settings.message_ttl_seconds.to_string());
+    let message_ttl_effective = Label::new(Some(&format!(
+        "Effective range: {} - {} seconds",
+        MIN_MESSAGE_TTL_SECONDS, MAX_MESSAGE_TTL_SECONDS
+    )));
+    message_ttl_effective.add_css_class("field-hint");
+    message_ttl_effective.set_xalign(0.0);
 
     let relay_list = ListBox::new();
     relay_list.add_css_class("contact-list");
@@ -410,6 +457,11 @@ fn build_ui(app: &Application) {
     diagnostics_panel.append(&relay_config_title);
     diagnostics_panel.append(&relay_toggle);
     diagnostics_panel.append(&gossip_toggle);
+    diagnostics_panel.append(&verbose_logging_toggle);
+    diagnostics_panel.append(&message_ttl_label);
+    diagnostics_panel.append(&message_ttl_hint);
+    diagnostics_panel.append(&message_ttl_entry);
+    diagnostics_panel.append(&message_ttl_effective);
     diagnostics_panel.append(&relay_list_scroll);
     diagnostics_panel.append(&relay_entry);
     diagnostics_panel.append(&relay_actions);
@@ -1779,6 +1831,61 @@ fn build_ui(app: &Application) {
     }
 
     {
+        let app_settings = Rc::clone(&app_settings);
+        let chat_status_label = chat_status_label.clone();
+        verbose_logging_toggle.connect_toggled(move |toggle| {
+            let enabled = toggle.is_active();
+            {
+                let mut settings = app_settings.borrow_mut();
+                settings.verbose_logging_enabled = enabled;
+                if let Err(err) = save_app_settings(&settings) {
+                    append_local_log(&format!("save_settings_failed: {err}"));
+                    chat_status_label.set_text(&format!("Failed to save logging setting: {err}"));
+                    return;
+                }
+            }
+            set_verbose_logging_enabled(enabled);
+            append_local_log(&format!("verbose_logging_enabled={enabled}"));
+            chat_status_label.set_text(if enabled {
+                "Verbose logging enabled"
+            } else {
+                "Verbose logging disabled"
+            });
+        });
+    }
+
+    {
+        let app_settings = Rc::clone(&app_settings);
+        let chat_status_label = chat_status_label.clone();
+        let message_ttl_effective = message_ttl_effective.clone();
+        message_ttl_entry.connect_activate(move |entry| {
+            apply_message_ttl_entry(
+                &app_settings,
+                entry,
+                &chat_status_label,
+                &message_ttl_effective,
+            );
+        });
+    }
+
+    {
+        let app_settings = Rc::clone(&app_settings);
+        let chat_status_label = chat_status_label.clone();
+        let message_ttl_effective = message_ttl_effective.clone();
+        message_ttl_entry.connect_has_focus_notify(move |entry| {
+            if entry.has_focus() {
+                return;
+            }
+            apply_message_ttl_entry(
+                &app_settings,
+                entry,
+                &chat_status_label,
+                &message_ttl_effective,
+            );
+        });
+    }
+
+    {
         let gossip_sync_enabled = Arc::clone(&gossip_sync_enabled);
         let gossip_last_activity_ms = Arc::clone(&gossip_last_activity_ms);
         let gossip_dot = gossip_dot.clone();
@@ -1934,12 +2041,7 @@ fn build_ui(app: &Application) {
                 return;
             }
 
-            spawn_relay_checks(
-                relay_endpoints,
-                &identity.wayfarer_id,
-                &identity.device_id,
-                tx.clone(),
-            );
+            spawn_relay_checks(relay_endpoints, identity, tx.clone());
         });
     }
 
@@ -1954,6 +2056,7 @@ fn build_ui(app: &Application) {
         let chat_state = Rc::clone(&chat_state);
         send_button.connect_clicked(move |button| {
             button.set_sensitive(false);
+            shared_log_verbose("send_click: user initiated outbound send");
 
             if !relay_sync_enabled.load(Ordering::SeqCst) {
                 let _ = session_tx.send(SessionStatus {
@@ -1964,6 +2067,7 @@ fn build_ui(app: &Application) {
                     outgoing_text: None,
                     outgoing_manifest_id: None,
                     outgoing_local_id: None,
+                    outgoing_expiry_unix_ms: None,
                     outgoing_error: None,
                     pulled_messages: Vec::new(),
                 });
@@ -1981,6 +2085,7 @@ fn build_ui(app: &Application) {
                         outgoing_text: None,
                         outgoing_manifest_id: None,
                         outgoing_local_id: None,
+                        outgoing_expiry_unix_ms: None,
                         outgoing_error: None,
                         pulled_messages: Vec::new(),
                     });
@@ -1999,6 +2104,7 @@ fn build_ui(app: &Application) {
                         outgoing_text: None,
                         outgoing_manifest_id: None,
                         outgoing_local_id: None,
+                        outgoing_expiry_unix_ms: None,
                         outgoing_error: None,
                         pulled_messages: Vec::new(),
                     });
@@ -2017,6 +2123,7 @@ fn build_ui(app: &Application) {
                         outgoing_text: None,
                         outgoing_manifest_id: None,
                         outgoing_local_id: None,
+                        outgoing_expiry_unix_ms: None,
                         outgoing_error: None,
                         pulled_messages: Vec::new(),
                     });
@@ -2032,6 +2139,7 @@ fn build_ui(app: &Application) {
                     outgoing_text: None,
                     outgoing_manifest_id: None,
                     outgoing_local_id: None,
+                    outgoing_expiry_unix_ms: None,
                     outgoing_error: None,
                     pulled_messages: Vec::new(),
                 });
@@ -2048,6 +2156,7 @@ fn build_ui(app: &Application) {
                     outgoing_text: None,
                     outgoing_manifest_id: None,
                     outgoing_local_id: None,
+                    outgoing_expiry_unix_ms: None,
                     outgoing_error: None,
                     pulled_messages: Vec::new(),
                 });
@@ -2064,21 +2173,56 @@ fn build_ui(app: &Application) {
                         outgoing_text: None,
                         outgoing_manifest_id: None,
                         outgoing_local_id: None,
+                        outgoing_expiry_unix_ms: None,
                         outgoing_error: None,
                         pulled_messages: Vec::new(),
                     });
                     return;
                 }
             };
+            let ttl_seconds = clamp_message_ttl_seconds(app_settings.borrow().message_ttl_seconds);
             let expires_at_unix_ms = (now_unix_secs().max(0) as u64)
                 .saturating_mul(1000)
-                .saturating_add(3600 * 1000);
-            let _ = gossip_record_local_payload(&payload_b64, expires_at_unix_ms);
+                .saturating_add(ttl_seconds.saturating_mul(1000));
+            let recorded_item_id =
+                match gossip_record_local_payload(&payload_b64, expires_at_unix_ms) {
+                    Ok(item_id) => item_id,
+                    Err(err) => {
+                        let _ = session_tx.send(SessionStatus {
+                            op: SessionOp::Send,
+                            text: format!(
+                                "send failed: local object store rejected payload: {err}"
+                            ),
+                            ack_msg_id: None,
+                            outgoing_contact: None,
+                            outgoing_text: None,
+                            outgoing_manifest_id: None,
+                            outgoing_local_id: None,
+                            outgoing_expiry_unix_ms: None,
+                            outgoing_error: None,
+                            pulled_messages: Vec::new(),
+                        });
+                        return;
+                    }
+                };
+            shared_log_verbose(&format!(
+                "send_local_store_item: item_id={} to={} expiry_unix_ms={}",
+                recorded_item_id, to, expires_at_unix_ms
+            ));
             body_entry.set_text("");
             let outgoing_manifest_id = decode_envelope_payload_b64(&payload_b64)
                 .ok()
                 .map(|decoded| decoded.manifest_id_hex);
             let local_outgoing_id = next_local_outgoing_id();
+            shared_log_verbose(&format!(
+                "send_composed: relay_ws={} to={} local_id={} ttl_seconds={} expiry_ms={} payload_chars={}",
+                relay_ws,
+                to,
+                local_outgoing_id,
+                ttl_seconds,
+                expires_at_unix_ms,
+                payload_b64.len()
+            ));
 
             let _ = session_tx.send(SessionStatus {
                 op: SessionOp::Send,
@@ -2088,6 +2232,7 @@ fn build_ui(app: &Application) {
                 outgoing_text: Some(outgoing_text.clone()),
                 outgoing_manifest_id: outgoing_manifest_id.clone(),
                 outgoing_local_id: Some(local_outgoing_id.clone()),
+                outgoing_expiry_unix_ms: Some(expires_at_unix_ms),
                 outgoing_error: None,
                 pulled_messages: Vec::new(),
             });
@@ -2095,46 +2240,85 @@ fn build_ui(app: &Application) {
             let auth = std::env::var("AETHOS_RELAY_AUTH_TOKEN").ok();
             let session_tx = session_tx.clone();
             thread::spawn(move || {
+                shared_log_verbose(&format!(
+                    "encounter_start: relay_ws={} to={} local_id={}",
+                    relay_ws, to, local_outgoing_id
+                ));
                 let to_for_status = to.clone();
                 let text_for_status = outgoing_text.clone();
                 let manifest_for_status = outgoing_manifest_id.clone();
-                let result = send_to_relay_v1_with_auth(
+                let result = run_relay_encounter_gossipv1(
                     &relay_ws,
-                    (&identity.wayfarer_id, &identity.device_id),
-                    &to,
-                    &payload_b64,
-                    None,
-                    Some(3600),
+                    &identity,
                     auth.as_deref(),
+                    Some(&recorded_item_id),
                 );
 
                 let status = match result {
-                    Ok((msg_id, received_at, expires_at)) => SessionStatus {
+                    Ok(report) => SessionStatus {
                         op: SessionOp::Send,
                         text: format!(
-                            "send_ok msg_id={} received_at={:?} expires_at={:?}",
-                            msg_id, received_at, expires_at
+                            "encounter complete: pushed item {} ({} transfer(s))",
+                            short_msg_id(&recorded_item_id),
+                            report.transferred_items
                         ),
-                        ack_msg_id: Some(msg_id),
+                        ack_msg_id: Some(recorded_item_id),
                         outgoing_contact: Some(to),
                         outgoing_text: Some(outgoing_text),
                         outgoing_manifest_id,
                         outgoing_local_id: Some(local_outgoing_id),
+                        outgoing_expiry_unix_ms: Some(expires_at_unix_ms),
                         outgoing_error: None,
-                        pulled_messages: Vec::new(),
+                        pulled_messages: report
+                            .pulled_messages
+                            .into_iter()
+                            .map(|item| PulledMessagePreview {
+                                from_wayfarer_id: item.from_node_id,
+                                msg_id: item.item_id,
+                                text: extract_chat_text_if_json(&item.text),
+                                received_at: item.received_at_unix,
+                                manifest_id_hex: item.manifest_id_hex,
+                                receipt_manifest_id: None,
+                                receipt_received_at_unix_ms: None,
+                            })
+                            .collect(),
                     },
                     Err(err) => SessionStatus {
                         op: SessionOp::Send,
-                        text: format!("send failed: {err}"),
+                        text: format!("encounter failed: {err}"),
                         ack_msg_id: None,
                         outgoing_contact: Some(to_for_status),
                         outgoing_text: Some(text_for_status),
                         outgoing_manifest_id: manifest_for_status,
                         outgoing_local_id: Some(local_outgoing_id),
+                        outgoing_expiry_unix_ms: Some(expires_at_unix_ms),
                         outgoing_error: Some(err.clone()),
                         pulled_messages: Vec::new(),
                     },
                 };
+                if status.outgoing_error.is_some() {
+                    shared_log_verbose(&format!(
+                        "encounter_failed: relay_ws={} to={} local_id={} error={}",
+                        relay_ws,
+                        status.outgoing_contact.as_deref().unwrap_or("unknown"),
+                        status
+                            .outgoing_local_id
+                            .as_deref()
+                            .unwrap_or("unknown"),
+                        status
+                            .outgoing_error
+                            .as_deref()
+                            .unwrap_or("unknown")
+                    ));
+                } else {
+                    shared_log_verbose(&format!(
+                        "encounter_success: relay_ws={} to={} msg_id={} pulled_messages={}",
+                        relay_ws,
+                        status.outgoing_contact.as_deref().unwrap_or("unknown"),
+                        status.ack_msg_id.as_deref().unwrap_or("none"),
+                        status.pulled_messages.len()
+                    ));
+                }
                 let _ = session_tx.send(status);
             });
         });
@@ -2208,13 +2392,9 @@ fn build_ui(app: &Application) {
 
 fn spawn_relay_checks(
     relay_http_endpoints: Vec<String>,
-    wayfarer_id: &str,
-    device_id: &str,
+    identity: crate::aethos_core::identity_store::LocalIdentitySummary,
     tx: Sender<RelayStatus>,
 ) {
-    let wayfarer_id = wayfarer_id.to_string();
-    let device_id = device_id.to_string();
-
     thread::spawn(move || {
         let mut session_manager =
             RelaySessionManager::new(relay_http_endpoints, RelaySessionConfig::default());
@@ -2232,27 +2412,31 @@ fn spawn_relay_checks(
                 thread::sleep(Duration::from_millis(50));
                 continue;
             };
+            shared_log_verbose(&format!(
+                "relay_check_start: slot={} relay_ws={}",
+                selection.relay_slot, selection.relay_ws
+            ));
 
             let outbound = dispatcher.register_outbound(
-                "hello",
+                "HELLO",
                 json!({
-                    "wayfarer_id": wayfarer_id,
-                    "device_id": device_id,
+                    "node_id": identity.wayfarer_id.clone(),
                     "relay_slot": selection.relay_slot
                 }),
             );
 
             let state = match selection.auth_token.as_deref() {
-                Some(token) => connect_to_relay_with_auth(
-                    &selection.relay_ws,
-                    &wayfarer_id,
-                    &device_id,
-                    Some(token),
-                ),
-                None => connect_to_relay(&selection.relay_ws, &wayfarer_id, &device_id),
+                Some(token) => {
+                    connect_to_relay_gossipv1_with_auth(&selection.relay_ws, &identity, Some(token))
+                }
+                None => connect_to_relay_gossipv1(&selection.relay_ws, &identity),
             };
+            shared_log_verbose(&format!(
+                "relay_check_result: slot={} relay_ws={} state={}",
+                selection.relay_slot, selection.relay_ws, state
+            ));
 
-            if state.starts_with("connected + hello_ok") {
+            if state.starts_with("connected + HELLO") {
                 session_manager.mark_success(selection.relay_slot);
             } else {
                 session_manager.mark_failure(selection.relay_slot);
@@ -2260,10 +2444,10 @@ fn spawn_relay_checks(
 
             let response = RelayFrame {
                 correlation_id: outbound.correlation_id,
-                message_type: if state.starts_with("connected + hello_ok") {
-                    "hello_ack".to_string()
+                message_type: if state.starts_with("connected + HELLO") {
+                    "HELLO_ACCEPTED".to_string()
                 } else {
-                    "hello_error".to_string()
+                    "HELLO_REJECTED".to_string()
                 },
                 payload: json!({"relay_ws": selection.relay_ws, "state": state}),
             };
@@ -2371,8 +2555,8 @@ fn update_relay_chip(
     relay_dot.remove_css_class("relay-dot-disabled");
     relay_chip.remove_css_class("relay-chip-disabled");
 
-    let primary_ok = primary_status.contains("connected + hello_ok");
-    let secondary_ok = secondary_status.contains("connected + hello_ok");
+    let primary_ok = primary_status.contains("connected + HELLO");
+    let secondary_ok = secondary_status.contains("connected + HELLO");
 
     match (primary_ok, secondary_ok) {
         (true, true) => {
@@ -2473,6 +2657,13 @@ fn attach_session_poller(rx: Receiver<SessionStatus>, ui: SessionPollerUi) {
 
             chat_status_label.set_text(&status.text);
             append_local_log(&format!("session_status: {}", status.text));
+            shared_log_verbose(&format!(
+                "session_event: op={:?} ack_msg_id={} outgoing_contact={} pulled_messages={}",
+                status.op,
+                status.ack_msg_id.as_deref().unwrap_or("none"),
+                status.outgoing_contact.as_deref().unwrap_or("none"),
+                status.pulled_messages.len()
+            ));
 
             {
                 let mut state = chat_state.borrow_mut();
@@ -2500,18 +2691,31 @@ fn attach_session_poller(rx: Receiver<SessionStatus>, ui: SessionPollerUi) {
                             manifest_id_hex: status.outgoing_manifest_id.clone(),
                             delivered_at: None,
                             outbound_state: Some(OutboundState::Sending),
+                            expires_at_unix_ms: status.outgoing_expiry_unix_ms,
+                            last_sync_attempt_unix_ms: Some(now_unix_ms()),
+                            last_sync_error: None,
                         });
                     }
 
                     if let Some(item) = thread.iter_mut().find(|item| item.msg_id == local_id) {
+                        item.last_sync_attempt_unix_ms = Some(now_unix_ms());
+                        if item.expires_at_unix_ms.is_none() {
+                            item.expires_at_unix_ms = status.outgoing_expiry_unix_ms;
+                        }
                         if let Some(error) = status.outgoing_error.as_ref() {
                             item.outbound_state = Some(OutboundState::Failed {
                                 error: error.clone(),
                             });
+                            item.last_sync_error = Some(error.clone());
                         } else if let Some(server_msg_id) = status.ack_msg_id.as_ref() {
                             item.msg_id = server_msg_id.clone();
                             item.outbound_state = Some(OutboundState::Sent);
+                            item.last_sync_error = None;
                         }
+                        shared_log_verbose(&format!(
+                            "thread_outgoing_update: contact={} msg_id={} state={:?}",
+                            contact, item.msg_id, item.outbound_state
+                        ));
                     }
 
                     state.selected_contact = Some(contact.clone());
@@ -2543,6 +2747,12 @@ fn attach_session_poller(rx: Receiver<SessionStatus>, ui: SessionPollerUi) {
                     });
 
                     if already_present {
+                        shared_log_verbose(&format!(
+                            "thread_incoming_skip_duplicate: from={} msg_id={} manifest={}",
+                            pulled.from_wayfarer_id,
+                            pulled.msg_id,
+                            pulled.manifest_id_hex.as_deref().unwrap_or("none")
+                        ));
                         continue;
                     }
 
@@ -2556,7 +2766,16 @@ fn attach_session_poller(rx: Receiver<SessionStatus>, ui: SessionPollerUi) {
                         manifest_id_hex: pulled.manifest_id_hex.clone(),
                         delivered_at: None,
                         outbound_state: None,
+                        expires_at_unix_ms: None,
+                        last_sync_attempt_unix_ms: None,
+                        last_sync_error: None,
                     });
+                    shared_log_verbose(&format!(
+                        "thread_incoming_insert: from={} msg_id={} manifest={}",
+                        pulled.from_wayfarer_id,
+                        pulled.msg_id,
+                        pulled.manifest_id_hex.as_deref().unwrap_or("none")
+                    ));
 
                     if let Some(manifest) = pulled.receipt_manifest_id.as_ref() {
                         let delivered_time = pulled
@@ -2672,6 +2891,7 @@ fn start_background_inbox_sync(
                         outgoing_text: None,
                         outgoing_manifest_id: None,
                         outgoing_local_id: None,
+                        outgoing_expiry_unix_ms: None,
                         outgoing_error: None,
                         pulled_messages: previews,
                     });
@@ -2692,47 +2912,30 @@ fn sync_inbox_once(relay_http: &str) -> Result<Vec<PulledMessagePreview>, String
     let identity = ensure_local_identity()?;
     let relay_ws = to_ws_endpoint(relay_http);
     let auth = std::env::var("AETHOS_RELAY_AUTH_TOKEN").ok();
-    let messages = pull_from_relay_v1_with_auth(
-        &relay_ws,
-        &identity.wayfarer_id,
-        &identity.device_id,
-        Some(50),
-        auth.as_deref(),
-    )?;
-
-    let mut previews = Vec::with_capacity(messages.len());
-    let expires_at_unix_ms = (now_unix_secs().max(0) as u64)
-        .saturating_mul(1000)
-        .saturating_add(24 * 60 * 60 * 1000);
-    for message in &messages {
-        let manifest_id_hex = decode_envelope_payload_b64(&message.payload_b64)
-            .ok()
-            .map(|decoded| decoded.manifest_id_hex);
-        let _ = gossip_record_local_payload(&message.payload_b64, expires_at_unix_ms);
-        let text = decode_message_text_for_display(&message.payload_b64);
-
-        previews.push(PulledMessagePreview {
-            from_wayfarer_id: message.from_wayfarer_id.clone(),
-            msg_id: message.msg_id.clone(),
-            text,
-            received_at: message.received_at,
-            manifest_id_hex,
-            receipt_manifest_id: extract_receipt_manifest_id(&message.payload_b64),
-            receipt_received_at_unix_ms: extract_receipt_received_at_ms(&message.payload_b64),
-        });
-    }
-
-    for message in messages {
-        let _ = ack_relay_message_v1_with_auth(
-            &relay_ws,
-            &identity.wayfarer_id,
-            &identity.device_id,
-            &message.msg_id,
-            auth.as_deref(),
-        );
-    }
-
-    Ok(previews)
+    shared_log_verbose(&format!(
+        "inbox_sync_start: relay_ws={} wayfarer={}",
+        relay_ws, identity.wayfarer_id
+    ));
+    let report = run_relay_encounter_gossipv1(&relay_ws, &identity, auth.as_deref(), None)?;
+    shared_log_verbose(&format!(
+        "inbox_sync_done: relay_ws={} transferred_items={} pulled_messages={}",
+        relay_ws,
+        report.transferred_items,
+        report.pulled_messages.len()
+    ));
+    Ok(report
+        .pulled_messages
+        .into_iter()
+        .map(|message| PulledMessagePreview {
+            from_wayfarer_id: message.from_node_id,
+            msg_id: message.item_id,
+            text: extract_chat_text_if_json(&message.text),
+            received_at: message.received_at_unix,
+            manifest_id_hex: message.manifest_id_hex,
+            receipt_manifest_id: None,
+            receipt_received_at_unix_ms: None,
+        })
+        .collect())
 }
 
 fn start_background_gossip_sync(
@@ -2767,7 +2970,8 @@ fn start_background_gossip_sync(
 
         append_local_log(&format!("gossip_sync_started on udp/{GOSSIP_LAN_PORT}"));
 
-        let mut seq: u64 = 0;
+        let mut peer_node_by_addr: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         let mut last_inventory_broadcast = Instant::now() - Duration::from_secs(10);
 
         loop {
@@ -2779,20 +2983,35 @@ fn start_background_gossip_sync(
             let force_announce = gossip_force_announce.swap(false, Ordering::SeqCst);
             if force_announce || last_inventory_broadcast.elapsed() >= Duration::from_secs(3) {
                 if let Ok(identity) = ensure_local_identity() {
-                    seq = seq.saturating_add(1);
-                    let session_id = gossip_id("sess", seq);
-                    let inventory = gossip_inventory_entries(now_unix_ms()).unwrap_or_default();
-                    let frame = GossipSyncFrame::InventorySummary(
-                        crate::aethos_core::gossip_sync::InventorySummaryFrame {
-                            sync_version: GOSSIP_SYNC_VERSION,
-                            session_id,
-                            sender_wayfarer_id: identity.wayfarer_id,
-                            page: 1,
-                            has_more: false,
-                            inventory,
-                        },
-                    );
-                    let _ = send_gossip_frame(&socket, "255.255.255.255", GOSSIP_LAN_PORT, &frame);
+                    let node_pubkey_raw = match base64::engine::general_purpose::STANDARD
+                        .decode(&identity.verifying_key_b64)
+                    {
+                        Ok(raw) => raw,
+                        Err(err) => {
+                            append_local_log(&format!("gossip_pubkey_decode_failed: {err}"));
+                            thread::sleep(Duration::from_millis(120));
+                            continue;
+                        }
+                    };
+                    let node_pubkey =
+                        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(node_pubkey_raw);
+                    if let Ok(hello) = build_gossip_hello_frame(&identity.wayfarer_id, &node_pubkey)
+                    {
+                        let _ =
+                            send_gossip_frame(&socket, "255.255.255.255", GOSSIP_LAN_PORT, &hello);
+                    }
+                    if let Ok(summary) = build_gossip_summary_frame(now_unix_ms()) {
+                        let _ = send_gossip_frame(
+                            &socket,
+                            "255.255.255.255",
+                            GOSSIP_LAN_PORT,
+                            &summary,
+                        );
+                    }
+                    if let Ok(ingest) = build_gossip_relay_ingest_frame(now_unix_ms()) {
+                        let _ =
+                            send_gossip_frame(&socket, "255.255.255.255", GOSSIP_LAN_PORT, &ingest);
+                    }
                     gossip_last_activity_ms.store(now_unix_ms(), Ordering::SeqCst);
                 }
                 last_inventory_broadcast = Instant::now();
@@ -2819,45 +3038,57 @@ fn start_background_gossip_sync(
                     };
 
                     let local_wayfarer = identity.wayfarer_id;
+                    let source_key = source.to_string();
+                    shared_log_verbose(&format!(
+                        "gossip_recv: frame_type={} bytes={} from={}",
+                        gossip_frame_type(&frame),
+                        len,
+                        source
+                    ));
 
                     match frame {
-                        GossipSyncFrame::InventorySummary(inv)
-                            if inv.sender_wayfarer_id != local_wayfarer =>
-                        {
-                            let mut missing_item_ids = inv
-                                .inventory
-                                .iter()
-                                .filter(|entry| {
-                                    entry.to_wayfarer_id == local_wayfarer
-                                        && entry.expires_at_unix_ms > now_unix_ms()
-                                })
-                                .filter_map(|entry| {
-                                    gossip_has_item(&entry.item_id).ok().and_then(|exists| {
-                                        if exists {
-                                            None
-                                        } else {
-                                            Some(entry.item_id.clone())
-                                        }
-                                    })
-                                })
-                                .collect::<Vec<_>>();
-                            missing_item_ids.sort();
+                        GossipSyncFrame::Hello(hello) if hello.node_id != local_wayfarer => {
+                            peer_node_by_addr.insert(source_key.clone(), hello.node_id);
+                            if let Ok(summary) = build_gossip_summary_frame(now_unix_ms()) {
+                                let _ = send_gossip_frame(
+                                    &socket,
+                                    &source.ip().to_string(),
+                                    source.port(),
+                                    &summary,
+                                );
+                            }
+                            if let Ok(ingest) = build_gossip_relay_ingest_frame(now_unix_ms()) {
+                                let _ = send_gossip_frame(
+                                    &socket,
+                                    &source.ip().to_string(),
+                                    source.port(),
+                                    &ingest,
+                                );
+                            }
+                            gossip_last_activity_ms.store(now_unix_ms(), Ordering::SeqCst);
+                        }
+                        GossipSyncFrame::Summary(summary) => {
+                            let want =
+                                match gossip_select_request_item_ids_from_summary(&summary, 256) {
+                                    Ok(want) => want,
+                                    Err(err) => {
+                                        append_local_log(&format!(
+                                            "gossip_summary_reconcile_failed: {err}"
+                                        ));
+                                        continue;
+                                    }
+                                };
 
-                            seq = seq.saturating_add(1);
-                            let request = GossipSyncFrame::MissingRequest(
-                                crate::aethos_core::gossip_sync::MissingRequestFrame {
-                                    sync_version: GOSSIP_SYNC_VERSION,
-                                    session_id: inv.session_id,
-                                    sender_wayfarer_id: local_wayfarer,
-                                    page: 1,
-                                    has_more: false,
-                                    request_id: gossip_id("req", seq),
-                                    in_response_to_page: 1,
-                                    missing_item_ids,
-                                    max_transfer_items: 64,
-                                    max_transfer_bytes: 2_097_152,
-                                },
-                            );
+                            let request = match build_gossip_request_frame(want, 256) {
+                                Ok(frame) => frame,
+                                Err(err) => {
+                                    append_local_log(&format!(
+                                        "gossip_request_build_failed: {err}"
+                                    ));
+                                    continue;
+                                }
+                            };
+
                             let _ = send_gossip_frame(
                                 &socket,
                                 &source.ip().to_string(),
@@ -2866,29 +3097,42 @@ fn start_background_gossip_sync(
                             );
                             gossip_last_activity_ms.store(now_unix_ms(), Ordering::SeqCst);
                         }
-                        GossipSyncFrame::MissingRequest(req)
-                            if req.sender_wayfarer_id != local_wayfarer =>
-                        {
-                            let items = gossip_transfer_items(
-                                &req.missing_item_ids,
-                                req.max_transfer_items.max(1),
-                                req.max_transfer_bytes.max(1),
+                        GossipSyncFrame::RelayIngest(ingest) => {
+                            let mut missing_item_ids = ingest
+                                .item_ids
+                                .into_iter()
+                                .filter(|item_id| {
+                                    gossip_has_item(item_id).map(|have| !have).unwrap_or(false)
+                                })
+                                .collect::<Vec<_>>();
+                            missing_item_ids.sort();
+                            let request = match build_gossip_request_frame(missing_item_ids, 256) {
+                                Ok(frame) => frame,
+                                Err(err) => {
+                                    append_local_log(&format!(
+                                        "gossip_request_build_failed: {err}"
+                                    ));
+                                    continue;
+                                }
+                            };
+                            let _ = send_gossip_frame(
+                                &socket,
+                                &source.ip().to_string(),
+                                source.port(),
+                                &request,
+                            );
+                            gossip_last_activity_ms.store(now_unix_ms(), Ordering::SeqCst);
+                        }
+                        GossipSyncFrame::Request(req) => {
+                            let objects = gossip_transfer_items(
+                                &req.want,
+                                32,
+                                crate::aethos_core::gossip_sync::MAX_TRANSFER_BYTES,
                                 now_unix_ms(),
                             )
                             .unwrap_or_default();
-
-                            seq = seq.saturating_add(1);
                             let transfer = GossipSyncFrame::Transfer(
-                                crate::aethos_core::gossip_sync::TransferFrame {
-                                    sync_version: GOSSIP_SYNC_VERSION,
-                                    session_id: req.session_id,
-                                    sender_wayfarer_id: local_wayfarer,
-                                    page: 1,
-                                    has_more: false,
-                                    transfer_id: gossip_id("tx", seq),
-                                    in_response_to_request_id: req.request_id,
-                                    items,
-                                },
+                                crate::aethos_core::gossip_sync::TransferFrame { objects },
                             );
                             let _ = send_gossip_frame(
                                 &socket,
@@ -2898,17 +3142,25 @@ fn start_background_gossip_sync(
                             );
                             gossip_last_activity_ms.store(now_unix_ms(), Ordering::SeqCst);
                         }
-                        GossipSyncFrame::Transfer(transfer)
-                            if transfer.sender_wayfarer_id != local_wayfarer =>
-                        {
+                        GossipSyncFrame::Transfer(transfer) => {
+                            let peer_node_id = peer_node_by_addr
+                                .get(&source_key)
+                                .cloned()
+                                .unwrap_or_else(|| source.ip().to_string());
                             let result = import_transfer_items(
-                                &transfer.sender_wayfarer_id,
+                                &peer_node_id,
                                 &local_wayfarer,
-                                &transfer.items,
+                                &transfer.objects,
                                 now_unix_ms(),
                             );
 
                             if let Ok(result) = result {
+                                if !result.rejected_items.is_empty() {
+                                    append_local_log(&format!(
+                                        "gossip_transfer_rejected_objects={}",
+                                        result.rejected_items.len()
+                                    ));
+                                }
                                 if !result.new_messages.is_empty() {
                                     let pulled_messages = result
                                         .new_messages
@@ -2936,31 +3188,15 @@ fn start_background_gossip_sync(
                                         outgoing_text: None,
                                         outgoing_manifest_id: None,
                                         outgoing_local_id: None,
+                                        outgoing_expiry_unix_ms: None,
                                         outgoing_error: None,
                                         pulled_messages,
                                     });
                                 }
 
-                                seq = seq.saturating_add(1);
-                                let status = if result.rejected_items.is_empty() {
-                                    "accepted".to_string()
-                                } else if result.accepted_item_ids.is_empty() {
-                                    "rejected".to_string()
-                                } else {
-                                    "partial".to_string()
-                                };
                                 let receipt = GossipSyncFrame::Receipt(
                                     crate::aethos_core::gossip_sync::ReceiptFrame {
-                                        sync_version: GOSSIP_SYNC_VERSION,
-                                        session_id: transfer.session_id,
-                                        sender_wayfarer_id: local_wayfarer,
-                                        page: 1,
-                                        has_more: false,
-                                        receipt_id: gossip_id("rcpt", seq),
-                                        in_response_to_transfer_id: transfer.transfer_id,
-                                        status,
-                                        accepted_item_ids: result.accepted_item_ids,
-                                        rejected_items: result.rejected_items,
+                                        received: result.accepted_item_ids,
                                     },
                                 );
                                 let _ = send_gossip_frame(
@@ -2972,15 +3208,11 @@ fn start_background_gossip_sync(
                                 gossip_last_activity_ms.store(now_unix_ms(), Ordering::SeqCst);
                             }
                         }
-                        GossipSyncFrame::Receipt(receipt)
-                            if receipt.sender_wayfarer_id != local_wayfarer =>
-                        {
+                        GossipSyncFrame::Receipt(receipt) => {
                             append_local_log(&format!(
-                                "gossip_receipt {} status={} accepted={} rejected={}",
-                                receipt.receipt_id,
-                                receipt.status,
-                                receipt.accepted_item_ids.len(),
-                                receipt.rejected_items.len()
+                                "gossip_receipt received={} from={}",
+                                receipt.received.len(),
+                                source
                             ));
                         }
                         _ => {}
@@ -3006,29 +3238,26 @@ fn send_gossip_frame(
 ) -> Result<(), String> {
     let raw = serialize_gossip_frame(frame)?;
     let addr = format!("{host}:{port}");
+    shared_log_verbose(&format!(
+        "gossip_send: frame_type={} bytes={} to={}",
+        gossip_frame_type(frame),
+        raw.len(),
+        addr
+    ));
     socket
         .send_to(&raw, &addr)
         .map(|_| ())
         .map_err(|err| format!("gossip send failed ({addr}): {err}"))
 }
 
-fn gossip_id(prefix: &str, seq: u64) -> String {
-    format!("linux-{prefix}-{}-{seq}", now_unix_ms())
-}
-
-fn decode_message_text_for_display(payload_b64: &str) -> String {
-    match decode_envelope_payload_utf8_preview(payload_b64) {
-        Ok(text) => extract_chat_text_if_json(&text),
-        Err(_) => match decode_envelope_payload_b64(payload_b64) {
-            Ok(decoded) => {
-                if let Ok(body_text) = String::from_utf8(decoded.body) {
-                    return extract_chat_text_if_json(&body_text);
-                }
-                let manifest_preview: String = decoded.manifest_id_hex.chars().take(12).collect();
-                format!("[binary body manifest={}…]", manifest_preview)
-            }
-            Err(err) => format!("[decode_error={err}]"),
-        },
+fn gossip_frame_type(frame: &GossipSyncFrame) -> &'static str {
+    match frame {
+        GossipSyncFrame::Hello(_) => "HELLO",
+        GossipSyncFrame::Summary(_) => "SUMMARY",
+        GossipSyncFrame::Request(_) => "REQUEST",
+        GossipSyncFrame::Transfer(_) => "TRANSFER",
+        GossipSyncFrame::Receipt(_) => "RECEIPT",
+        GossipSyncFrame::RelayIngest(_) => "RELAY_INGEST",
     }
 }
 
@@ -3037,106 +3266,11 @@ fn extract_chat_text_if_json(input: &str) -> String {
         return input.to_string();
     };
 
-    if let Some((manifest, ts)) = parse_receipt_like_json(&value) {
-        let at = ts
-            .map(format_timestamp_from_unix_ms)
-            .unwrap_or_else(|| "unknown".to_string());
-        let manifest_short: String = manifest.chars().take(10).collect();
-        return format!("Delivered ✓ ({manifest_short}… at {at})");
-    }
-
     if let Some(text) = value.get("text").and_then(|v| v.as_str()) {
         return text.to_string();
     }
 
     input.to_string()
-}
-
-fn extract_receipt_manifest_id(payload_b64: &str) -> Option<String> {
-    let text = decode_envelope_payload_utf8_preview(payload_b64).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    parse_receipt_like_json(&value).map(|tuple| tuple.0)
-}
-
-fn extract_receipt_received_at_ms(payload_b64: &str) -> Option<u64> {
-    let text = decode_envelope_payload_utf8_preview(payload_b64).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    parse_receipt_like_json(&value).and_then(|tuple| tuple.1)
-}
-
-fn parse_receipt_like_json(value: &serde_json::Value) -> Option<(String, Option<u64>)> {
-    if value
-        .get("type")
-        .and_then(|v| v.as_str())
-        .map(|v| v == "receipt")
-        .unwrap_or(false)
-    {
-        let manifest = value
-            .get("manifestId")
-            .or_else(|| value.get("manifest_id"))
-            .and_then(|v| v.as_str())?
-            .to_string();
-        let ts = value
-            .get("receivedAtUnixMs")
-            .or_else(|| value.get("received_at_unix_ms"))
-            .and_then(|v| v.as_u64());
-        return Some((manifest, ts));
-    }
-
-    if value
-        .get("receipt_scope")
-        .and_then(|v| v.as_str())
-        .is_some()
-    {
-        let receipt_b64 = value.get("receipt_v1_b64").and_then(|v| v.as_str())?;
-        return decode_receipt_v1_b64(receipt_b64).ok();
-    }
-
-    None
-}
-
-fn decode_receipt_v1_b64(receipt_b64: &str) -> Result<(String, Option<u64>), String> {
-    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(receipt_b64)
-        .map_err(|err| format!("failed decoding receipt_v1_b64: {err}"))?;
-    let mut cursor = if raw.len() >= 2 && raw[0] == 1 && raw[1] == 4 {
-        2usize
-    } else {
-        0usize
-    };
-
-    let mut manifest: Option<String> = None;
-    let mut received_ms: Option<u64> = None;
-
-    while cursor + 5 <= raw.len() {
-        let field_id = raw[cursor];
-        cursor += 1;
-        let len = u32::from_be_bytes(
-            raw[cursor..cursor + 4]
-                .try_into()
-                .map_err(|_| "invalid receipt field length".to_string())?,
-        ) as usize;
-        cursor += 4;
-        if cursor + len > raw.len() {
-            return Err("truncated receipt field payload".to_string());
-        }
-        let value = &raw[cursor..cursor + len];
-        cursor += len;
-
-        match field_id {
-            2 => manifest = Some(bytes_to_hex_lower(value)),
-            3 if len == 8 => {
-                received_ms =
-                    Some(u64::from_be_bytes(value.try_into().map_err(|_| {
-                        "invalid receipt timestamp bytes".to_string()
-                    })?))
-            }
-            _ => {}
-        }
-    }
-
-    let manifest = manifest.ok_or_else(|| "receipt missing manifestId".to_string())?;
-    Ok((manifest, received_ms))
 }
 
 fn render_contacts(
@@ -3441,13 +3575,22 @@ fn render_messages(state: &ChatState, ui: MessageRenderUi<'_>) {
                     .unwrap_or_else(|| " · sent".to_string()),
                 (ChatDirection::Incoming, _) => String::new(),
             };
+            let ttl_suffix = message
+                .expires_at_unix_ms
+                .map(|expiry| {
+                    let remaining_secs = expiry.saturating_sub(now_unix_ms()) / 1000;
+                    format!(" · ttl={}s", remaining_secs)
+                })
+                .unwrap_or_default();
             metadata.set_text(&format!(
-                "{} · {}{}",
+                "{} · {}{}{}",
                 message.timestamp,
                 short_msg_id(&message.msg_id),
-                delivery_suffix
+                delivery_suffix,
+                ttl_suffix
             ));
             metadata.add_css_class("bubble-meta");
+            metadata.set_tooltip_text(Some(&message_debug_tooltip(message)));
             match (
                 &message.direction,
                 &message.outbound_state,
@@ -3678,6 +3821,29 @@ fn short_msg_id(value: &str) -> String {
     format!("{}…{}", &value[0..6], &value[value.len() - 6..])
 }
 
+fn message_debug_tooltip(message: &ChatMessage) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!("msg_id: {}", message.msg_id));
+    if let Some(manifest) = message.manifest_id_hex.as_ref() {
+        lines.push(format!("manifest_id: {manifest}"));
+    }
+    if let Some(expiry) = message.expires_at_unix_ms {
+        let remaining_secs = expiry.saturating_sub(now_unix_ms()) / 1000;
+        lines.push(format!("expires_at_unix_ms: {expiry}"));
+        lines.push(format!("ttl_remaining_seconds: {remaining_secs}"));
+    }
+    if let Some(last_attempt) = message.last_sync_attempt_unix_ms {
+        lines.push(format!("last_sync_attempt_unix_ms: {last_attempt}"));
+    }
+    if let Some(delivered) = message.delivered_at.as_ref() {
+        lines.push(format!("delivered_at: {delivered}"));
+    }
+    if let Some(error) = message.last_sync_error.as_ref() {
+        lines.push(format!("last_sync_error: {error}"));
+    }
+    lines.join("\n")
+}
+
 fn format_timestamp_from_unix(unix_secs: i64) -> String {
     if let Ok(dt) = glib::DateTime::from_unix_local(unix_secs) {
         return dt
@@ -3731,16 +3897,6 @@ fn day_key_and_label(unix_secs: i64) -> (String, String) {
     }
 
     ("unknown-day".to_string(), "Earlier".to_string())
-}
-
-fn bytes_to_hex_lower(input: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(input.len() * 2);
-    for byte in input {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
 }
 
 fn now_unix_secs() -> i64 {
@@ -3869,55 +4025,11 @@ fn build_version_text() -> String {
 }
 
 fn append_local_log(message: &str) {
-    if let Err(err) = append_local_log_inner(message) {
-        eprintln!("local log warning: {err}");
-    }
-}
-
-fn append_local_log_inner(message: &str) -> Result<(), String> {
-    let path = app_log_file_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|err| format!("failed creating app log directory: {err}"))?;
-    }
-
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|err| format!("failed opening app log file at {}: {err}", path.display()))?;
-
-    let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => duration.as_secs(),
-        Err(_) => 0,
-    };
-
-    writeln!(file, "[{now}] {message}")
-        .map_err(|err| format!("failed writing app log file at {}: {err}", path.display()))
-}
-
-fn app_log_file_path() -> PathBuf {
-    if let Ok(xdg_state_home) = std::env::var("XDG_STATE_HOME") {
-        if !xdg_state_home.trim().is_empty() {
-            return Path::new(&xdg_state_home)
-                .join("aethos-linux")
-                .join(APP_LOG_FILE_NAME);
-        }
-    }
-
-    if let Ok(home) = std::env::var("HOME") {
-        return Path::new(&home)
-            .join(".local")
-            .join("state")
-            .join("aethos-linux")
-            .join(APP_LOG_FILE_NAME);
-    }
-
-    std::env::temp_dir().join(APP_LOG_FILE_NAME)
+    shared_log_info(message);
 }
 
 fn open_log_folder() -> Result<(), String> {
-    let log_dir = app_log_file_path()
+    let log_dir = shared_app_log_file_path()
         .parent()
         .map(|path| path.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
@@ -4100,6 +4212,7 @@ fn load_app_settings() -> Result<AppSettings, String> {
         .for_each(|endpoint| *endpoint = normalize_http_endpoint(endpoint));
     settings.relay_endpoints.sort();
     settings.relay_endpoints.dedup();
+    settings.message_ttl_seconds = clamp_message_ttl_seconds(settings.message_ttl_seconds);
     Ok(settings)
 }
 
@@ -4128,11 +4241,53 @@ fn save_app_settings(settings: &AppSettings) -> Result<(), String> {
         .for_each(|endpoint| *endpoint = normalize_http_endpoint(endpoint));
     normalized.relay_endpoints.sort();
     normalized.relay_endpoints.dedup();
+    normalized.message_ttl_seconds = clamp_message_ttl_seconds(normalized.message_ttl_seconds);
 
     let serialized = serde_json::to_string_pretty(&normalized)
         .map_err(|err| format!("failed serializing app settings: {err}"))?;
     fs::write(&path, serialized)
         .map_err(|err| format!("failed writing app settings at {}: {err}", path.display()))
+}
+
+fn default_message_ttl_seconds() -> u64 {
+    DEFAULT_MESSAGE_TTL_SECONDS
+}
+
+fn clamp_message_ttl_seconds(ttl_seconds: u64) -> u64 {
+    ttl_seconds.clamp(MIN_MESSAGE_TTL_SECONDS, MAX_MESSAGE_TTL_SECONDS)
+}
+
+fn apply_message_ttl_entry(
+    app_settings: &Rc<RefCell<AppSettings>>,
+    entry: &Entry,
+    chat_status_label: &Label,
+    message_ttl_effective: &Label,
+) {
+    let raw = entry.text().trim().to_string();
+    let parsed = raw.parse::<u64>();
+    let Ok(value) = parsed else {
+        entry.set_text(&app_settings.borrow().message_ttl_seconds.to_string());
+        chat_status_label.set_text("TTL update failed: enter a whole number in seconds");
+        return;
+    };
+
+    let clamped = clamp_message_ttl_seconds(value);
+    {
+        let mut settings = app_settings.borrow_mut();
+        settings.message_ttl_seconds = clamped;
+        if let Err(err) = save_app_settings(&settings) {
+            append_local_log(&format!("save_settings_failed: {err}"));
+            chat_status_label.set_text(&format!("TTL update failed: {err}"));
+            return;
+        }
+    }
+
+    entry.set_text(&clamped.to_string());
+    message_ttl_effective.set_text(&format!(
+        "Effective range: {} - {} seconds · active {} seconds",
+        MIN_MESSAGE_TTL_SECONDS, MAX_MESSAGE_TTL_SECONDS, clamped
+    ));
+    chat_status_label.set_text(&format!("Outbound TTL updated to {clamped} seconds"));
 }
 
 fn app_settings_file_path() -> PathBuf {
