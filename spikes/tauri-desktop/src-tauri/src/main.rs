@@ -185,6 +185,15 @@ struct RelayHealthStatus {
     chip_state: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppLogTail {
+    log_file_path: String,
+    total_lines: usize,
+    shown_lines: usize,
+    content: String,
+}
+
 #[tauri::command]
 fn app_diagnostics() -> AppDiagnostics {
     AppDiagnostics {
@@ -200,6 +209,34 @@ fn app_diagnostics() -> AppDiagnostics {
         verbose_logging_enabled: verbose_logging_enabled(),
         log_file_path: app_log_file_path().display().to_string(),
     }
+}
+
+#[tauri::command]
+fn read_app_log(max_lines: Option<usize>) -> Result<AppLogTail, String> {
+    let limit = max_lines.unwrap_or(400).clamp(50, 5000);
+    let path = app_log_file_path();
+    let raw = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => {
+            return Err(format!(
+                "failed reading app log at {}: {err}",
+                path.display()
+            ))
+        }
+    };
+
+    let all_lines = raw.lines().collect::<Vec<_>>();
+    let total_lines = all_lines.len();
+    let tail_start = total_lines.saturating_sub(limit);
+    let shown = all_lines[tail_start..].join("\n");
+
+    Ok(AppLogTail {
+        log_file_path: path.display().to_string(),
+        total_lines,
+        shown_lines: total_lines.saturating_sub(tail_start),
+        content: shown,
+    })
 }
 
 #[tauri::command]
@@ -1381,6 +1418,7 @@ pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             app_diagnostics,
+            read_app_log,
             bootstrap_state,
             rotate_wayfarer_id,
             reset_wayfarer_id,

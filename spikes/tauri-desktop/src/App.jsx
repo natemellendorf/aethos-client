@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   BellRing,
@@ -58,6 +58,9 @@ export default function App() {
   const [showSplash, setShowSplash] = useState(true);
   const [splashFade, setSplashFade] = useState(false);
   const [networkPulseTs, setNetworkPulseTs] = useState(0);
+  const [logTail, setLogTail] = useState({ logFilePath: "", totalLines: 0, shownLines: 0, content: "" });
+  const [logFollow, setLogFollow] = useState(true);
+  const logContainerRef = useRef(null);
 
   const entries = useMemo(
     () => Object.entries(contacts).sort((a, b) => (a[1] || "").localeCompare(b[1] || "", undefined, { sensitivity: "base" })),
@@ -70,11 +73,12 @@ export default function App() {
   const runBootstrap = async () => {
     const startedAt = Date.now();
     try {
-      const [boot, diag, gossip, relay] = await Promise.all([
+      const [boot, diag, gossip, relay, log] = await Promise.all([
         invoke("bootstrap_state"),
         invoke("app_diagnostics"),
         invoke("gossip_status"),
-        invoke("relay_health_status")
+        invoke("relay_health_status"),
+        invoke("read_app_log", { maxLines: 500 })
       ]);
       setIdentity(boot.identity);
       setSettings(boot.settings);
@@ -87,6 +91,7 @@ export default function App() {
       setDiagnostics(diag);
       setGossipStatus(gossip);
       setRelayHealth(relay);
+      setLogTail(log);
       setStatus("Ready");
       setNetworkPulseTs(Date.now());
     } catch (error) {
@@ -104,6 +109,36 @@ export default function App() {
   useEffect(() => {
     runBootstrap();
   }, []);
+
+  useEffect(() => {
+    if (tab !== "settings") return;
+
+    let cancelled = false;
+    const fetchLogs = async () => {
+      try {
+        const log = await invoke("read_app_log", { maxLines: 500 });
+        if (!cancelled) {
+          setLogTail(log);
+        }
+      } catch {
+        // keep settings page responsive
+      }
+    };
+
+    fetchLogs();
+    const timer = setInterval(fetchLogs, 1500);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [tab]);
+
+  useEffect(() => {
+    if (!logFollow || tab !== "settings") return;
+    const el = logContainerRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [logTail, logFollow, tab]);
 
   useEffect(() => {
     const timer = setInterval(async () => {
@@ -259,6 +294,7 @@ export default function App() {
       setSettings(saved);
       setRelayHealth(await invoke("relay_health_status"));
       setGossipStatus(await invoke("gossip_status"));
+      setLogTail(await invoke("read_app_log", { maxLines: 500 }));
       setStatus("Settings saved");
     } catch (error) {
       setStatus(`Settings update failed: ${String(error)}`);
@@ -418,8 +454,9 @@ export default function App() {
         )}
 
         {tab === "settings" && settings && (
-          <div className="grid gap-4 lg:grid-cols-2">
-            <Card>
+          <div className="space-y-4">
+            <div className="grid gap-4 lg:grid-cols-2">
+              <Card>
               <CardHeader><CardTitle>Sync Settings</CardTitle></CardHeader>
               <CardContent>
                 <form className="space-y-3" onSubmit={saveSettings}>
@@ -434,8 +471,8 @@ export default function App() {
                   </div>
                 </form>
               </CardContent>
-            </Card>
-            <Card>
+              </Card>
+              <Card>
               <CardHeader><CardTitle>Diagnostics</CardTitle></CardHeader>
               <CardContent className="space-y-2 text-sm text-muted-foreground">
                 <p>{diagnostics ? `${diagnostics.platform}/${diagnostics.arch}` : "Loading"}</p>
@@ -456,6 +493,46 @@ export default function App() {
                     <p>Encounter: {report.encounterStatus}</p>
                   </div>
                 )) : null}
+              </CardContent>
+              </Card>
+            </div>
+
+            <Card>
+              <CardHeader>
+                <CardTitle>Live Client Logs</CardTitle>
+                <p className="text-xs text-muted-foreground">{logTail.logFilePath || "Log path unavailable"}</p>
+              </CardHeader>
+              <CardContent>
+                <div className="mb-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                  <Badge className="bg-slate-700/40">Showing {logTail.shownLines} / {logTail.totalLines} lines</Badge>
+                  <label className="inline-flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={logFollow}
+                      onChange={(event) => setLogFollow(event.target.checked)}
+                    />
+                    Auto-follow
+                  </label>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={async () => setLogTail(await invoke("read_app_log", { maxLines: 500 }))}
+                  >
+                    Refresh Logs
+                  </Button>
+                </div>
+
+                <div
+                  ref={logContainerRef}
+                  onScroll={(event) => {
+                    const el = event.currentTarget;
+                    const nearBottom = el.scrollHeight - (el.scrollTop + el.clientHeight) < 20;
+                    if (logFollow && !nearBottom) setLogFollow(false);
+                  }}
+                  className="max-h-[320px] overflow-auto rounded-lg border border-border/60 bg-black/40 p-3"
+                >
+                  <pre className="whitespace-pre-wrap text-xs leading-5 text-cyan-100">{logTail.content || "(no log lines yet)"}</pre>
+                </div>
               </CardContent>
             </Card>
           </div>
