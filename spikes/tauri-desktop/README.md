@@ -1,20 +1,24 @@
-# Tauri Desktop Spike (Isolated)
+# Tauri Desktop Rewrite Track
 
-This directory is an isolated spike to evaluate Tauri as the cross-platform GUI shell.
+This directory is the active Tauri rewrite track for the desktop client.
 
-It does not modify or replace the current GTK implementation.
+The GTK implementation remains in `src/main.rs` during migration, but this path is now the target for cross-platform GUI delivery.
 
 ## Goals
 
-- Validate Linux/macOS/Windows desktop app packaging flow.
-- Validate UX fidelity potential with a modern UI layer.
-- Validate Rust backend command integration for app logic.
+- Ship standalone desktop bundles for Linux/macOS/Windows.
+- Preserve existing chat/contact/settings workflows from GTK while improving UX.
+- Keep protocol, relay, and identity logic in Rust.
 
-## Included Spike Scope
+## Current Scope
 
-- Multi-view UI shell: Onboarding, Chats, Contacts, Settings.
-- Local mock contact/thread state in frontend for interaction testing.
-- Rust command bridge for diagnostics and mock Wayfarer ID generation.
+- React + Tailwind + shadcn/ui-style component system.
+- Multi-view UI shell: Chats, Contacts, Share, Settings.
+- Real identity, contacts, settings, and chat persistence wired to backend commands.
+- Relay diagnostics + inbox sync commands with non-blocking backend execution.
+- QR share generation + contact QR import flow.
+- Outbound status transitions (sending/sent/failed), retry action, and metadata details.
+- New-contact and unread badges in contact list.
 
 ## Run (Dev)
 
@@ -25,10 +29,30 @@ npm install
 npm run tauri:dev
 ```
 
+Frontend-only preview:
+
+```bash
+npm run dev
+```
+
 ## Build (Desktop Bundle)
 
 ```bash
 npm run tauri:build
+```
+
+## Tests
+
+Run backend tests:
+
+```bash
+cargo test --manifest-path src-tauri/Cargo.toml
+```
+
+Optional relay target E2E tests (ignored by default):
+
+```bash
+AETHOS_RELAY_TEST_HTTP=http://your-relay:8082 cargo test --manifest-path src-tauri/Cargo.toml -- --ignored
 ```
 
 ## macOS signing/notarization (CI)
@@ -44,22 +68,14 @@ To produce a signed + notarized `.dmg` from GitHub Actions, add these repository
 - `APPLE_PASSWORD` (app-specific password)
 - `APPLE_TEAM_ID`
 
-Then run workflow `Tauri Spike Bundles` with `notarize_macos=true`.
+Then run workflow `Release Binaries` with `notarize_macos=true`.
 
 CLI example:
 
 ```bash
-gh workflow run tauri-spike-bundles.yml --ref spike/tauri-bundles -f notarize_macos=true
+gh workflow run release-binaries.yml --ref spike/tauri-bundles -f notarize_macos=true
 ```
 
-## Evaluation Checklist
+## Release readiness
 
-1. App launches on each platform without manual GTK/Homebrew/MSYS runtime setup.
-2. UI remains responsive and usable at desktop and narrow widths.
-3. Rust commands return expected data in UI.
-4. Generated bundles/installers are straightforward to distribute.
-
-## Notes
-
-- Dev server is a minimal static server (`python3 -m http.server`) to keep the spike simple.
-- This spike is intentionally small and non-production.
+Use `docs/tauri-cutover-checklist.md` before promoting this path to default desktop release.
