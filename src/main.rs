@@ -30,12 +30,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::aethos_core::gossip_sync::{
     build_hello_frame as build_gossip_hello_frame,
-    build_relay_ingest_frame as build_gossip_relay_ingest_frame,
     build_request_frame as build_gossip_request_frame,
-    build_summary_frame as build_gossip_summary_frame, has_item as gossip_has_item,
-    import_transfer_items, parse_frame as parse_gossip_frame,
-    record_local_payload as gossip_record_local_payload,
-    select_request_item_ids_from_summary as gossip_select_request_item_ids_from_summary,
+    build_summary_frame as build_gossip_summary_frame, import_transfer_items,
+    parse_frame as parse_gossip_frame, record_local_payload as gossip_record_local_payload,
+    select_request_item_ids_from_summary_with_candidates as gossip_select_request_item_ids_from_summary,
     serialize_frame as serialize_gossip_frame, transfer_items_for_request as gossip_transfer_items,
     GossipSyncFrame, GOSSIP_LAN_PORT,
 };
@@ -99,7 +97,9 @@ struct SessionStatus {
 
 #[derive(Clone, Debug)]
 struct PulledMessagePreview {
-    from_wayfarer_id: String,
+    author_wayfarer_id: Option<String>,
+    session_peer: Option<String>,
+    transport_peer: Option<String>,
     msg_id: String,
     text: String,
     received_at: i64,
@@ -2307,7 +2307,9 @@ fn build_ui(app: &Application) {
                             .pulled_messages
                             .into_iter()
                             .map(|item| PulledMessagePreview {
-                                from_wayfarer_id: item.from_node_id,
+                                author_wayfarer_id: item.author_wayfarer_id,
+                                session_peer: item.session_peer,
+                                transport_peer: item.transport_peer,
                                 msg_id: item.item_id,
                                 text: extract_chat_text_if_json(&item.text),
                                 received_at: item.received_at_unix,
@@ -2785,22 +2787,20 @@ fn attach_session_poller(rx: Receiver<SessionStatus>, ui: SessionPollerUi) {
                 }
 
                 for pulled in &status.pulled_messages {
-                    if !state.contact_aliases.contains_key(&pulled.from_wayfarer_id) {
-                        state.contact_aliases.insert(
-                            pulled.from_wayfarer_id.clone(),
-                            pulled.from_wayfarer_id.clone(),
-                        );
-                        state.new_contacts.insert(pulled.from_wayfarer_id.clone());
+                    let sender_label = display_sender_label(pulled);
+
+                    if !state.contact_aliases.contains_key(&sender_label) {
+                        state
+                            .contact_aliases
+                            .insert(sender_label.clone(), sender_label.clone());
+                        state.new_contacts.insert(sender_label.clone());
                         aliases_changed = true;
                     }
 
                     let is_seen_on_insert =
-                        state.selected_contact.as_deref() == Some(pulled.from_wayfarer_id.as_str());
+                        state.selected_contact.as_deref() == Some(sender_label.as_str());
 
-                    let thread = state
-                        .threads
-                        .entry(pulled.from_wayfarer_id.clone())
-                        .or_default();
+                    let thread = state.threads.entry(sender_label.clone()).or_default();
 
                     let already_present = thread.iter().any(|existing| {
                         existing.msg_id == pulled.msg_id
@@ -2811,7 +2811,7 @@ fn attach_session_poller(rx: Receiver<SessionStatus>, ui: SessionPollerUi) {
                     if already_present {
                         shared_log_verbose(&format!(
                             "thread_incoming_skip_duplicate: from={} msg_id={} manifest={}",
-                            pulled.from_wayfarer_id,
+                            sender_label,
                             pulled.msg_id,
                             pulled.manifest_id_hex.as_deref().unwrap_or("none")
                         ));
@@ -2834,7 +2834,7 @@ fn attach_session_poller(rx: Receiver<SessionStatus>, ui: SessionPollerUi) {
                     });
                     shared_log_verbose(&format!(
                         "thread_incoming_insert: from={} msg_id={} manifest={}",
-                        pulled.from_wayfarer_id,
+                        sender_label,
                         pulled.msg_id,
                         pulled.manifest_id_hex.as_deref().unwrap_or("none")
                     ));
@@ -2844,7 +2844,7 @@ fn attach_session_poller(rx: Receiver<SessionStatus>, ui: SessionPollerUi) {
                             .receipt_received_at_unix_ms
                             .map(format_timestamp_from_unix_ms)
                             .unwrap_or_else(|| format_timestamp_from_unix(pulled.received_at));
-                        if let Some(thread) = state.threads.get_mut(&pulled.from_wayfarer_id) {
+                        if let Some(thread) = state.threads.get_mut(&sender_label) {
                             for item in thread.iter_mut().rev() {
                                 if matches!(item.direction, ChatDirection::Outgoing)
                                     && item.manifest_id_hex.as_deref() == Some(manifest.as_str())
@@ -2858,8 +2858,8 @@ fn attach_session_poller(rx: Receiver<SessionStatus>, ui: SessionPollerUi) {
                     }
 
                     if state.selected_contact.is_none() {
-                        state.selected_contact = Some(pulled.from_wayfarer_id.clone());
-                        mark_contact_seen(&mut state, &pulled.from_wayfarer_id);
+                        state.selected_contact = Some(sender_label.clone());
+                        mark_contact_seen(&mut state, &sender_label);
                     }
                 }
 
@@ -2989,7 +2989,9 @@ fn sync_inbox_once(relay_http: &str) -> Result<Vec<PulledMessagePreview>, String
         .pulled_messages
         .into_iter()
         .map(|message| PulledMessagePreview {
-            from_wayfarer_id: message.from_node_id,
+            author_wayfarer_id: message.author_wayfarer_id,
+            session_peer: message.session_peer,
+            transport_peer: message.transport_peer,
             msg_id: message.item_id,
             text: extract_chat_text_if_json(&message.text),
             received_at: message.received_at_unix,
@@ -3034,7 +3036,7 @@ fn start_background_gossip_sync(
 
         let mut peer_node_by_addr: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
-        let mut last_inventory_broadcast = Instant::now() - Duration::from_secs(10);
+        let mut last_hello_broadcast = Instant::now() - Duration::from_secs(10);
 
         loop {
             if !gossip_sync_enabled.load(Ordering::SeqCst) {
@@ -3043,7 +3045,7 @@ fn start_background_gossip_sync(
             }
 
             let force_announce = gossip_force_announce.swap(false, Ordering::SeqCst);
-            if force_announce || last_inventory_broadcast.elapsed() >= Duration::from_secs(3) {
+            if force_announce || last_hello_broadcast.elapsed() >= Duration::from_secs(3) {
                 if let Ok(identity) = ensure_local_identity() {
                     let node_pubkey_raw = match base64::engine::general_purpose::STANDARD
                         .decode(&identity.verifying_key_b64)
@@ -3059,24 +3061,17 @@ fn start_background_gossip_sync(
                         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(node_pubkey_raw);
                     if let Ok(hello) = build_gossip_hello_frame(&identity.wayfarer_id, &node_pubkey)
                     {
-                        let _ =
-                            send_gossip_frame(&socket, "255.255.255.255", GOSSIP_LAN_PORT, &hello);
-                    }
-                    if let Ok(summary) = build_gossip_summary_frame(now_unix_ms()) {
                         let _ = send_gossip_frame(
                             &socket,
                             "255.255.255.255",
                             GOSSIP_LAN_PORT,
-                            &summary,
+                            &hello,
+                            GossipSendMode::Broadcast,
                         );
-                    }
-                    if let Ok(ingest) = build_gossip_relay_ingest_frame(now_unix_ms()) {
-                        let _ =
-                            send_gossip_frame(&socket, "255.255.255.255", GOSSIP_LAN_PORT, &ingest);
                     }
                     gossip_last_activity_ms.store(now_unix_ms(), Ordering::SeqCst);
                 }
-                last_inventory_broadcast = Instant::now();
+                last_hello_broadcast = Instant::now();
             }
 
             let mut buf = [0u8; 65_535];
@@ -3101,6 +3096,7 @@ fn start_background_gossip_sync(
 
                     let local_wayfarer = identity.wayfarer_id;
                     let source_key = source.to_string();
+                    let source_ip_key = source.ip().to_string();
                     shared_log_verbose(&format!(
                         "gossip_recv: frame_type={} bytes={} from={}",
                         gossip_frame_type(&frame),
@@ -3110,36 +3106,33 @@ fn start_background_gossip_sync(
 
                     match frame {
                         GossipSyncFrame::Hello(hello) if hello.node_id != local_wayfarer => {
-                            peer_node_by_addr.insert(source_key.clone(), hello.node_id);
+                            peer_node_by_addr.insert(source_key.clone(), hello.node_id.clone());
+                            peer_node_by_addr.insert(source_ip_key, hello.node_id);
                             if let Ok(summary) = build_gossip_summary_frame(now_unix_ms()) {
                                 let _ = send_gossip_frame(
                                     &socket,
                                     &source.ip().to_string(),
                                     source.port(),
                                     &summary,
-                                );
-                            }
-                            if let Ok(ingest) = build_gossip_relay_ingest_frame(now_unix_ms()) {
-                                let _ = send_gossip_frame(
-                                    &socket,
-                                    &source.ip().to_string(),
-                                    source.port(),
-                                    &ingest,
+                                    GossipSendMode::Unicast,
                                 );
                             }
                             gossip_last_activity_ms.store(now_unix_ms(), Ordering::SeqCst);
                         }
                         GossipSyncFrame::Summary(summary) => {
-                            let want =
-                                match gossip_select_request_item_ids_from_summary(&summary, 256) {
-                                    Ok(want) => want,
-                                    Err(err) => {
-                                        append_local_log(&format!(
-                                            "gossip_summary_reconcile_failed: {err}"
-                                        ));
-                                        continue;
-                                    }
-                                };
+                            let want = match gossip_select_request_item_ids_from_summary(
+                                &summary,
+                                256,
+                                &[],
+                            ) {
+                                Ok(want) => want,
+                                Err(err) => {
+                                    append_local_log(&format!(
+                                        "gossip_summary_reconcile_failed: {err}"
+                                    ));
+                                    continue;
+                                }
+                            };
 
                             let request = match build_gossip_request_frame(want, 256) {
                                 Ok(frame) => frame,
@@ -3156,34 +3149,14 @@ fn start_background_gossip_sync(
                                 &source.ip().to_string(),
                                 source.port(),
                                 &request,
+                                GossipSendMode::Unicast,
                             );
                             gossip_last_activity_ms.store(now_unix_ms(), Ordering::SeqCst);
                         }
-                        GossipSyncFrame::RelayIngest(ingest) => {
-                            let mut missing_item_ids = ingest
-                                .item_ids
-                                .into_iter()
-                                .filter(|item_id| {
-                                    gossip_has_item(item_id).map(|have| !have).unwrap_or(false)
-                                })
-                                .collect::<Vec<_>>();
-                            missing_item_ids.sort();
-                            let request = match build_gossip_request_frame(missing_item_ids, 256) {
-                                Ok(frame) => frame,
-                                Err(err) => {
-                                    append_local_log(&format!(
-                                        "gossip_request_build_failed: {err}"
-                                    ));
-                                    continue;
-                                }
-                            };
-                            let _ = send_gossip_frame(
-                                &socket,
-                                &source.ip().to_string(),
-                                source.port(),
-                                &request,
-                            );
-                            gossip_last_activity_ms.store(now_unix_ms(), Ordering::SeqCst);
+                        GossipSyncFrame::RelayIngest(_) => {
+                            append_local_log(&format!(
+                                "gossip_relay_ingest_ignored_untrusted from={source}"
+                            ));
                         }
                         GossipSyncFrame::Request(req) => {
                             let objects = gossip_transfer_items(
@@ -3201,17 +3174,23 @@ fn start_background_gossip_sync(
                                 &source.ip().to_string(),
                                 source.port(),
                                 &transfer,
+                                GossipSendMode::Unicast,
                             );
                             gossip_last_activity_ms.store(now_unix_ms(), Ordering::SeqCst);
                         }
                         GossipSyncFrame::Transfer(transfer) => {
-                            let peer_node_id = peer_node_by_addr
+                            let session_peer = peer_node_by_addr
                                 .get(&source_key)
+                                .or_else(|| peer_node_by_addr.get(&source.ip().to_string()))
                                 .cloned()
-                                .unwrap_or_else(|| source.ip().to_string());
+                                .or_else(|| {
+                                    peer_node_by_addr.get(&source.ip().to_string()).cloned()
+                                });
+                            let transport_peer = source.to_string();
                             let result = import_transfer_items(
-                                &peer_node_id,
                                 &local_wayfarer,
+                                Some(&transport_peer),
+                                session_peer.as_deref(),
                                 &transfer.objects,
                                 now_unix_ms(),
                             );
@@ -3228,7 +3207,9 @@ fn start_background_gossip_sync(
                                         .new_messages
                                         .iter()
                                         .map(|item| PulledMessagePreview {
-                                            from_wayfarer_id: item.from_wayfarer_id.clone(),
+                                            author_wayfarer_id: item.author_wayfarer_id.clone(),
+                                            session_peer: item.session_peer.clone(),
+                                            transport_peer: item.transport_peer.clone(),
                                             msg_id: item.item_id.clone(),
                                             text: extract_chat_text_if_json(&item.text),
                                             received_at: item.received_at_unix,
@@ -3266,6 +3247,7 @@ fn start_background_gossip_sync(
                                     &source.ip().to_string(),
                                     source.port(),
                                     &receipt,
+                                    GossipSendMode::Unicast,
                                 );
                                 gossip_last_activity_ms.store(now_unix_ms(), Ordering::SeqCst);
                             }
@@ -3292,24 +3274,76 @@ fn start_background_gossip_sync(
     });
 }
 
+#[derive(Clone, Copy)]
+enum GossipSendMode {
+    Broadcast,
+    Unicast,
+}
+
+trait DatagramSink {
+    fn send_to(&self, raw: &[u8], addr: &str) -> std::io::Result<usize>;
+}
+
+impl DatagramSink for UdpSocket {
+    fn send_to(&self, raw: &[u8], addr: &str) -> std::io::Result<usize> {
+        UdpSocket::send_to(self, raw, addr)
+    }
+}
+
 fn send_gossip_frame(
     socket: &UdpSocket,
     host: &str,
     port: u16,
     frame: &GossipSyncFrame,
+    mode: GossipSendMode,
 ) -> Result<(), String> {
-    let raw = serialize_gossip_frame(frame)?;
+    send_gossip_frame_with_sink(socket, host, port, frame, mode)
+}
+
+fn send_gossip_frame_with_sink(
+    sink: &impl DatagramSink,
+    host: &str,
+    port: u16,
+    frame: &GossipSyncFrame,
+    mode: GossipSendMode,
+) -> Result<(), String> {
     let addr = format!("{host}:{port}");
+    let mode_label = match mode {
+        GossipSendMode::Broadcast => "broadcast",
+        GossipSendMode::Unicast => "unicast",
+    };
+
+    if matches!(mode, GossipSendMode::Broadcast) && !matches!(frame, GossipSyncFrame::Hello(_)) {
+        let message = format!(
+            "gossip_send_drop: frame_type={} to={} mode={} reason=broadcast_only_allows_hello",
+            gossip_frame_type(frame),
+            addr,
+            mode_label
+        );
+        append_local_log(&message);
+        shared_log_verbose(&message);
+        return Ok(());
+    }
+
+    let raw = serialize_gossip_frame(frame)?;
+
     shared_log_verbose(&format!(
-        "gossip_send: frame_type={} bytes={} to={}",
+        "gossip_send: frame_type={} bytes={} to={} mode={}",
         gossip_frame_type(frame),
         raw.len(),
-        addr
+        addr,
+        mode_label
     ));
-    socket
-        .send_to(&raw, &addr)
-        .map(|_| ())
-        .map_err(|err| format!("gossip send failed ({addr}): {err}"))
+
+    sink.send_to(&raw, &addr).map(|_| ()).map_err(|err| {
+        format!(
+            "gossip send failed (frame_type={} bytes={} to={} mode={}): {err}",
+            gossip_frame_type(frame),
+            raw.len(),
+            addr,
+            mode_label
+        )
+    })
 }
 
 fn gossip_frame_type(frame: &GossipSyncFrame) -> &'static str {
@@ -3333,6 +3367,22 @@ fn extract_chat_text_if_json(input: &str) -> String {
     }
 
     input.to_string()
+}
+
+fn display_sender_label(pulled: &PulledMessagePreview) -> String {
+    if let Some(author) = pulled.author_wayfarer_id.as_ref() {
+        return author.clone();
+    }
+
+    if let Some(session_peer) = pulled.session_peer.as_ref() {
+        return format!("session peer: {session_peer}");
+    }
+
+    if let Some(transport_peer) = pulled.transport_peer.as_ref() {
+        return format!("transport peer: {transport_peer}");
+    }
+
+    "unknown peer".to_string()
 }
 
 fn render_contacts(
@@ -5030,10 +5080,31 @@ fn apply_styles() {
 #[cfg(test)]
 mod tests {
     use super::{extract_wayfarer_id_from_text, update_relay_sync_setting, AppSettings};
+    use crate::aethos_core::gossip_sync::{GossipSyncFrame, RelayIngestFrame};
+    use base64::Engine;
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    #[derive(Default)]
+    struct MockDatagramSink {
+        sent: std::sync::Mutex<Vec<(String, usize)>>,
+        fail: std::sync::Mutex<Option<std::io::ErrorKind>>,
+    }
+
+    impl super::DatagramSink for MockDatagramSink {
+        fn send_to(&self, raw: &[u8], addr: &str) -> std::io::Result<usize> {
+            if let Some(kind) = self.fail.lock().expect("lock fail kind").take() {
+                return Err(std::io::Error::from(kind));
+            }
+            self.sent
+                .lock()
+                .expect("lock sent")
+                .push((addr.to_string(), raw.len()));
+            Ok(raw.len())
+        }
+    }
 
     #[test]
     fn relay_toggle_helper_updates_state_and_atomic_flag() {
@@ -5083,5 +5154,53 @@ mod tests {
             extract_wayfarer_id_from_text(&format!("scan={id}&source=camera")),
             Some(id)
         );
+    }
+
+    #[test]
+    fn lan_sender_refuses_broadcast_relay_ingest_to_avoid_emsgsize_loops() {
+        let sink = MockDatagramSink::default();
+        let oversized = GossipSyncFrame::RelayIngest(RelayIngestFrame {
+            item_ids: (0..20_000)
+                .map(|idx| format!("{:064x}", idx as u64))
+                .collect(),
+        });
+
+        let result = super::send_gossip_frame_with_sink(
+            &sink,
+            "255.255.255.255",
+            super::GOSSIP_LAN_PORT,
+            &oversized,
+            super::GossipSendMode::Broadcast,
+        );
+
+        assert!(result.is_ok());
+        assert!(sink.sent.lock().expect("lock sent").is_empty());
+    }
+
+    #[test]
+    fn lan_sender_emits_single_datagram_per_frame() {
+        let sink = MockDatagramSink::default();
+        let frame = GossipSyncFrame::Hello(crate::aethos_core::gossip_sync::HelloFrame {
+            version: 1,
+            node_id: "11".repeat(32),
+            node_pubkey: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x11u8; 32]),
+            capabilities: vec![],
+            propagation_class: "interactive".to_string(),
+            max_want: 1,
+            max_transfer: 1,
+        });
+
+        let result = super::send_gossip_frame_with_sink(
+            &sink,
+            "127.0.0.1",
+            super::GOSSIP_LAN_PORT,
+            &frame,
+            super::GossipSendMode::Unicast,
+        );
+
+        assert!(result.is_ok());
+        let sent = sink.sent.lock().expect("lock sent");
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].1 > 0);
     }
 }

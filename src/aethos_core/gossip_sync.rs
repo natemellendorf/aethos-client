@@ -4,14 +4,16 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
+use ciborium::value::Value;
 use ciborium::{de::from_reader, ser::into_writer};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::aethos_core::logging::log_verbose;
 use crate::aethos_core::protocol::{
-    bytes_to_hex_lower, decode_envelope_payload_b64, decode_envelope_payload_utf8_preview,
-    is_valid_payload_b64,
+    bytes_to_hex_lower, decode_cbor_value_exact, decode_envelope_payload_b64,
+    decode_envelope_payload_utf8_preview, encode_cbor_value_deterministic, is_valid_payload_b64,
+    to_cbor_value,
 };
 
 pub const GOSSIP_VERSION: u64 = 1;
@@ -104,7 +106,9 @@ pub struct RelayIngestFrame {
 #[derive(Debug, Clone)]
 pub struct ImportedEnvelope {
     pub item_id: String,
-    pub from_wayfarer_id: String,
+    pub author_wayfarer_id: Option<String>,
+    pub transport_peer: Option<String>,
+    pub session_peer: Option<String>,
     pub text: String,
     pub received_at_unix: i64,
     pub manifest_id_hex: Option<String>,
@@ -140,8 +144,16 @@ struct StoredItem {
 }
 
 pub fn serialize_frame(frame: &GossipSyncFrame) -> Result<Vec<u8>, String> {
-    let mut raw = Vec::new();
-    into_writer(frame, &mut raw).map_err(|err| format!("serialize gossip frame: {err}"))?;
+    let (frame_type, payload) = frame_type_and_payload(frame)?;
+    let envelope = Value::Map(vec![
+        (
+            Value::Text("type".to_string()),
+            Value::Text(frame_type.to_string()),
+        ),
+        (Value::Text("payload".to_string()), payload),
+    ]);
+    let raw = encode_cbor_value_deterministic(&envelope)
+        .map_err(|err| format!("serialize gossip frame: {err}"))?;
     if raw.len() > MAX_FRAME_BYTES {
         return Err("frame exceeds MAX_FRAME_BYTES".to_string());
     }
@@ -152,8 +164,20 @@ pub fn parse_frame(raw: &[u8]) -> Result<GossipSyncFrame, String> {
     if raw.len() > MAX_FRAME_BYTES {
         return Err("frame exceeds MAX_FRAME_BYTES".to_string());
     }
-    let frame: GossipSyncFrame =
-        from_reader(raw).map_err(|err| classify_frame_parse_error(&err.to_string()))?;
+
+    let envelope = decode_cbor_value_exact(raw, "gossip frame")
+        .map_err(|err| classify_frame_parse_error(&err))?;
+    let canonical = encode_cbor_value_deterministic(&envelope).map_err(|err| {
+        classify_frame_parse_error(&format!("canonical frame encode failed: {err}"))
+    })?;
+    if canonical.as_slice() != raw {
+        return Err(
+            "parse gossip frame cbor: frame is not deterministic canonical CBOR".to_string(),
+        );
+    }
+
+    let frame =
+        frame_from_envelope_value(envelope).map_err(|err| classify_frame_parse_error(&err))?;
     validate_frame(&frame)?;
     Ok(frame)
 }
@@ -223,29 +247,78 @@ pub fn select_request_item_ids_from_summary(
     summary: &SummaryFrame,
     max_want: usize,
 ) -> Result<Vec<String>, String> {
+    select_request_item_ids_from_summary_with_candidates(summary, max_want, &[])
+}
+
+pub fn select_request_item_ids_from_summary_with_candidates(
+    summary: &SummaryFrame,
+    max_want: usize,
+    candidate_item_ids: &[String],
+) -> Result<Vec<String>, String> {
+    let local_have = eligible_item_ids(now_unix_ms())?;
+    select_request_item_ids_from_summary_with_context(
+        summary,
+        max_want,
+        candidate_item_ids,
+        &local_have,
+    )
+}
+
+fn select_request_item_ids_from_summary_with_context(
+    summary: &SummaryFrame,
+    max_want: usize,
+    candidate_item_ids: &[String],
+    local_have_item_ids: &[String],
+) -> Result<Vec<String>, String> {
     let request_cap = max_want.min(MAX_WANT_ITEMS);
     if request_cap == 0 {
         return Ok(Vec::new());
     }
 
-    let local_have = eligible_item_ids(now_unix_ms())?
+    let local_have = local_have_item_ids
+        .iter()
+        .cloned()
         .into_iter()
         .collect::<BTreeSet<_>>();
-    let mut selected = Vec::new();
-    let mut seen = BTreeSet::new();
-
+    let mut preview_eligible = Vec::new();
+    let mut preview_seen = BTreeSet::new();
     for item_id in summary.preview_item_ids.as_deref().unwrap_or(&[]) {
-        if selected.len() >= request_cap {
-            break;
-        }
         if local_have.contains(item_id) {
             continue;
         }
-        if !bloom_might_contain(&summary.bloom_filter, item_id)? {
+        if !preview_seen.insert(item_id.clone()) {
             continue;
         }
-        if seen.insert(item_id.clone()) {
-            selected.push(item_id.clone());
+        if bloom_might_contain(&summary.bloom_filter, item_id)? {
+            preview_eligible.push(item_id.clone());
+        }
+    }
+
+    let mut candidate_eligible = Vec::new();
+    let mut candidate_seen = BTreeSet::new();
+    for item_id in candidate_item_ids {
+        if local_have.contains(item_id) {
+            continue;
+        }
+        if !candidate_seen.insert(item_id.clone()) {
+            continue;
+        }
+        if bloom_might_contain(&summary.bloom_filter, item_id)? {
+            candidate_eligible.push(item_id.clone());
+        }
+    }
+
+    let mut selected = Vec::new();
+    let mut selected_seen = BTreeSet::new();
+    for item_id in preview_eligible
+        .into_iter()
+        .chain(candidate_eligible.into_iter())
+    {
+        if selected.len() >= request_cap {
+            break;
+        }
+        if selected_seen.insert(item_id.clone()) {
+            selected.push(item_id);
         }
     }
 
@@ -376,15 +449,17 @@ pub fn transfer_items_for_request(
 }
 
 pub fn import_transfer_items(
-    sender_wayfarer_id: &str,
     local_wayfarer_id: &str,
+    transport_peer: Option<&str>,
+    session_peer_wayfarer_id: Option<&str>,
     objects: &[TransferObject],
     now_ms: u64,
 ) -> Result<ImportTransferResult, String> {
     log_verbose(&format!(
-        "transfer_import_start: sender={} local={} objects={} now_ms={}",
-        sender_wayfarer_id,
+        "transfer_import_start: local={} transport_peer={} session_peer={} objects={} now_ms={}",
         local_wayfarer_id,
+        transport_peer.unwrap_or("none"),
+        session_peer_wayfarer_id.unwrap_or("none"),
         objects.len(),
         now_ms
     ));
@@ -459,7 +534,9 @@ pub fn import_transfer_items(
                     .unwrap_or_else(|_| "[binary payload]".to_string());
                 new_messages.push(ImportedEnvelope {
                     item_id: object.item_id.clone(),
-                    from_wayfarer_id: sender_wayfarer_id.to_string(),
+                    author_wayfarer_id: None,
+                    transport_peer: transport_peer.map(|value| value.to_string()),
+                    session_peer: session_peer_wayfarer_id.map(|value| value.to_string()),
                     text,
                     received_at_unix: (now_ms / 1000) as i64,
                     manifest_id_hex: Some(parsed.manifest_id_hex),
@@ -707,24 +784,8 @@ fn load_store() -> Result<GossipStore, String> {
     }
     let content = fs::read_to_string(&path)
         .map_err(|err| format!("failed to read gossip store at {}: {err}", path.display()))?;
-    match serde_json::from_str(&content) {
-        Ok(store) => Ok(store),
-        Err(err)
-            if content.trim().is_empty()
-                || matches!(err.classify(), serde_json::error::Category::Eof) =>
-        {
-            let quarantine = path.with_extension(format!("corrupt-{}.json", now_unix_ms()));
-            let _ = fs::rename(&path, &quarantine);
-
-            let reset = GossipStore::default();
-            save_store(&reset)?;
-            Ok(reset)
-        }
-        Err(err) => Err(format!(
-            "failed to parse gossip store at {}: {err}",
-            path.display()
-        )),
-    }
+    serde_json::from_str(&content)
+        .map_err(|err| format!("failed to parse gossip store at {}: {err}", path.display()))
 }
 
 fn save_store(store: &GossipStore) -> Result<(), String> {
@@ -763,5 +824,365 @@ fn now_unix_ms() -> u64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => duration.as_millis() as u64,
         Err(_) => 0,
+    }
+}
+
+fn frame_type_and_payload(frame: &GossipSyncFrame) -> Result<(&'static str, Value), String> {
+    match frame {
+        GossipSyncFrame::Hello(payload) => Ok(("HELLO", to_cbor_value(payload)?)),
+        GossipSyncFrame::Summary(payload) => Ok(("SUMMARY", to_cbor_value(payload)?)),
+        GossipSyncFrame::Request(payload) => Ok(("REQUEST", to_cbor_value(payload)?)),
+        GossipSyncFrame::Transfer(payload) => Ok(("TRANSFER", to_cbor_value(payload)?)),
+        GossipSyncFrame::Receipt(payload) => Ok(("RECEIPT", to_cbor_value(payload)?)),
+        GossipSyncFrame::RelayIngest(payload) => Ok(("RELAY_INGEST", to_cbor_value(payload)?)),
+    }
+}
+
+fn frame_from_envelope_value(envelope: Value) -> Result<GossipSyncFrame, String> {
+    let Value::Map(entries) = envelope else {
+        return Err("parse gossip frame cbor: envelope must be map".to_string());
+    };
+
+    let mut frame_type = None;
+    let mut payload = None;
+    for (key, value) in entries {
+        let Value::Text(key_text) = key else {
+            continue;
+        };
+        match key_text.as_str() {
+            "type" => {
+                let Value::Text(type_text) = value else {
+                    return Err("parse gossip frame cbor: envelope.type must be text".to_string());
+                };
+                frame_type = Some(type_text);
+            }
+            "payload" => {
+                payload = Some(value);
+            }
+            _ => {
+                // Unknown top-level envelope keys are intentionally ignored by spec.
+            }
+        }
+    }
+
+    let frame_type = frame_type.ok_or_else(|| {
+        "parse gossip frame cbor: envelope missing required key `type`".to_string()
+    })?;
+    let payload = payload.ok_or_else(|| {
+        "parse gossip frame cbor: envelope missing required key `payload`".to_string()
+    })?;
+
+    match frame_type.as_str() {
+        "HELLO" => decode_payload_frame(payload, GossipSyncFrame::Hello),
+        "SUMMARY" => decode_payload_frame(payload, GossipSyncFrame::Summary),
+        "REQUEST" => decode_payload_frame(payload, GossipSyncFrame::Request),
+        "TRANSFER" => decode_payload_frame(payload, GossipSyncFrame::Transfer),
+        "RECEIPT" => decode_payload_frame(payload, GossipSyncFrame::Receipt),
+        "RELAY_INGEST" => decode_payload_frame(payload, GossipSyncFrame::RelayIngest),
+        _ => Err(format!(
+            "parse gossip frame cbor: unsupported frame type `{frame_type}`"
+        )),
+    }
+}
+
+fn decode_payload_frame<T, F>(payload: Value, wrap: F) -> Result<GossipSyncFrame, String>
+where
+    T: for<'de> serde::Deserialize<'de>,
+    F: FnOnce(T) -> GossipSyncFrame,
+{
+    let mut raw = Vec::new();
+    into_writer(&payload, &mut raw).map_err(|err| format!("payload re-encode failed: {err}"))?;
+    let payload_value: T =
+        from_reader(raw.as_slice()).map_err(|err| format!("payload decode failed: {err}"))?;
+    Ok(wrap(payload_value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    static TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn test_env_lock() -> &'static Mutex<()> {
+        TEST_ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn unique_test_state_dir(prefix: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let counter = TEST_DIR_COUNTER.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!("{prefix}-{nanos}-{counter}"))
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.as_ref() {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn item(fill: u8) -> String {
+        format!("{:02x}", fill).repeat(32)
+    }
+
+    fn summary_with_bloom_for(items: &[String]) -> SummaryFrame {
+        SummaryFrame {
+            bloom_filter: build_bloom_filter(items).expect("build bloom"),
+            item_count: items.len() as u64,
+            preview_item_ids: None,
+            preview_cursor: None,
+        }
+    }
+
+    #[test]
+    fn summary_reconciliation_uses_candidates_when_preview_empty() {
+        let candidate_a = item(0x20);
+        let candidate_b = item(0x10);
+        let summary = summary_with_bloom_for(&[candidate_a.clone(), candidate_b.clone()]);
+        let want = select_request_item_ids_from_summary_with_context(
+            &summary,
+            8,
+            &[candidate_a.clone(), candidate_b.clone()],
+            &[],
+        )
+        .expect("select want");
+        assert_eq!(want, vec![candidate_b, candidate_a]);
+    }
+
+    #[test]
+    fn summary_reconciliation_excludes_local_have_from_preview() {
+        let preview_a = item(0x01);
+        let preview_b = item(0x02);
+        let summary = SummaryFrame {
+            bloom_filter: build_bloom_filter(&[preview_a.clone(), preview_b.clone()])
+                .expect("bloom"),
+            item_count: 2,
+            preview_item_ids: Some(vec![preview_a.clone(), preview_b.clone()]),
+            preview_cursor: Some(preview_b.clone()),
+        };
+        let want =
+            select_request_item_ids_from_summary_with_context(&summary, 8, &[], &[preview_a])
+                .expect("select want");
+        assert_eq!(want, vec![preview_b]);
+    }
+
+    #[test]
+    fn summary_reconciliation_is_deterministic_for_same_inputs() {
+        let preview_a = item(0x0a);
+        let preview_b = item(0x0b);
+        let candidate = item(0x0c);
+        let summary = SummaryFrame {
+            bloom_filter: build_bloom_filter(&[
+                preview_a.clone(),
+                preview_b.clone(),
+                candidate.clone(),
+            ])
+            .expect("bloom"),
+            item_count: 3,
+            preview_item_ids: Some(vec![preview_b.clone(), preview_a.clone()]),
+            preview_cursor: Some(preview_a.clone()),
+        };
+        let first = select_request_item_ids_from_summary_with_context(
+            &summary,
+            8,
+            std::slice::from_ref(&candidate),
+            &[],
+        )
+        .expect("first");
+        let second = select_request_item_ids_from_summary_with_context(
+            &summary,
+            8,
+            std::slice::from_ref(&candidate),
+            &[],
+        )
+        .expect("second");
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn parse_frame_accepts_unknown_top_level_envelope_key() {
+        let pubkey = [0x11u8; 32];
+        let node_id = bytes_to_hex_lower(&Sha256::digest(pubkey));
+        let hello = build_hello_frame(
+            &node_id,
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(pubkey),
+        )
+        .expect("hello");
+        let raw = serialize_frame(&hello).expect("serialize");
+        let mut value = decode_cbor_value_exact(&raw, "frame").expect("decode");
+        let Value::Map(entries) = &mut value else {
+            panic!("expected envelope map")
+        };
+        entries.push((
+            Value::Text("x_unknown".to_string()),
+            Value::Text("ignored".to_string()),
+        ));
+        let with_unknown = encode_cbor_value_deterministic(&value).expect("encode");
+        assert!(matches!(
+            parse_frame(&with_unknown).expect("parse should ignore unknown envelope keys"),
+            GossipSyncFrame::Hello(_)
+        ));
+    }
+
+    #[test]
+    fn parse_frame_rejects_summary_unknown_payload_key() {
+        let summary = GossipSyncFrame::Summary(SummaryFrame {
+            bloom_filter: vec![0u8; BLOOM_FILTER_BYTES],
+            item_count: 0,
+            preview_item_ids: None,
+            preview_cursor: None,
+        });
+        let raw = serialize_frame(&summary).expect("serialize");
+        let mut value = decode_cbor_value_exact(&raw, "frame").expect("decode");
+        let Value::Map(envelope_entries) = &mut value else {
+            panic!("expected envelope map")
+        };
+        let payload = envelope_entries
+            .iter_mut()
+            .find_map(|(key, value)| match key {
+                Value::Text(text) if text == "payload" => Some(value),
+                _ => None,
+            })
+            .expect("payload field");
+        let Value::Map(payload_entries) = payload else {
+            panic!("expected payload map")
+        };
+        payload_entries.push((
+            Value::Text("extra".to_string()),
+            Value::Text("boom".to_string()),
+        ));
+        let invalid = encode_cbor_value_deterministic(&value).expect("encode");
+        assert!(parse_frame(&invalid)
+            .expect_err("must reject unknown summary payload key")
+            .contains("unknown field"));
+    }
+
+    #[test]
+    fn parse_frame_rejects_multiple_frames_in_one_datagram() {
+        let pubkey = [0x11u8; 32];
+        let node_id = bytes_to_hex_lower(&Sha256::digest(pubkey));
+        let hello = build_hello_frame(
+            &node_id,
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(pubkey),
+        )
+        .expect("hello");
+        let raw = serialize_frame(&hello).expect("serialize");
+        let mut combined = raw.clone();
+        combined.extend_from_slice(&raw);
+        assert!(parse_frame(&combined)
+            .expect_err("must reject trailing frame data")
+            .contains("exactly one complete CBOR value"));
+    }
+
+    #[test]
+    fn validate_transfer_rejects_item_id_mismatch() {
+        let envelope_b64 =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vec![0x81, 0x00]);
+        let transfer = TransferFrame {
+            objects: vec![TransferObject {
+                item_id: item(0xaa),
+                envelope_b64,
+                expiry_unix_ms: now_unix_ms() + 10_000,
+                hop_count: 1,
+            }],
+        };
+        assert!(validate_transfer(&transfer).is_err());
+    }
+
+    #[test]
+    fn import_transfer_keeps_message_with_unresolved_author() {
+        let _lock = test_env_lock().lock().expect("lock test env");
+        let temp_dir = unique_test_state_dir("aethos-gossip-import-test");
+        let _env_guard = EnvVarGuard::set("XDG_STATE_HOME", &temp_dir);
+
+        let local_wayfarer = item(0x99);
+        let payload = crate::aethos_core::protocol::build_envelope_payload_b64_from_utf8(
+            &local_wayfarer,
+            "hello",
+        )
+        .expect("payload");
+        let object = TransferObject {
+            item_id: super::item_id_from_envelope_bytes(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(&payload)
+                    .expect("decode payload"),
+            ),
+            envelope_b64: payload,
+            expiry_unix_ms: now_unix_ms() + 60_000,
+            hop_count: 1,
+        };
+        let imported = import_transfer_items(
+            &local_wayfarer,
+            Some("10.0.0.2:47655"),
+            Some(&item(0x55)),
+            &[object],
+            now_unix_ms(),
+        )
+        .expect("import");
+        assert_eq!(imported.new_messages.len(), 1);
+        let msg = &imported.new_messages[0];
+        assert!(msg.author_wayfarer_id.is_none());
+        assert_eq!(msg.transport_peer.as_deref(), Some("10.0.0.2:47655"));
+        let expected_session_peer = item(0x55);
+        assert_eq!(
+            msg.session_peer.as_deref(),
+            Some(expected_session_peer.as_str())
+        );
+    }
+
+    #[test]
+    fn import_transfer_does_not_substitute_author_from_peer() {
+        let _lock = test_env_lock().lock().expect("lock test env");
+        let temp_dir = unique_test_state_dir("aethos-gossip-import-test");
+        let _env_guard = EnvVarGuard::set("XDG_STATE_HOME", &temp_dir);
+
+        let local_wayfarer = item(0x42);
+        let payload = crate::aethos_core::protocol::build_envelope_payload_b64_from_utf8(
+            &local_wayfarer,
+            "hello",
+        )
+        .expect("payload");
+        let object = TransferObject {
+            item_id: super::item_id_from_envelope_bytes(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(&payload)
+                    .expect("decode payload"),
+            ),
+            envelope_b64: payload,
+            expiry_unix_ms: now_unix_ms() + 60_000,
+            hop_count: 1,
+        };
+        let imported = import_transfer_items(
+            &local_wayfarer,
+            Some("10.0.0.9:47655"),
+            Some(&item(0x33)),
+            &[object],
+            now_unix_ms(),
+        )
+        .expect("import");
+        assert_eq!(imported.new_messages.len(), 1);
+        assert!(imported.new_messages[0].author_wayfarer_id.is_none());
     }
 }

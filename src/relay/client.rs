@@ -9,7 +9,8 @@ use url::Url;
 
 use crate::aethos_core::gossip_sync::{
     build_hello_frame, build_relay_ingest_frame, build_request_frame, build_summary_frame,
-    import_transfer_items, parse_frame, select_request_item_ids_from_summary, serialize_frame,
+    has_item, import_transfer_items, parse_frame,
+    select_request_item_ids_from_summary_with_candidates, serialize_frame,
     transfer_items_for_request, GossipSyncFrame, HelloFrame, RelayIngestFrame,
 };
 use crate::aethos_core::identity_store::LocalIdentitySummary;
@@ -77,7 +78,9 @@ pub struct EncounterReport {
 
 #[derive(Debug, Clone)]
 pub struct EncounterMessagePreview {
-    pub from_node_id: String,
+    pub author_wayfarer_id: Option<String>,
+    pub session_peer: Option<String>,
+    pub transport_peer: Option<String>,
     pub item_id: String,
     pub text: String,
     pub received_at_unix: i64,
@@ -109,6 +112,9 @@ pub fn run_relay_encounter_gossipv1(
 
     let mut transferred_items = 0usize;
     let mut pulled_messages = Vec::new();
+    let mut latest_summary: Option<crate::aethos_core::gossip_sync::SummaryFrame> = None;
+    let mut relay_ingest_candidates = Vec::<String>::new();
+    let relay_ingest_trusted = auth_token.is_some();
     let deadline = Instant::now() + Duration::from_secs(3);
 
     while Instant::now() <= deadline {
@@ -126,8 +132,12 @@ pub fn run_relay_encounter_gossipv1(
                     summary.item_count,
                     summary.bloom_filter.len()
                 ));
-                let want =
-                    select_request_item_ids_from_summary(&summary, peer_hello.max_want as usize)?;
+                latest_summary = Some(summary.clone());
+                let want = select_request_item_ids_from_summary_with_candidates(
+                    &summary,
+                    peer_hello.max_want as usize,
+                    &relay_ingest_candidates,
+                )?;
                 send_binary_frame(
                     &mut socket,
                     &build_request_frame(want, peer_hello.max_want as usize)?,
@@ -147,19 +157,31 @@ pub fn run_relay_encounter_gossipv1(
                     relay_ws,
                     item_ids.len()
                 ));
-                let mut want = item_ids
+                if !relay_ingest_trusted {
+                    log_verbose(&format!(
+                        "relay_encounter_ignore_untrusted_relay_ingest: relay_ws={relay_ws}"
+                    ));
+                    continue;
+                }
+
+                relay_ingest_candidates = item_ids
                     .into_iter()
-                    .filter(|item_id| {
-                        crate::aethos_core::gossip_sync::has_item(item_id)
-                            .map(|have| !have)
-                            .unwrap_or(false)
-                    })
+                    .filter(|item_id| has_item(item_id).map(|have| !have).unwrap_or(false))
                     .collect::<Vec<_>>();
-                want.sort();
-                send_binary_frame(
-                    &mut socket,
-                    &build_request_frame(want, peer_hello.max_want as usize)?,
-                )?;
+                relay_ingest_candidates.sort();
+                relay_ingest_candidates.dedup();
+
+                if let Some(summary) = latest_summary.as_ref() {
+                    let want = select_request_item_ids_from_summary_with_candidates(
+                        summary,
+                        peer_hello.max_want as usize,
+                        &relay_ingest_candidates,
+                    )?;
+                    send_binary_frame(
+                        &mut socket,
+                        &build_request_frame(want, peer_hello.max_want as usize)?,
+                    )?;
+                }
             }
             GossipSyncFrame::Request(request) => {
                 if let Some(trace_item_id) = trace_item_id {
@@ -209,8 +231,9 @@ pub fn run_relay_encounter_gossipv1(
                     transfer.objects.len()
                 ));
                 let imported = import_transfer_items(
-                    &peer_hello.node_id,
                     &identity.wayfarer_id,
+                    Some(relay_ws),
+                    Some(&peer_hello.node_id),
                     &transfer.objects,
                     now_unix_ms(),
                 )?;
@@ -232,7 +255,9 @@ pub fn run_relay_encounter_gossipv1(
                 for message in imported.new_messages {
                     let item_id = message.item_id.clone();
                     pulled_messages.push(EncounterMessagePreview {
-                        from_node_id: message.from_wayfarer_id,
+                        author_wayfarer_id: message.author_wayfarer_id,
+                        session_peer: message.session_peer,
+                        transport_peer: message.transport_peer,
                         item_id: item_id.clone(),
                         text: decode_envelope_payload_utf8_preview(
                             &transfer

@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
+use std::io::Cursor;
 
 use base64::Engine;
 use ciborium::value::Value;
 use ciborium::{de::from_reader, ser::into_writer};
+use serde::Serialize;
 use serde_bytes::ByteBuf;
 use sha2::{Digest, Sha256};
 
@@ -46,11 +48,9 @@ impl EnvelopeV1 {
             ByteBuf::from(self.manifest_id.clone()),
         );
         payload_fields.insert("body".to_string(), ByteBuf::from(self.body.clone()));
-
-        let mut out = Vec::new();
-        into_writer(&payload_fields, &mut out)
+        let value = to_cbor_value(&payload_fields)
             .map_err(|err| format!("failed serializing envelope cbor: {err}"))?;
-        Ok(out)
+        encode_cbor_value_deterministic(&value)
     }
 }
 
@@ -81,13 +81,10 @@ pub fn decode_envelope_payload_b64(payload_b64: &str) -> Result<DecodedEnvelopeV
 }
 
 fn parse_envelope_cbor(raw: &[u8]) -> Result<DecodedEnvelopeV1, String> {
-    let fields: Value =
-        from_reader(raw).map_err(|err| format!("envelope cbor decode failed: {err}"))?;
-
-    let mut canonical = Vec::new();
-    into_writer(&fields, &mut canonical)
+    let fields = decode_cbor_value_exact(raw, "envelope")?;
+    let canonical = encode_cbor_value_deterministic(&fields)
         .map_err(|err| format!("envelope cbor canonical re-encode failed: {err}"))?;
-    if canonical != raw {
+    if canonical.as_slice() != raw {
         return Err("envelope is not canonical CBOR encoding".to_string());
     }
 
@@ -145,6 +142,61 @@ fn parse_envelope_cbor(raw: &[u8]) -> Result<DecodedEnvelopeV1, String> {
     })
 }
 
+pub fn to_cbor_value<T: Serialize>(value: &T) -> Result<Value, String> {
+    let mut raw = Vec::new();
+    into_writer(value, &mut raw).map_err(|err| format!("CBOR encode failed: {err}"))?;
+    from_reader(raw.as_slice()).map_err(|err| format!("CBOR decode failed: {err}"))
+}
+
+pub fn decode_cbor_value_exact(raw: &[u8], context: &str) -> Result<Value, String> {
+    let mut cursor = Cursor::new(raw);
+    let value: Value =
+        from_reader(&mut cursor).map_err(|err| format!("{context} cbor decode failed: {err}"))?;
+    if cursor.position() as usize != raw.len() {
+        return Err(format!(
+            "{context} must contain exactly one complete CBOR value"
+        ));
+    }
+    Ok(value)
+}
+
+pub fn encode_cbor_value_deterministic(value: &Value) -> Result<Vec<u8>, String> {
+    let canonical = canonicalize_cbor_value(value.clone())?;
+    let mut out = Vec::new();
+    into_writer(&canonical, &mut out)
+        .map_err(|err| format!("deterministic CBOR encode failed: {err}"))?;
+    Ok(out)
+}
+
+fn canonicalize_cbor_value(mut value: Value) -> Result<Value, String> {
+    match &mut value {
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                *item = canonicalize_cbor_value(item.clone())?;
+            }
+        }
+        Value::Map(entries) => {
+            for (key, entry_value) in entries.iter_mut() {
+                *key = canonicalize_cbor_value(key.clone())?;
+                *entry_value = canonicalize_cbor_value(entry_value.clone())?;
+            }
+            entries.sort_by(|(left_key, _), (right_key, _)| {
+                let left_encoded = encode_cbor_value_raw(left_key).unwrap_or_default();
+                let right_encoded = encode_cbor_value_raw(right_key).unwrap_or_default();
+                left_encoded.cmp(&right_encoded)
+            });
+        }
+        _ => {}
+    }
+    Ok(value)
+}
+
+fn encode_cbor_value_raw(value: &Value) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    into_writer(value, &mut out).map_err(|err| format!("CBOR key encode failed: {err}"))?;
+    Ok(out)
+}
+
 pub fn decode_envelope_payload_utf8_preview(payload_b64: &str) -> Result<String, String> {
     let decoded = decode_envelope_payload_b64(payload_b64)?;
     String::from_utf8(decoded.body).map_err(|_| "envelope body is not valid UTF-8".to_string())
@@ -174,4 +226,92 @@ pub fn bytes_to_hex_lower(input: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_envelope_payload_b64_from_utf8, bytes_to_hex_lower, decode_envelope_payload_b64,
+        encode_cbor_value_deterministic, parse_envelope_cbor,
+    };
+    use base64::Engine;
+    use ciborium::value::Value;
+    use sha2::{Digest, Sha256};
+
+    const VECTOR_TO_WAYFARER_ID: &str =
+        "1111111111111111111111111111111111111111111111111111111111111111";
+    const VECTOR_BODY: &str = "hello";
+    const VECTOR_ENVELOPE_HEX: &str = "a364626f64794568656c6c6f6b6d616e69666573745f696458202cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b98246e746f5f77617966617265725f696458201111111111111111111111111111111111111111111111111111111111111111";
+    const VECTOR_ITEM_ID_HEX: &str =
+        "462e8f38ba0e88386d4b547fd6d3e63d8c263431bc19ea3bd2fb788ee6fcb702";
+    const VECTOR_ENVELOPE_B64URL: &str = "o2Rib2R5RWhlbGxva21hbmlmZXN0X2lkWCAs8k26X7CjDiboOyrFueKeGxYeXB-nQl5zBDNik4uYJG50b193YXlmYXJlcl9pZFggERERERERERERERERERERERERERERERERERERERERERE";
+
+    #[test]
+    fn envelope_v1_matches_canonical_vector() {
+        let envelope_b64 = build_envelope_payload_b64_from_utf8(VECTOR_TO_WAYFARER_ID, VECTOR_BODY)
+            .expect("build vector envelope");
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&envelope_b64)
+            .expect("decode envelope bytes");
+
+        assert_eq!(bytes_to_hex_lower(&raw), VECTOR_ENVELOPE_HEX);
+        assert_eq!(
+            bytes_to_hex_lower(&Sha256::digest(&raw)),
+            VECTOR_ITEM_ID_HEX
+        );
+        assert_eq!(envelope_b64, VECTOR_ENVELOPE_B64URL);
+    }
+
+    #[test]
+    fn envelope_decode_rejects_noncanonical_map_order() {
+        let to_wayfarer = vec![0x11u8; 32];
+        let manifest = Sha256::digest(VECTOR_BODY.as_bytes()).to_vec();
+        let body = VECTOR_BODY.as_bytes().to_vec();
+        let noncanonical = Value::Map(vec![
+            (
+                Value::Text("to_wayfarer_id".to_string()),
+                Value::Bytes(to_wayfarer),
+            ),
+            (
+                Value::Text("manifest_id".to_string()),
+                Value::Bytes(manifest),
+            ),
+            (Value::Text("body".to_string()), Value::Bytes(body)),
+        ]);
+        let noncanonical_raw = {
+            let mut out = Vec::new();
+            ciborium::ser::into_writer(&noncanonical, &mut out).expect("encode noncanonical");
+            out
+        };
+        assert!(parse_envelope_cbor(&noncanonical_raw)
+            .expect_err("must reject noncanonical ordering")
+            .contains("not canonical"));
+    }
+
+    #[test]
+    fn deterministic_encoder_orders_map_keys_by_encoded_bytes() {
+        let value = Value::Map(vec![
+            (
+                Value::Text("payload".to_string()),
+                Value::Integer(1u8.into()),
+            ),
+            (
+                Value::Text("type".to_string()),
+                Value::Text("HELLO".to_string()),
+            ),
+        ]);
+        let raw = encode_cbor_value_deterministic(&value).expect("encode deterministic");
+        let expected = vec![
+            0xa2, 0x64, b't', b'y', b'p', b'e', 0x65, b'H', b'E', b'L', b'L', b'O', 0x67, b'p',
+            b'a', b'y', b'l', b'o', b'a', b'd', 0x01,
+        ];
+        assert_eq!(raw, expected);
+    }
+
+    #[test]
+    fn envelope_payload_decoder_accepts_vector() {
+        let decoded = decode_envelope_payload_b64(VECTOR_ENVELOPE_B64URL).expect("decode envelope");
+        assert_eq!(decoded.to_wayfarer_id_hex, VECTOR_TO_WAYFARER_ID);
+        assert_eq!(decoded.body, VECTOR_BODY.as_bytes());
+    }
 }
