@@ -35,7 +35,7 @@ body {
 .app-atmosphere {
   position: absolute;
   inset: -8% -12% auto -12%;
-  height: 76%;
+  height: 54%;
   pointer-events: none;
   background:
     radial-gradient(circle at 12% 22%, rgba(93, 131, 255, 0.2), transparent 45%),
@@ -60,8 +60,8 @@ body {
     radial-gradient(circle at 18% 15%, rgba(124, 203, 255, 0.42), transparent 38%),
     radial-gradient(circle at 86% 18%, rgba(178, 118, 255, 0.34), transparent 34%),
     linear-gradient(110deg, rgba(21, 47, 124, 0.92), rgba(48, 70, 180, 0.78) 45%, rgba(113, 68, 205, 0.7));
-  box-shadow: inset 0 1px 0 rgba(224, 241, 255, 0.18), 0 18px 45px rgba(10, 22, 68, 0.48);
-  max-height: 520px;
+  box-shadow: inset 0 1px 0 rgba(224, 241, 255, 0.18), 0 12px 28px rgba(10, 22, 68, 0.45);
+  height: 146px;
   opacity: 1;
   transform: translateY(0) scale(1);
   transition: opacity 0.3s ease, max-height 0.35s ease, transform 0.35s ease, margin-bottom 0.3s ease;
@@ -72,13 +72,41 @@ body {
   z-index: 8;
 }
 
+.hero-layout {
+  position: relative;
+  height: 100%;
+  padding: 10px 14px;
+  padding-right: clamp(106px, 18vw, 176px);
+}
+
+.hero-copy {
+  display: grid;
+  gap: 6px;
+  width: min(92ch, 100%);
+}
+
+.hero-headline-row {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  min-width: 0;
+}
+
+.hero-subtitle {
+  max-width: 74ch;
+  margin: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .tabs-dock {
   position: sticky;
-  top: 10px;
+  top: 6px;
   z-index: 20;
-  padding: 8px 10px;
+  padding: 6px 8px;
   border: 1px solid rgba(148, 183, 231, 0.24);
-  border-radius: 16px;
+  border-radius: 14px;
   background: rgba(8, 19, 48, 0.62);
   backdrop-filter: blur(8px);
 }
@@ -87,8 +115,8 @@ body {
   position: absolute;
   inset: 0;
   background:
-    radial-gradient(circle at 46% 100%, rgba(218, 240, 255, 0.55), transparent 40%),
-    radial-gradient(circle at 5% 90%, rgba(133, 149, 255, 0.4), transparent 35%);
+    radial-gradient(circle at 46% 98%, rgba(190, 225, 255, 0.32), transparent 42%),
+    radial-gradient(circle at 5% 90%, rgba(133, 149, 255, 0.2), transparent 35%);
   pointer-events: none;
 }
 
@@ -97,12 +125,14 @@ body {
   inset: 0;
   pointer-events: none;
   background-image:
-    linear-gradient(100deg, transparent 0%, rgba(224, 248, 255, 0.08) 30%, rgba(224, 248, 255, 0.55) 50%, rgba(210, 235, 255, 0.08) 68%, transparent 100%),
-    linear-gradient(99deg, transparent 0%, rgba(162, 228, 255, 0.05) 25%, rgba(162, 228, 255, 0.35) 50%, rgba(162, 228, 255, 0.05) 75%, transparent 100%);
-  background-size: 160% 120px, 170% 170px;
+    linear-gradient(100deg, transparent 0%, rgba(216, 245, 255, 0.06) 32%, rgba(216, 245, 255, 0.24) 50%, rgba(216, 245, 255, 0.06) 68%, transparent 100%),
+    linear-gradient(99deg, transparent 0%, rgba(162, 228, 255, 0.04) 30%, rgba(162, 228, 255, 0.14) 50%, rgba(162, 228, 255, 0.04) 70%, transparent 100%);
+  background-size: 150% 52px, 160% 64px;
   background-repeat: no-repeat;
-  background-position: -35% 56%, -12% 72%;
+  background-position: -26% 46%, -10% 70%;
   animation: hero-wind-shift 12s ease-in-out infinite;
+  opacity: 0.55;
+  mask-image: linear-gradient(to bottom, transparent 4%, rgba(0, 0, 0, 0.96) 18%, rgba(0, 0, 0, 0.96) 82%, transparent 100%);
 }
 
 .hero-stars {
@@ -164,7 +194,7 @@ body {
 
 .hero-title {
   font-family: "Sora", "Plus Jakarta Sans", sans-serif;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.06em;
   color: rgba(243, 250, 255, 0.98);
   text-shadow: 0 7px 18px rgba(18, 38, 112, 0.5);
 }
@@ -176,27 +206,29 @@ body {
 }
 
 .hero-mesh-strip {
-  max-width: 360px;
+  width: fit-content;
+  max-width: 320px;
   border: 1px solid rgba(198, 231, 255, 0.2);
   background: rgba(10, 30, 84, 0.34);
   border-radius: 999px;
-  padding: 6px 12px;
+  padding: 4px 10px;
 }
 
 .hero-mark-wrap {
-  position: relative;
-  align-self: center;
-  justify-self: end;
+  position: absolute;
+  right: 14px;
+  top: 50%;
+  transform: translateY(-50%);
   display: grid;
   place-items: center;
-  min-height: 170px;
-  width: min(250px, 100%);
+  min-height: 78px;
+  width: clamp(74px, 11vw, 110px);
 }
 
 .hero-mark {
   position: relative;
   z-index: 2;
-  width: min(166px, 78%);
+  width: min(66px, 80%);
   border-radius: 36%;
   filter: drop-shadow(0 0 20px rgba(171, 243, 255, 0.3)) drop-shadow(0 12px 24px rgba(12, 24, 79, 0.6));
   animation: hero-mark-float 4.6s ease-in-out infinite;
@@ -210,22 +242,22 @@ body {
   z-index: 2;
   display: grid;
   place-items: center;
-  width: min(188px, 86%);
+  width: min(82px, 88%);
   aspect-ratio: 1;
   border-radius: 38%;
   background: radial-gradient(circle at 36% 28%, rgba(223, 247, 255, 0.34), rgba(132, 153, 255, 0.2) 48%, rgba(47, 73, 173, 0.16));
-  box-shadow: inset 0 0 26px rgba(194, 240, 255, 0.2), 0 0 30px rgba(103, 161, 255, 0.24);
+  box-shadow: inset 0 0 16px rgba(194, 240, 255, 0.2), 0 0 22px rgba(103, 161, 255, 0.24);
   backdrop-filter: blur(2px);
 }
 
 .hero-mark-ring {
   position: absolute;
   z-index: 1;
-  width: min(228px, 95%);
+  width: min(98px, 95%);
   aspect-ratio: 1;
   border-radius: 999px;
   border: 1px solid rgba(218, 244, 255, 0.38);
-  box-shadow: inset 0 0 20px rgba(171, 225, 255, 0.2), 0 0 35px rgba(133, 123, 255, 0.35);
+  box-shadow: inset 0 0 14px rgba(171, 225, 255, 0.2), 0 0 22px rgba(133, 123, 255, 0.35);
   animation: hero-ring-spin 15s linear infinite;
   will-change: transform;
   transform: translate3d(0, 0, 0);
@@ -233,14 +265,34 @@ body {
 }
 
 @media (max-width: 768px) {
+  .hero-banner {
+    height: 136px;
+  }
+
+  .hero-layout {
+    height: 100%;
+    padding: 9px 10px;
+    padding-right: 92px;
+  }
+
   .hero-mark-wrap {
-    justify-self: start;
-    width: min(210px, 78vw);
-    min-height: 130px;
+    right: 10px;
+    width: 70px;
+    min-height: 62px;
   }
 
   .hero-title {
     letter-spacing: 0.05em;
+  }
+
+  .hero-headline-row {
+    display: grid;
+    gap: 2px;
+  }
+
+  .hero-subtitle {
+    white-space: normal;
+    max-width: 45ch;
   }
 
 }
@@ -290,15 +342,15 @@ body {
   position: relative;
   display: flex;
   align-items: center;
-  min-height: 30px;
-  padding-left: 45px;
+  min-height: 22px;
+  padding-left: 32px;
 }
 
 .network-core {
   position: absolute;
-  left: 10px;
-  width: 9px;
-  height: 9px;
+  left: 8px;
+  width: 7px;
+  height: 7px;
   border-radius: 999px;
   background: rgba(173, 241, 255, 0.92);
   box-shadow: 0 0 14px rgba(108, 220, 255, 0.82);
@@ -306,9 +358,9 @@ body {
 
 .network-orbit-ring {
   position: absolute;
-  left: 3px;
-  width: 23px;
-  height: 23px;
+  left: 2px;
+  width: 18px;
+  height: 18px;
   border-radius: 999px;
   border: 1px solid rgba(157, 214, 255, 0.42);
 }
@@ -324,18 +376,18 @@ body {
 
 .network-orbit-dot {
   position: absolute;
-  left: 13px;
-  top: 15px;
-  width: 5px;
-  height: 5px;
+  left: 10px;
+  top: 11px;
+  width: 4px;
+  height: 4px;
   border-radius: 999px;
   background: rgba(212, 243, 255, 0.9);
 }
 
 .network-label {
   margin: 0;
-  font-size: 11px;
-  letter-spacing: 0.14em;
+  font-size: 10px;
+  letter-spacing: 0.11em;
   text-transform: uppercase;
   color: rgba(202, 232, 255, 0.88);
 }

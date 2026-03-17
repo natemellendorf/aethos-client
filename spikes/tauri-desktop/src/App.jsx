@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   BellRing,
   CheckCircle2,
@@ -11,7 +12,9 @@ import {
   Settings,
   Share2,
   Wifi,
-  Wind
+  Wind,
+  Maximize2,
+  Minimize2
 } from "lucide-react";
 
 import { Badge } from "./components/ui/badge";
@@ -50,6 +53,35 @@ function formatMessageTimestamp(message) {
   return new Date(ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" });
 }
 
+function createOptimisticOutgoingMessage(localId, text) {
+  const nowMs = Date.now();
+  return {
+    msgId: localId,
+    text,
+    timestamp: new Date(nowMs).toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" }),
+    createdAtUnix: Math.floor(nowMs / 1000),
+    direction: "Outgoing",
+    seen: true,
+    manifestIdHex: null,
+    deliveredAt: null,
+    outboundState: "sending",
+    expiresAtUnixMs: null,
+    lastSyncAttemptUnixMs: nowMs,
+    lastSyncError: null
+  };
+}
+
+function formatOutgoingStatus(message) {
+  if (message?.direction !== "Outgoing") return null;
+  const state = message?.outboundState;
+  if (state === "sending") return "Sending...";
+  if (state === "sent") return "Sent";
+  if (state && typeof state === "object" && state.failed?.error) return `Failed: ${state.failed.error}`;
+  if (message?.lastSyncError) return `Failed: ${message.lastSyncError}`;
+  if (message?.deliveredAt) return "Sent";
+  return null;
+}
+
 export default function App() {
   const [tab, setTab] = useState("chats");
   const [status, setStatus] = useState("Loading app state...");
@@ -58,6 +90,7 @@ export default function App() {
   const [contacts, setContacts] = useState({});
   const [chat, setChat] = useState({ selectedContact: null, threads: {}, newContacts: [] });
   const [relayReports, setRelayReports] = useState([]);
+  const [isFullscreen, setIsFullscreen] = useState(false);
   const [relayHealth, setRelayHealth] = useState(emptyRelay);
   const [gossipStatus, setGossipStatus] = useState(emptyGossip);
   const [shareQr, setShareQr] = useState(null);
@@ -160,6 +193,11 @@ export default function App() {
 
   useEffect(() => {
     runBootstrap();
+  }, []);
+
+  useEffect(() => {
+    const appWindow = getCurrentWindow();
+    appWindow.isFullscreen().then(setIsFullscreen).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -305,14 +343,44 @@ export default function App() {
 
   const sendMessage = async () => {
     if (!selectedContactId) return setStatus("Select a contact before sending");
-    if (!composer.trim()) return setStatus("Message body cannot be empty");
+    const body = composer.trim();
+    if (!body) return setStatus("Message body cannot be empty");
+
+    const localId = `ui-local-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+    const contactId = selectedContactId;
+    setComposer("");
+    setChat((prev) => {
+      const next = { ...prev, threads: { ...prev.threads } };
+      const thread = [...(next.threads[contactId] || [])];
+      thread.push(createOptimisticOutgoingMessage(localId, body));
+      next.threads[contactId] = thread;
+      next.selectedContact = contactId;
+      return next;
+    });
+    setStatus("Sending message...");
+
     try {
-      const response = await withNetworkPulse(() => invoke("send_message", { request: { wayfarerId: selectedContactId, body: composer.trim() } }));
+      const response = await withNetworkPulse(() => invoke("send_message", { request: { wayfarerId: contactId, body } }));
       setChat(response.chat);
       setContacts(response.contacts);
-      setComposer("");
       setStatus(`${response.encounterStatus} · ${tinyId(response.message.msgId)}`);
     } catch (error) {
+      const failure = String(error);
+      setChat((prev) => {
+        const next = { ...prev, threads: { ...prev.threads } };
+        const thread = [...(next.threads[contactId] || [])];
+        const idx = thread.findIndex((item) => item.msgId === localId);
+        if (idx >= 0) {
+          thread[idx] = {
+            ...thread[idx],
+            outboundState: { failed: { error: failure } },
+            lastSyncError: failure,
+            lastSyncAttemptUnixMs: Date.now()
+          };
+          next.threads[contactId] = thread;
+        }
+        return next;
+      });
       setStatus(`Send failed: ${String(error)}`);
     }
   };
@@ -386,6 +454,18 @@ export default function App() {
     }
   };
 
+  const toggleFullscreen = async () => {
+    try {
+      const appWindow = getCurrentWindow();
+      const next = !(await appWindow.isFullscreen());
+      await appWindow.setFullscreen(next);
+      setIsFullscreen(next);
+      setStatus(next ? "Entered fullscreen" : "Exited fullscreen");
+    } catch (error) {
+      setStatus(`Fullscreen toggle failed: ${String(error)}`);
+    }
+  };
+
   const selectedName = selectedContactId ? contacts[selectedContactId] || tinyId(selectedContactId) : "none";
   const networkActive = Date.now() - networkPulseTs < 2200;
   const relayOnline = relayHealth.chipState === "ok" || relayHealth.chipState === "warn";
@@ -405,10 +485,10 @@ export default function App() {
     <div className="relative min-h-screen overflow-x-hidden bg-[radial-gradient(circle_at_15%_10%,rgba(76,122,255,.26),transparent_42%),radial-gradient(circle_at_88%_-10%,rgba(42,189,255,.2),transparent_35%),#060914] text-foreground">
       <div className="app-atmosphere" aria-hidden="true" />
       <div className="app-atmosphere-grid" aria-hidden="true" />
-      <div className="mx-auto max-w-7xl p-5">
+      <div className="mx-auto max-w-7xl p-2.5 md:p-3">
 
         <div className="hero-stack">
-          <Card className="hero-banner mb-4 overflow-hidden border-indigo-300/20">
+          <Card className="hero-banner mb-1.5 overflow-hidden border-indigo-300/20">
             <CardContent className="relative p-0">
               <div className="hero-glow" aria-hidden="true" />
               <div className="hero-wind" aria-hidden="true" />
@@ -417,18 +497,20 @@ export default function App() {
                   <span key={idx} className="hero-star" style={{ animationDelay: `${idx * 0.9}s` }} />
                 ))}
               </div>
-              <div className="relative grid gap-6 px-6 py-7 md:grid-cols-[1.4fr_1fr] md:px-8">
-                <div className="space-y-4">
-                  <p className="inline-flex items-center gap-2 rounded-full border border-cyan-200/30 bg-cyan-300/10 px-3 py-1 text-xs font-semibold tracking-[0.22em] text-cyan-50/90">
-                    <Wind className="h-3.5 w-3.5" />
+              <div className="hero-layout">
+                <div className="hero-copy">
+                  <p className="inline-flex w-fit items-center gap-1.5 rounded-full border border-cyan-200/30 bg-cyan-300/10 px-2 py-0.5 text-[10px] font-semibold tracking-[0.18em] text-cyan-50/90">
+                    <Wind className="h-3 w-3" />
                     DELAY-TOLERANT MESSAGING
                   </p>
-                  <CardTitle className="hero-title text-4xl md:text-5xl">AETHOS</CardTitle>
-                  <p className="max-w-xl text-sm leading-relaxed text-blue-100/90 md:text-base">
-                    Messages float across relay and local airwaves, surviving gaps and reconnects so conversations keep moving.
-                  </p>
+                  <div className="hero-headline-row">
+                    <CardTitle className="hero-title text-xl md:text-2xl">AETHOS</CardTitle>
+                    <p className="hero-subtitle text-[11px] leading-relaxed text-blue-100/90 md:text-xs">
+                      Unstoppable messaging across relay and local airwaves, even through disconnects.
+                    </p>
+                  </div>
                   <div className="hero-mesh-strip">
-                    <div className={cn("network-orbit", networkActive ? "is-active" : "")}>
+                    <div className={cn("network-orbit", networkActive ? "is-active" : "") }>
                       <span className="network-core" />
                       <span className="network-orbit-ring ring-a" />
                       <span className="network-orbit-ring ring-b" />
@@ -450,18 +532,21 @@ export default function App() {
           </Card>
         </div>
 
-        <div className="tabs-dock mb-3">
+        <div className="tabs-dock mb-2">
           <div className="flex flex-wrap items-center justify-between gap-2">
             {TABS.map((t) => {
               const Icon = t.icon;
               return (
-                <Button key={t.id} variant={tab === t.id ? "default" : "ghost"} className="gap-2" onClick={() => setTab(t.id)}>
+                <Button key={t.id} variant={tab === t.id ? "default" : "ghost"} className="h-9 gap-1.5 px-3" onClick={() => setTab(t.id)}>
                   <Icon className="h-4 w-4" />
                   {t.label}
                 </Button>
               );
             })}
             <div className="flex items-center gap-2">
+              <Button variant="ghost" className="h-9 w-9 p-0" onClick={toggleFullscreen} title={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}>
+                {isFullscreen ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
+              </Button>
               <span className={cn("tab-status-dot", relayOnline ? "is-online" : "is-offline")} title="Relay status">
                 <Wifi className="h-3.5 w-3.5" />
               </span>
@@ -473,15 +558,15 @@ export default function App() {
         </div>
 
         {tab === "chats" && (
-          <div className="grid gap-4 lg:grid-cols-[300px_1fr]">
-            <Card>
-              <CardHeader><CardTitle>Contacts</CardTitle></CardHeader>
-              <CardContent className="space-y-2">
+          <div className="grid gap-3 lg:h-[calc(100vh-220px)] lg:grid-cols-[285px_1fr]">
+            <Card className="flex min-h-[320px] flex-col lg:h-full">
+              <CardHeader className="p-3 pb-1"><CardTitle className="text-base">Contacts</CardTitle></CardHeader>
+              <CardContent className="min-h-0 flex-1 space-y-1.5 overflow-auto p-3 pt-1">
                 {entries.map(([id, alias]) => {
                   const unread = (chat.threads[id] || []).filter((m) => m.direction === "Incoming" && !m.seen).length;
                   const isNew = (chat.newContacts || []).includes(id);
                   return (
-                    <button key={id} className={cn("w-full rounded-lg border p-3 text-left", id === selectedContactId ? "border-blue-300 bg-blue-500/20" : "border-border/60 bg-background/50")} onClick={() => selectContact(id)}>
+                    <button key={id} className={cn("w-full rounded-lg border p-2.5 text-left", id === selectedContactId ? "border-blue-300 bg-blue-500/20" : "border-border/60 bg-background/50")} onClick={() => selectContact(id)}>
                       <div className="flex items-center justify-between gap-2"><span className="truncate font-semibold">{alias || tinyId(id)}</span>{isNew ? <Badge className="bg-violet-500/20">NEW</Badge> : unread > 0 ? <Badge>{unread}</Badge> : null}</div>
                       <p className="mt-1 truncate text-xs text-muted-foreground">{tinyId(id)}</p>
                     </button>
@@ -489,18 +574,21 @@ export default function App() {
                 })}
               </CardContent>
             </Card>
-            <Card>
-              <CardHeader><CardTitle>{selectedName}</CardTitle></CardHeader>
-              <CardContent>
-                <div ref={threadContainerRef} className="mb-3 max-h-[360px] space-y-2 overflow-auto rounded-lg border border-border/60 bg-background/40 p-3">
+            <Card className="flex min-h-[360px] flex-col lg:h-full">
+              <CardHeader className="p-3 pb-1"><CardTitle className="text-base">{selectedName}</CardTitle></CardHeader>
+              <CardContent className="flex min-h-0 flex-1 flex-col p-3 pt-1">
+                <div ref={threadContainerRef} className="mb-1.5 min-h-0 flex-1 space-y-2 overflow-auto rounded-lg border border-border/60 bg-background/40 p-2.5">
                   {selectedThread.length === 0 ? <p className="text-sm text-muted-foreground">No messages in this thread yet.</p> : selectedThread.map((m) => (
                     <div key={m.msgId} className={cn("message-bubble max-w-[85%] rounded-xl px-3 py-2 text-sm", m.direction === "Incoming" ? "message-bubble-incoming" : "message-bubble-outgoing ml-auto", arrivingMessageIds[m.msgId] ? "message-arrive" : "") }>
                       <p>{m.text}</p>
-                      <p className="mt-1 text-[11px] text-slate-300">{formatMessageTimestamp(m)}</p>
+                      <div className="mt-1 flex items-center gap-2 text-[11px] text-slate-300">
+                        <span>{formatMessageTimestamp(m)}</span>
+                        {formatOutgoingStatus(m) ? <span className="text-cyan-200/90">{formatOutgoingStatus(m)}</span> : null}
+                      </div>
                     </div>
                   ))}
                 </div>
-                <div className="mb-2 flex gap-2"><Button variant="secondary" onClick={syncInbox}><RefreshCcw className="mr-2 h-4 w-4" />Sync Inbox</Button></div>
+                <div className="mb-1 flex gap-2"><Button variant="secondary" className="h-9" onClick={syncInbox}><RefreshCcw className="mr-2 h-4 w-4" />Sync Inbox</Button></div>
                 <Textarea
                   value={composer}
                   onChange={(e) => setComposer(e.target.value)}
@@ -511,22 +599,22 @@ export default function App() {
                     event.preventDefault();
                     void sendMessage();
                   }}
-                  rows={3}
+                  rows={2}
                   placeholder={settings?.enterToSend === false ? "Write a message..." : "Write a message... (Enter to send, Shift+Enter newline)"}
                 />
-                <Button className="mt-2 w-full" onClick={sendMessage}>Send</Button>
+                <Button className="mt-1 h-9 w-full" onClick={sendMessage}>Send</Button>
               </CardContent>
             </Card>
           </div>
         )}
 
         {tab === "contacts" && (
-          <div className="grid gap-4 lg:grid-cols-2">
+          <div className="grid gap-3 lg:grid-cols-2">
             <Card>
-              <CardHeader><CardTitle>Manage Contacts</CardTitle></CardHeader>
-              <CardContent>
-                <p className="mb-3 text-sm text-muted-foreground">Editing: <strong>{selectedName}</strong> {selectedContactId ? `(${tinyId(selectedContactId)})` : ""}</p>
-                <form className="space-y-3" onSubmit={submitContact}>
+              <CardHeader className="p-3 pb-1"><CardTitle className="text-base">Manage Contacts</CardTitle></CardHeader>
+              <CardContent className="p-3 pt-1">
+                <p className="mb-2 text-sm text-muted-foreground">Editing: <strong>{selectedName}</strong> {selectedContactId ? `(${tinyId(selectedContactId)})` : ""}</p>
+                <form className="space-y-2" onSubmit={submitContact}>
                   <Input name="wayfarer_id" value={contactDraft.wayfarerId} onChange={(e) => setContactDraft((d) => ({ ...d, wayfarerId: e.target.value }))} placeholder="64 lowercase hex chars" />
                   <Input name="alias" value={contactDraft.alias} onChange={(e) => setContactDraft((d) => ({ ...d, alias: e.target.value }))} placeholder="Display name" />
                   <div className="flex flex-wrap gap-2">
@@ -542,10 +630,10 @@ export default function App() {
               </CardContent>
             </Card>
             <Card>
-              <CardHeader><CardTitle>Address Book</CardTitle></CardHeader>
-              <CardContent className="space-y-2">
+              <CardHeader className="p-3 pb-1"><CardTitle className="text-base">Address Book</CardTitle></CardHeader>
+              <CardContent className="space-y-1.5 p-3 pt-1">
                 {entries.map(([id, alias]) => (
-                  <button key={id} className={cn("w-full rounded-lg border p-3 text-left", id === selectedContactId ? "border-cyan-300 bg-cyan-500/20" : "border-border/60 bg-background/50")} onClick={() => selectContact(id)}>
+                  <button key={id} className={cn("w-full rounded-lg border p-2.5 text-left", id === selectedContactId ? "border-cyan-300 bg-cyan-500/20" : "border-border/60 bg-background/50")} onClick={() => selectContact(id)}>
                     <p className="truncate font-semibold">{alias || tinyId(id)}</p>
                     <p className="truncate text-xs text-muted-foreground">{id}</p>
                   </button>
@@ -557,8 +645,8 @@ export default function App() {
 
         {tab === "share" && (
           <Card>
-            <CardHeader><CardTitle>Share Your Wayfarer ID</CardTitle></CardHeader>
-            <CardContent className="space-y-3">
+            <CardHeader className="p-3 pb-1"><CardTitle className="text-base">Share Your Wayfarer ID</CardTitle></CardHeader>
+            <CardContent className="space-y-2 p-3 pt-1">
               <pre className="overflow-auto rounded-lg border border-border/60 bg-background/60 p-3 text-xs">{identity?.wayfarerId || "Unavailable"}</pre>
               <div className="flex flex-wrap gap-2">
                 <Button variant="secondary" onClick={generateShareQr}><QrCode className="mr-2 h-4 w-4" />Generate QR</Button>
@@ -586,12 +674,12 @@ export default function App() {
         )}
 
         {tab === "settings" && settings && (
-          <div className="space-y-4">
-            <div className="grid gap-4 lg:grid-cols-2">
+          <div className="space-y-3">
+            <div className="grid gap-3 lg:grid-cols-2">
               <Card>
-              <CardHeader><CardTitle>Sync Settings</CardTitle></CardHeader>
-              <CardContent>
-                <form className="space-y-3" onSubmit={saveSettings}>
+              <CardHeader className="p-3 pb-1"><CardTitle className="text-base">Sync Settings</CardTitle></CardHeader>
+              <CardContent className="p-3 pt-1">
+                <form className="space-y-2" onSubmit={saveSettings}>
                   <label className="flex items-center gap-2 text-sm"><input type="checkbox" name="relay_sync_enabled" defaultChecked={settings.relaySyncEnabled} /> Enable relay sync</label>
                   <label className="flex items-center gap-2 text-sm"><input type="checkbox" name="gossip_sync_enabled" defaultChecked={settings.gossipSyncEnabled} /> Enable LAN gossip sync</label>
                   <label className="flex items-center gap-2 text-sm"><input type="checkbox" name="verbose_logging_enabled" defaultChecked={settings.verboseLoggingEnabled} /> Enable verbose logging</label>
@@ -606,8 +694,8 @@ export default function App() {
               </CardContent>
               </Card>
               <Card>
-              <CardHeader><CardTitle>Diagnostics</CardTitle></CardHeader>
-              <CardContent className="space-y-2 text-sm text-muted-foreground">
+              <CardHeader className="p-3 pb-1"><CardTitle className="text-base">Diagnostics</CardTitle></CardHeader>
+              <CardContent className="space-y-1.5 p-3 pt-1 text-sm text-muted-foreground">
                 <p>{diagnostics ? `${diagnostics.platform}/${diagnostics.arch}` : "Loading"}</p>
                 <p>Primary relay: {relayHealth.primaryStatus}</p>
                 <p>Secondary relay: {relayHealth.secondaryStatus}</p>
@@ -631,11 +719,11 @@ export default function App() {
             </div>
 
             <Card>
-              <CardHeader>
-                <CardTitle>Live Client Logs</CardTitle>
+              <CardHeader className="p-3 pb-1">
+                <CardTitle className="text-base">Live Client Logs</CardTitle>
                 <p className="text-xs text-muted-foreground">{logTail.logFilePath || "Log path unavailable"}</p>
               </CardHeader>
-              <CardContent>
+              <CardContent className="p-3 pt-1">
                 <div className="mb-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
                   <Badge className="bg-slate-700/40">Showing {filteredLogLines.length} / {logTail.totalLines} lines</Badge>
                   <label className="inline-flex items-center gap-2">
@@ -695,7 +783,7 @@ export default function App() {
                     const nearBottom = el.scrollHeight - (el.scrollTop + el.clientHeight) < 20;
                     if (logFollow && !nearBottom) setLogFollow(false);
                   }}
-                  className="max-h-[320px] overflow-auto rounded-lg border border-border/60 bg-black/40 p-3"
+                  className="max-h-[280px] overflow-auto rounded-lg border border-border/60 bg-black/40 p-2.5"
                 >
                   <pre className="whitespace-pre-wrap text-xs leading-5 text-cyan-100">{filteredLogContent || "(no log lines for current filter)"}</pre>
                 </div>
@@ -704,8 +792,8 @@ export default function App() {
           </div>
         )}
 
-        <Card className="mt-4">
-          <CardContent className="flex items-center gap-2 py-3 text-sm text-cyan-100">
+        <Card className="mt-2.5">
+          <CardContent className="flex items-center gap-2 py-2 text-sm text-cyan-100">
             <Badge className="bg-cyan-500/20 border-cyan-400/40">Status</Badge>
             <span>{status}</span>
           </CardContent>
