@@ -707,8 +707,24 @@ fn load_store() -> Result<GossipStore, String> {
     }
     let content = fs::read_to_string(&path)
         .map_err(|err| format!("failed to read gossip store at {}: {err}", path.display()))?;
-    serde_json::from_str(&content)
-        .map_err(|err| format!("failed to parse gossip store at {}: {err}", path.display()))
+    match serde_json::from_str(&content) {
+        Ok(store) => Ok(store),
+        Err(err)
+            if content.trim().is_empty()
+                || matches!(err.classify(), serde_json::error::Category::Eof) =>
+        {
+            let quarantine = path.with_extension(format!("corrupt-{}.json", now_unix_ms()));
+            let _ = fs::rename(&path, &quarantine);
+
+            let reset = GossipStore::default();
+            save_store(&reset)?;
+            Ok(reset)
+        }
+        Err(err) => Err(format!(
+            "failed to parse gossip store at {}: {err}",
+            path.display()
+        )),
+    }
 }
 
 fn save_store(store: &GossipStore) -> Result<(), String> {
