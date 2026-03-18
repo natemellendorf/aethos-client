@@ -536,7 +536,7 @@ fn send_message_blocking(request: SendMessageRequest) -> Result<SendMessageRespo
                 merge_pulled_messages(&mut chat, &mut contacts, report.pulled_messages);
             }
             Err(err) => {
-                encounter_status = format!("relay encounter failed: {err}");
+                encounter_status = format!("message queued locally; awaiting ACK ({err})");
                 mark_outgoing_message(&mut chat, wayfarer_id, &local_id, &item_id, Some(err));
             }
         }
@@ -1102,8 +1102,14 @@ fn mark_outgoing_message(
         if let Some(message) = thread.iter_mut().find(|item| item.msg_id == local_id) {
             message.last_sync_attempt_unix_ms = Some(now_unix_ms());
             if let Some(err) = error {
-                message.outbound_state = Some(OutboundState::Failed { error: err.clone() });
-                message.last_sync_error = Some(err);
+                log_verbose(&format!(
+                    "outgoing_message_queued_without_ack: contact={} local_id={} item_id={} reason={}",
+                    contact, local_id, item_id, err
+                ));
+                message.msg_id = item_id.to_string();
+                message.outbound_state = Some(OutboundState::Sending);
+                message.delivered_at = None;
+                message.last_sync_error = None;
             } else {
                 message.msg_id = item_id.to_string();
                 message.outbound_state = Some(OutboundState::Sent);
@@ -1158,11 +1164,12 @@ fn merge_pulled_messages(
             continue;
         }
 
+        let message_unix = extract_sent_at_unix_if_json(&pulled.text).unwrap_or(pulled.received_at_unix);
         thread.push(ChatMessage {
             msg_id: pulled.item_id,
             text: extract_chat_text_if_json(&pulled.text),
-            timestamp: format_timestamp_from_unix(pulled.received_at_unix),
-            created_at_unix: pulled.received_at_unix,
+            timestamp: format_timestamp_from_unix(message_unix),
+            created_at_unix: message_unix,
             direction: ChatDirection::Incoming,
             seen: seen_on_insert,
             manifest_id_hex: pulled.manifest_id_hex,
@@ -1172,6 +1179,7 @@ fn merge_pulled_messages(
             last_sync_attempt_unix_ms: None,
             last_sync_error: None,
         });
+        sort_thread_messages(thread);
 
         if chat.selected_contact.is_none() {
             chat.selected_contact = Some(sender_label.clone());
@@ -1264,6 +1272,23 @@ fn extract_chat_text_if_json(input: &str) -> String {
         .and_then(|v| v.as_str())
         .map(|text| text.to_string())
         .unwrap_or_else(|| input.to_string())
+}
+
+fn extract_sent_at_unix_if_json(input: &str) -> Option<i64> {
+    let value = serde_json::from_str::<serde_json::Value>(input).ok()?;
+    let sent_ms = value
+        .get("sent_at_unix_ms")
+        .or_else(|| value.get("sentAtUnixMs"))
+        .and_then(|v| v.as_u64())?;
+    Some((sent_ms / 1000) as i64)
+}
+
+fn sort_thread_messages(thread: &mut [ChatMessage]) {
+    thread.sort_by(|left, right| {
+        left.created_at_unix
+            .cmp(&right.created_at_unix)
+            .then_with(|| left.msg_id.cmp(&right.msg_id))
+    });
 }
 
 fn build_outbound_chat_payload(text: &str, client_msg_id: &str, sent_at_unix_ms: u64) -> String {
@@ -1689,6 +1714,72 @@ mod tests {
     fn outbound_chat_payload_json_keeps_display_text() {
         let payload = build_outbound_chat_payload("hello", "local-123", 42);
         assert_eq!(extract_chat_text_if_json(&payload), "hello");
+    }
+
+    #[test]
+    fn outbound_chat_payload_exposes_sent_at_for_thread_sorting() {
+        let payload = build_outbound_chat_payload("hello", "local-123", 1700000000123);
+        assert_eq!(extract_sent_at_unix_if_json(&payload), Some(1_700_000_000));
+    }
+
+    #[test]
+    fn incoming_messages_are_sorted_by_sent_at_when_present() {
+        let mut chat = PersistedChatState::default();
+        let mut contacts = BTreeMap::new();
+
+        let newer = serde_json::json!({
+            "text": "newer",
+            "client_msg_id": "m2",
+            "sent_at_unix_ms": 2000
+        })
+        .to_string();
+        let older = serde_json::json!({
+            "text": "older",
+            "client_msg_id": "m1",
+            "sent_at_unix_ms": 1000
+        })
+        .to_string();
+
+        merge_pulled_messages(
+            &mut chat,
+            &mut contacts,
+            vec![
+                crate::relay::client::EncounterMessagePreview {
+                    author_wayfarer_id: Some(
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                            .to_string(),
+                    ),
+                    session_peer: None,
+                    transport_peer: None,
+                    item_id: "fbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        .to_string(),
+                    text: newer,
+                    received_at_unix: 20,
+                    manifest_id_hex: None,
+                },
+                crate::relay::client::EncounterMessagePreview {
+                    author_wayfarer_id: Some(
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                            .to_string(),
+                    ),
+                    session_peer: None,
+                    transport_peer: None,
+                    item_id: "abbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        .to_string(),
+                    text: older,
+                    received_at_unix: 10,
+                    manifest_id_hex: None,
+                },
+            ],
+        );
+
+        let thread = chat
+            .threads
+            .get("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .expect("thread should exist");
+        assert_eq!(thread.len(), 2);
+        assert_eq!(thread[0].text, "older");
+        assert_eq!(thread[1].text, "newer");
     }
 
     #[test]

@@ -401,15 +401,7 @@ fn read_binary_frame(
     socket: &mut tungstenite::WebSocket<TcpStream>,
 ) -> Result<GossipSyncFrame, String> {
     match socket.read() {
-        Ok(Message::Binary(raw)) => {
-            let payload = decode_stream_frame(&raw)?;
-            log_verbose(&format!(
-                "relay_frame_recv_binary: framed_bytes={} payload_bytes={}",
-                raw.len(),
-                payload.len()
-            ));
-            parse_frame(payload)
-        }
+        Ok(Message::Binary(raw)) => parse_relay_binary_message(&raw),
         Ok(Message::Ping(payload)) => {
             let _ = socket.send(Message::Pong(payload));
             Err("WouldBlock".to_string())
@@ -424,6 +416,38 @@ fn read_binary_frame(
         }
         Ok(other) => Err(format!("unexpected relay frame: {other:?}")),
         Err(err) => Err(format!("websocket read failed: {err}")),
+    }
+}
+
+fn parse_relay_binary_message(raw: &[u8]) -> Result<GossipSyncFrame, String> {
+    match decode_stream_frame(raw) {
+        Ok(payload) => {
+            log_verbose(&format!(
+                "relay_frame_recv_binary: framing=length-prefixed framed_bytes={} payload_bytes={}",
+                raw.len(),
+                payload.len()
+            ));
+            parse_frame(payload)
+        }
+        Err(prefix_err) => {
+            log_verbose(&format!(
+                "relay_frame_recv_binary_unframed_attempt: framed_bytes={} reason={}",
+                raw.len(),
+                prefix_err
+            ));
+            match parse_frame(raw) {
+                Ok(frame) => {
+                    log_verbose(&format!(
+                        "relay_frame_recv_binary: framing=raw-cbor bytes={}",
+                        raw.len()
+                    ));
+                    Ok(frame)
+                }
+                Err(raw_err) => Err(format!(
+                    "relay frame decode failed (length-prefixed: {prefix_err}; raw-cbor: {raw_err})"
+                )),
+            }
+        }
     }
 }
 

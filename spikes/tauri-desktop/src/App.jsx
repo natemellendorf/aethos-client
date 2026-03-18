@@ -76,7 +76,7 @@ function createOptimisticOutgoingMessage(localId, text) {
 function formatOutgoingStatus(message) {
   if (message?.direction !== "Outgoing") return null;
   const state = message?.outboundState;
-  if (state === "sending") return "Sending...";
+  if (state === "sending") return "Queued";
   if (state === "sent") return "Sent";
   if (state && typeof state === "object" && state.failed?.error) return `Failed: ${state.failed.error}`;
   if (message?.lastSyncError) return `Failed: ${message.lastSyncError}`;
