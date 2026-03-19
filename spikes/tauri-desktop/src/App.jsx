@@ -22,6 +22,7 @@ import { Button } from "./components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "./components/ui/card";
 import { Input } from "./components/ui/input";
 import { Textarea } from "./components/ui/textarea";
+import { soundManager } from "./lib/soundManager";
 import { cn } from "./lib/utils";
 
 const TABS = [
@@ -110,6 +111,8 @@ export default function App() {
   const logContainerRef = useRef(null);
   const threadContainerRef = useRef(null);
   const seenThreadMessageIdsRef = useRef(new Set());
+  const seenIncomingMessageIdsRef = useRef(new Set());
+  const hasHydratedIncomingRef = useRef(false);
 
   const entries = useMemo(
     () => Object.entries(contacts).sort((a, b) => (a[1] || "").localeCompare(b[1] || "", undefined, { sensitivity: "base" })),
@@ -225,6 +228,53 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    let disposed = false;
+    let unlisten;
+    listen("sound_event", (event) => {
+      if (disposed) return;
+      const kind = event.payload?.kind;
+      if (typeof kind === "string") {
+        soundManager.play(kind);
+      }
+    })
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch(() => {
+        // keep app responsive if listener fails
+      });
+
+    return () => {
+      disposed = true;
+      if (unlisten) unlisten();
+    };
+  }, []);
+
+  useEffect(() => {
+    const nextIncoming = new Set();
+    Object.values(chat.threads || {}).forEach((thread) => {
+      thread.forEach((message) => {
+        if (message.direction === "Incoming") {
+          nextIncoming.add(message.msgId);
+        }
+      });
+    });
+
+    if (!hasHydratedIncomingRef.current) {
+      seenIncomingMessageIdsRef.current = nextIncoming;
+      hasHydratedIncomingRef.current = true;
+      return;
+    }
+
+    const prior = seenIncomingMessageIdsRef.current;
+    const hasNewIncoming = [...nextIncoming].some((id) => !prior.has(id));
+    seenIncomingMessageIdsRef.current = nextIncoming;
+    if (hasNewIncoming) {
+      soundManager.play("receive");
+    }
+  }, [chat.threads]);
+
+  useEffect(() => {
     if (tab !== "settings" || !logStreaming) return;
 
     let cancelled = false;
@@ -320,6 +370,7 @@ export default function App() {
       setStatus(`Saved contact ${alias}`);
     } catch (error) {
       setStatus(`Saving contact failed: ${String(error)}`);
+      soundManager.play("error");
     }
   };
 
@@ -340,6 +391,7 @@ export default function App() {
       setStatus("Contact removed");
     } catch (error) {
       setStatus(`Contact removal failed: ${String(error)}`);
+      soundManager.play("error");
     }
   };
 
@@ -369,6 +421,7 @@ export default function App() {
       setChat(response.chat);
       setContacts(response.contacts);
       setStatus(`${response.encounterStatus} · ${tinyId(response.message.msgId)}`);
+      soundManager.play("send");
     } catch (error) {
       const failure = String(error);
       setChat((prev) => {
@@ -387,6 +440,7 @@ export default function App() {
         return next;
       });
       setStatus(`Send failed: ${String(error)}`);
+      soundManager.play("error");
     }
   };
 
@@ -396,8 +450,12 @@ export default function App() {
       setChat(response.chat);
       setContacts(response.contacts);
       setStatus(response.status);
+      if ((response.pulledMessages || 0) > 0) {
+        soundManager.play("sync");
+      }
     } catch (error) {
       setStatus(`Inbox sync failed: ${String(error)}`);
+      soundManager.play("error");
     }
   };
 
@@ -408,6 +466,7 @@ export default function App() {
       setStatus("Share QR generated");
     } catch (error) {
       setStatus(`Share QR generation failed: ${String(error)}`);
+      soundManager.play("error");
     }
   };
 
@@ -429,6 +488,7 @@ export default function App() {
       setStatus(`Imported contact ${tinyId(wayfarerId)}`);
     } catch (error) {
       setStatus(`QR import failed: ${String(error)}`);
+      soundManager.play("error");
     }
   };
 
@@ -456,6 +516,7 @@ export default function App() {
       setStatus("Settings saved");
     } catch (error) {
       setStatus(`Settings update failed: ${String(error)}`);
+      soundManager.play("error");
     }
   };
 
@@ -468,6 +529,7 @@ export default function App() {
       setStatus(next ? "Entered fullscreen" : "Exited fullscreen");
     } catch (error) {
       setStatus(`Fullscreen toggle failed: ${String(error)}`);
+      soundManager.play("error");
     }
   };
 

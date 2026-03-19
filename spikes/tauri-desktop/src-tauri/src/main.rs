@@ -56,6 +56,7 @@ use crate::relay::client::{
 
 const SHARE_QR_FILE_NAME: &str = "share-wayfarer-qr.png";
 const CHAT_SNAPSHOT_EVENT: &str = "chat_snapshot";
+const SOUND_EVENT: &str = "sound_event";
 
 struct GossipRuntime {
     enabled: AtomicBool,
@@ -124,6 +125,11 @@ struct BootstrapState {
 struct ChatSnapshot {
     contacts: BTreeMap<String, String>,
     chat: PersistedChatState,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct SoundEventPayload {
+    kind: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -929,6 +935,7 @@ fn handle_gossip_frame(
             let node_id = hello.node_id;
             peer_node_by_addr.insert(source_key.clone(), node_id.clone());
             peer_node_by_addr.insert(source_ip_key.clone(), node_id);
+            emit_sound_event_best_effort("encounter", "gossip_hello");
             log_verbose(&format!(
                 "gossip_peer_hello_mapped: source={} source_ip={} peers={}",
                 source_key,
@@ -1031,6 +1038,7 @@ fn handle_gossip_frame(
                 save_chat_state(&chat)?;
                 save_contact_aliases(&contacts)?;
                 emit_chat_snapshot_event_best_effort("gossip_transfer_import");
+                emit_sound_event_best_effort("sync", "gossip_transfer_import");
                 runtime.last_activity_ms.store(now_unix_ms(), Ordering::SeqCst);
                 set_gossip_event("received messages");
                 log_verbose(&format!(
@@ -1318,6 +1326,28 @@ fn emit_chat_snapshot_event() -> Result<(), String> {
 fn emit_chat_snapshot_event_best_effort(context: &str) {
     if let Err(err) = emit_chat_snapshot_event() {
         log_verbose(&format!("chat_snapshot_emit_failed context={context}: {err}"));
+    }
+}
+
+fn emit_sound_event(kind: &str) -> Result<(), String> {
+    let Some(handle) = APP_HANDLE.get() else {
+        return Ok(());
+    };
+
+    handle
+        .emit(
+            SOUND_EVENT,
+            SoundEventPayload {
+                kind: kind.to_string(),
+            },
+        )
+        .map_err(|err| format!("failed emitting {SOUND_EVENT}: {err}"))
+}
+
+fn emit_sound_event_best_effort(kind: &str, context: &str) {
+    match emit_sound_event(kind) {
+        Ok(()) => log_verbose(&format!("sound_played: {kind}")),
+        Err(err) => log_verbose(&format!("sound_emit_failed context={context} kind={kind}: {err}")),
     }
 }
 
