@@ -43,6 +43,8 @@ const LOG_FILTERS = {
   transfer: ["transfer_import_", "transfer_select_", "gossip_transfer_"]
 };
 
+const RELEASES_LATEST_URL = "https://api.github.com/repos/natemellendorf/aethos-client/releases/latest";
+
 function tinyId(id = "") {
   if (!id) return "-";
   if (id.length <= 24) return id;
@@ -85,6 +87,50 @@ function formatOutgoingStatus(message) {
   return null;
 }
 
+function parseSemverLike(value = "") {
+  const clean = String(value).trim().replace(/^v/i, "");
+  const [major = "0", minor = "0", patch = "0"] = clean.split(".");
+  return {
+    raw: clean,
+    major: Number.parseInt(major, 10) || 0,
+    minor: Number.parseInt(minor, 10) || 0,
+    patch: Number.parseInt(patch, 10) || 0
+  };
+}
+
+function isVersionNewer(current, latest) {
+  const a = parseSemverLike(current);
+  const b = parseSemverLike(latest);
+  if (b.major !== a.major) return b.major > a.major;
+  if (b.minor !== a.minor) return b.minor > a.minor;
+  return b.patch > a.patch;
+}
+
+function summarizeReleaseNotes(body = "") {
+  const plain = body.replace(/\r/g, "").trim();
+  if (!plain) return "No release notes summary available.";
+  const firstParagraph = plain.split("\n\n").find((part) => part.trim()) || plain;
+  const compact = firstParagraph.replace(/\n+/g, " ").trim();
+  return compact.length > 220 ? `${compact.slice(0, 217)}...` : compact;
+}
+
+function pickInstallerAssetUrl(release) {
+  const assets = Array.isArray(release?.assets) ? release.assets : [];
+  const ua = navigator.userAgent || "";
+  const isWindows = /Windows/i.test(ua);
+  const isMac = /Macintosh|Mac OS X/i.test(ua);
+  const isLinux = /Linux/i.test(ua) && !/Android/i.test(ua);
+
+  const bySuffix = (suffix) => assets.find((asset) => asset?.browser_download_url?.toLowerCase().endsWith(suffix));
+
+  if (isWindows) return bySuffix(".exe")?.browser_download_url || null;
+  if (isMac) return bySuffix(".dmg")?.browser_download_url || null;
+  if (isLinux) {
+    return bySuffix(".appimage")?.browser_download_url || bySuffix(".deb")?.browser_download_url || null;
+  }
+  return null;
+}
+
 export default function App() {
   const [tab, setTab] = useState("chats");
   const [status, setStatus] = useState("Loading app state...");
@@ -94,6 +140,9 @@ export default function App() {
   const [chat, setChat] = useState({ selectedContact: null, threads: {}, newContacts: [] });
   const [relayReports, setRelayReports] = useState([]);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [currentVersion, setCurrentVersion] = useState("0.0.0");
+  const [updateNotice, setUpdateNotice] = useState(null);
+  const [updateDismissed, setUpdateDismissed] = useState(false);
   const [relayHealth, setRelayHealth] = useState(emptyRelay);
   const [gossipStatus, setGossipStatus] = useState(emptyGossip);
   const [shareQr, setShareQr] = useState(null);
@@ -198,6 +247,44 @@ export default function App() {
 
   useEffect(() => {
     runBootstrap();
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const checkForUpdates = async () => {
+      try {
+        const localVersion = await invoke("app_version");
+        if (cancelled) return;
+        setCurrentVersion(localVersion);
+
+        const response = await fetch(RELEASES_LATEST_URL, {
+          method: "GET",
+          headers: { Accept: "application/vnd.github+json" }
+        });
+        if (!response.ok) return;
+        const latest = await response.json();
+        const latestTag = String(latest.tag_name || "").trim();
+        if (!latestTag) return;
+        if (!isVersionNewer(localVersion, latestTag)) return;
+
+        if (cancelled) return;
+        setUpdateNotice({
+          currentVersion: parseSemverLike(localVersion).raw,
+          latestVersion: parseSemverLike(latestTag).raw,
+          notesSummary: summarizeReleaseNotes(latest.body || ""),
+          notesUrl: latest.html_url || "https://github.com/natemellendorf/aethos-client/releases",
+          downloadUrl: pickInstallerAssetUrl(latest)
+        });
+      } catch {
+        // fail silently for non-disruptive UX
+      }
+    };
+
+    const timer = setTimeout(checkForUpdates, 2200);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
   }, []);
 
   useEffect(() => {
@@ -624,6 +711,39 @@ export default function App() {
             </div>
           </div>
         </div>
+
+        {updateNotice && !updateDismissed ? (
+          <Card className="mb-2 border-cyan-300/30 bg-cyan-500/8">
+            <CardContent className="flex flex-wrap items-center justify-between gap-2 p-3 text-sm">
+              <div className="min-w-[260px] flex-1">
+                <p className="font-semibold text-cyan-100">Update available: v{updateNotice.latestVersion}</p>
+                <p className="text-xs text-cyan-100/85">
+                  You are on v{updateNotice.currentVersion}. {updateNotice.notesSummary}
+                </p>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  variant="secondary"
+                  className="h-8"
+                  onClick={() => invoke("open_external_url", { url: updateNotice.notesUrl })}
+                >
+                  Release Notes
+                </Button>
+                {updateNotice.downloadUrl ? (
+                  <Button
+                    className="h-8"
+                    onClick={() => invoke("open_external_url", { url: updateNotice.downloadUrl })}
+                  >
+                    Download Update
+                  </Button>
+                ) : null}
+                <Button variant="ghost" className="h-8" onClick={() => setUpdateDismissed(true)}>
+                  Dismiss
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        ) : null}
 
         {tab === "chats" && (
           <div className="grid gap-3 lg:h-[calc(100vh-220px)] lg:grid-cols-[285px_1fr]">

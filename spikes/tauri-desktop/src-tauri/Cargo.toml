@@ -25,6 +25,7 @@ socket2 = "0.5"
 tauri = { version = "2", default-features = false, features = ["wry"] }
 tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }
 url = "2"
+webbrowser = "1"
 
 [features]
 default = []

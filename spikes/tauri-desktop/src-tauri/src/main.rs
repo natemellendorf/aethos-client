@@ -134,6 +134,39 @@ struct SoundEventPayload {
     kind: String,
 }
 
+#[tauri::command]
+fn app_version() -> String {
+    embedded_release_version()
+}
+
+#[tauri::command]
+fn open_external_url(url: String) -> Result<(), String> {
+    let trimmed = url.trim();
+    if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
+        return Err("only http(s) URLs are allowed".to_string());
+    }
+    webbrowser::open(trimmed).map_err(|err| format!("failed opening URL: {err}"))
+}
+
+fn embedded_release_version() -> String {
+    let source = include_str!("../../../../Cargo.toml");
+    source
+        .lines()
+        .find_map(|line| {
+            let line = line.trim();
+            if !line.starts_with("version") {
+                return None;
+            }
+            let value = line.split('=').nth(1)?.trim().trim_matches('"').to_string();
+            if value.is_empty() {
+                None
+            } else {
+                Some(value)
+            }
+        })
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UpsertContactRequest {
@@ -1612,6 +1645,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             app_diagnostics,
+            app_version,
             read_app_log,
             clear_app_log,
             bootstrap_state,
@@ -1629,6 +1663,7 @@ pub fn run() {
             relay_health_status,
             generate_share_qr,
             decode_wayfarer_id_from_qr_bytes,
+            open_external_url,
             run_relay_diagnostics
         ])
         .run(tauri::generate_context!())
@@ -1648,6 +1683,12 @@ mod tests {
         std::env::var("AETHOS_RELAY_TEST_HTTP")
             .ok()
             .filter(|value| !value.trim().is_empty())
+    }
+
+    #[test]
+    fn embedded_release_version_is_semver_like() {
+        let version = embedded_release_version();
+        assert!(version.split('.').count() >= 3);
     }
 
     #[test]
