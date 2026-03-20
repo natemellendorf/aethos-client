@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 
 use app_state::{
     load_app_settings, load_chat_state, normalize_chat_state, now_unix_ms, now_unix_secs,
-    save_app_settings, save_chat_state, AppSettings, ChatDirection, ChatMessage, OutboundState,
-    PersistedChatState,
+    save_app_settings, save_chat_state, AppSettings, ChatAttachment, ChatDirection, ChatMessage,
+    OutboundState, PersistedChatState,
 };
 use base64::Engine;
 use image::{imageops::FilterType, ImageBuffer, Luma, Rgba, RgbaImage};
@@ -59,6 +59,7 @@ use crate::relay::client::{
 const SHARE_QR_FILE_NAME: &str = "share-wayfarer-qr.png";
 const CHAT_SNAPSHOT_EVENT: &str = "chat_snapshot";
 const SOUND_EVENT: &str = "sound_event";
+const MAX_ATTACHMENT_BYTES: u64 = 2 * 1024 * 1024;
 
 struct GossipRuntime {
     enabled: AtomicBool,
@@ -179,6 +180,17 @@ struct UpsertContactRequest {
 struct SendMessageRequest {
     wayfarer_id: String,
     body: String,
+    #[serde(default)]
+    attachment: Option<SendAttachmentRequest>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SendAttachmentRequest {
+    file_name: String,
+    mime_type: String,
+    size_bytes: u64,
+    content_b64: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -497,14 +509,23 @@ fn send_message_blocking(request: SendMessageRequest) -> Result<SendMessageRespo
     }
 
     let body = request.body.trim();
-    if body.is_empty() {
-        return Err("message body cannot be empty".to_string());
+    let attachment = request
+        .attachment
+        .as_ref()
+        .map(validate_send_attachment)
+        .transpose()?;
+    if body.is_empty() && attachment.is_none() {
+        return Err("message must include text or a file attachment".to_string());
     }
 
     log_verbose(&format!(
-        "send_message_start: to={} body_bytes={}",
+        "send_message_start: to={} body_bytes={} attachment={}",
         wayfarer_id,
-        body.len()
+        body.len(),
+        attachment
+            .as_ref()
+            .map(|value| format!("{}:{}", value.file_name, value.size_bytes))
+            .unwrap_or_else(|| "none".to_string())
     ));
 
     let now_ms = now_unix_ms();
@@ -515,7 +536,7 @@ fn send_message_blocking(request: SendMessageRequest) -> Result<SendMessageRespo
     let mut contacts = load_contact_aliases()?;
     let expiry_ms = now_ms.saturating_add(settings.message_ttl_seconds.saturating_mul(1000));
     let local_id = format!("local-{now_ms}-{:08x}", rand::random::<u32>());
-    let outbound_payload = build_outbound_chat_payload(body, &local_id, now_ms);
+    let outbound_payload = build_outbound_chat_payload(body, &local_id, now_ms, attachment.as_ref());
     let payload =
         build_envelope_payload_b64_from_utf8(wayfarer_id, &outbound_payload, &author_signing_seed)?;
     let decoded = decode_envelope_payload_b64(&payload)?;
@@ -551,6 +572,7 @@ fn send_message_blocking(request: SendMessageRequest) -> Result<SendMessageRespo
         expires_at_unix_ms: Some(expiry_ms),
         last_sync_attempt_unix_ms: Some(now_ms),
         last_sync_error: None,
+        attachment,
     });
 
     let relay_http = settings
@@ -1220,6 +1242,7 @@ fn merge_pulled_messages(
             expires_at_unix_ms: None,
             last_sync_attempt_unix_ms: None,
             last_sync_error: None,
+            attachment: extract_attachment_if_json(&pulled.text),
         });
         sort_thread_messages(thread);
 
@@ -1309,11 +1332,24 @@ fn extract_chat_text_if_json(input: &str) -> String {
         return input.to_string();
     };
 
-    value
+    if let Some(text) = value
         .get("text")
         .and_then(|v| v.as_str())
-        .map(|text| text.to_string())
-        .unwrap_or_else(|| input.to_string())
+    {
+        if !text.is_empty() {
+            return text.to_string();
+        }
+    }
+
+    if let Some(file_name) = value
+        .get("attachment")
+        .and_then(|v| v.get("file_name").or_else(|| v.get("fileName")))
+        .and_then(|v| v.as_str())
+    {
+        return format!("[File] {file_name}");
+    }
+
+    input.to_string()
 }
 
 fn extract_sent_at_unix_if_json(input: &str) -> Option<i64> {
@@ -1333,13 +1369,92 @@ fn sort_thread_messages(thread: &mut [ChatMessage]) {
     });
 }
 
-fn build_outbound_chat_payload(text: &str, client_msg_id: &str, sent_at_unix_ms: u64) -> String {
-    serde_json::json!({
+fn extract_attachment_if_json(input: &str) -> Option<ChatAttachment> {
+    let value = serde_json::from_str::<serde_json::Value>(input).ok()?;
+    let attachment = value.get("attachment")?;
+
+    let file_name = attachment
+        .get("file_name")
+        .or_else(|| attachment.get("fileName"))
+        .and_then(|v| v.as_str())?
+        .to_string();
+    let mime_type = attachment
+        .get("mime_type")
+        .or_else(|| attachment.get("mimeType"))
+        .and_then(|v| v.as_str())?
+        .to_string();
+    let size_bytes = attachment
+        .get("size_bytes")
+        .or_else(|| attachment.get("sizeBytes"))
+        .and_then(|v| v.as_u64())?;
+    let content_b64 = attachment
+        .get("content_b64")
+        .or_else(|| attachment.get("contentB64"))
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
+
+    Some(ChatAttachment {
+        file_name,
+        mime_type,
+        size_bytes,
+        content_b64,
+    })
+}
+
+fn build_outbound_chat_payload(
+    text: &str,
+    client_msg_id: &str,
+    sent_at_unix_ms: u64,
+    attachment: Option<&ChatAttachment>,
+) -> String {
+    let mut value = serde_json::json!({
         "text": text,
         "client_msg_id": client_msg_id,
         "sent_at_unix_ms": sent_at_unix_ms,
+    });
+
+    if let Some(attachment) = attachment {
+        value["attachment"] = serde_json::json!({
+            "file_name": attachment.file_name,
+            "mime_type": attachment.mime_type,
+            "size_bytes": attachment.size_bytes,
+            "content_b64": attachment.content_b64,
+        });
+    }
+
+    value.to_string()
+}
+
+fn validate_send_attachment(attachment: &SendAttachmentRequest) -> Result<ChatAttachment, String> {
+    let file_name = attachment.file_name.trim();
+    if file_name.is_empty() {
+        return Err("attachment file name cannot be empty".to_string());
+    }
+
+    if attachment.size_bytes == 0 {
+        return Err("attachment cannot be empty".to_string());
+    }
+
+    if attachment.size_bytes > MAX_ATTACHMENT_BYTES {
+        return Err(format!(
+            "attachment too large; max {} bytes",
+            MAX_ATTACHMENT_BYTES
+        ));
+    }
+
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(attachment.content_b64.trim())
+        .map_err(|_| "attachment base64 content is invalid".to_string())?;
+    if decoded.len() as u64 != attachment.size_bytes {
+        return Err("attachment size mismatch".to_string());
+    }
+
+    Ok(ChatAttachment {
+        file_name: file_name.to_string(),
+        mime_type: attachment.mime_type.trim().to_string(),
+        size_bytes: attachment.size_bytes,
+        content_b64: Some(attachment.content_b64.trim().to_string()),
     })
-    .to_string()
 }
 
 fn emit_chat_snapshot_event() -> Result<(), String> {
@@ -1784,13 +1899,34 @@ mod tests {
 
     #[test]
     fn outbound_chat_payload_json_keeps_display_text() {
-        let payload = build_outbound_chat_payload("hello", "local-123", 42);
+        let payload = build_outbound_chat_payload("hello", "local-123", 42, None);
         assert_eq!(extract_chat_text_if_json(&payload), "hello");
     }
 
     #[test]
+    fn outbound_chat_payload_keeps_emoji_text() {
+        let payload = build_outbound_chat_payload("hello 🌬️🚀", "local-emoji", 42, None);
+        assert_eq!(extract_chat_text_if_json(&payload), "hello 🌬️🚀");
+    }
+
+    #[test]
+    fn outbound_chat_payload_roundtrips_attachment_metadata() {
+        let attachment = ChatAttachment {
+            file_name: "note.txt".to_string(),
+            mime_type: "text/plain".to_string(),
+            size_bytes: 4,
+            content_b64: Some(base64::engine::general_purpose::STANDARD.encode("test")),
+        };
+        let payload = build_outbound_chat_payload("", "local-file", 42, Some(&attachment));
+        let extracted = extract_attachment_if_json(&payload).expect("attachment extracted");
+        assert_eq!(extracted.file_name, "note.txt");
+        assert_eq!(extracted.mime_type, "text/plain");
+        assert_eq!(extracted.size_bytes, 4);
+    }
+
+    #[test]
     fn outbound_chat_payload_exposes_sent_at_for_thread_sorting() {
-        let payload = build_outbound_chat_payload("hello", "local-123", 1700000000123);
+        let payload = build_outbound_chat_payload("hello", "local-123", 1700000000123, None);
         assert_eq!(extract_sent_at_unix_if_json(&payload), Some(1_700_000_000));
     }
 
@@ -1861,13 +1997,13 @@ mod tests {
 
         let payload_a = build_envelope_payload_b64_from_utf8(
             recipient,
-            &build_outbound_chat_payload("same text", "local-1", 1000),
+            &build_outbound_chat_payload("same text", "local-1", 1000, None),
             &signing_seed,
         )
         .expect("build payload a");
         let payload_b = build_envelope_payload_b64_from_utf8(
             recipient,
-            &build_outbound_chat_payload("same text", "local-2", 1000),
+            &build_outbound_chat_payload("same text", "local-2", 1000, None),
             &signing_seed,
         )
         .expect("build payload b");
@@ -1898,6 +2034,7 @@ mod tests {
         let request = SendMessageRequest {
             wayfarer_id: identity.wayfarer_id,
             body: "e2e relay send test".to_string(),
+            attachment: None,
         };
 
         let response = send_message_blocking(request).expect("send message through relay path");

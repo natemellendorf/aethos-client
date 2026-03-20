@@ -8,13 +8,14 @@ import {
   ContactRound,
   MessageCircle,
   QrCode,
-  RefreshCcw,
   Settings,
   Share2,
   Wifi,
   Wind,
   Maximize2,
-  Minimize2
+  Minimize2,
+  Paperclip,
+  FileDown
 } from "lucide-react";
 
 import { Badge } from "./components/ui/badge";
@@ -44,6 +45,7 @@ const LOG_FILTERS = {
 };
 
 const RELEASES_LATEST_URL = "https://api.github.com/repos/natemellendorf/aethos-client/releases/latest";
+const DEFAULT_RELAY_ENDPOINT = "wss://aethos-relay.network";
 
 function tinyId(id = "") {
   if (!id) return "-";
@@ -72,7 +74,22 @@ function createOptimisticOutgoingMessage(localId, text) {
     outboundState: "sending",
     expiresAtUnixMs: null,
     lastSyncAttemptUnixMs: nowMs,
-    lastSyncError: null
+    lastSyncError: null,
+    attachment: null
+  };
+}
+
+function createOptimisticOutgoingMessageWithAttachment(localId, text, attachment) {
+  return {
+    ...createOptimisticOutgoingMessage(localId, text),
+    attachment: attachment
+      ? {
+          fileName: attachment.fileName,
+          mimeType: attachment.mimeType,
+          sizeBytes: attachment.sizeBytes,
+          contentB64: attachment.contentB64
+        }
+      : null
   };
 }
 
@@ -85,6 +102,23 @@ function formatOutgoingStatus(message) {
   if (message?.lastSyncError) return `Failed: ${message.lastSyncError}`;
   if (message?.deliveredAt) return "Sent";
   return null;
+}
+
+function formatBytes(bytes = 0) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+async function readFileAsBase64(file) {
+  const buffer = await file.arrayBuffer();
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
 }
 
 function parseSemverLike(value = "") {
@@ -136,6 +170,7 @@ export default function App() {
   const [status, setStatus] = useState("Loading app state...");
   const [identity, setIdentity] = useState(null);
   const [settings, setSettings] = useState(null);
+  const [relayEndpointsDraft, setRelayEndpointsDraft] = useState("");
   const [contacts, setContacts] = useState({});
   const [chat, setChat] = useState({ selectedContact: null, threads: {}, newContacts: [] });
   const [relayReports, setRelayReports] = useState([]);
@@ -148,6 +183,7 @@ export default function App() {
   const [shareQr, setShareQr] = useState(null);
   const [diagnostics, setDiagnostics] = useState(null);
   const [composer, setComposer] = useState("");
+  const [composerAttachment, setComposerAttachment] = useState(null);
   const [contactDraft, setContactDraft] = useState({ wayfarerId: "", alias: "" });
   const [showSplash, setShowSplash] = useState(true);
   const [splashFade, setSplashFade] = useState(false);
@@ -159,6 +195,7 @@ export default function App() {
   const [arrivingMessageIds, setArrivingMessageIds] = useState({});
   const logContainerRef = useRef(null);
   const threadContainerRef = useRef(null);
+  const attachmentInputRef = useRef(null);
   const seenThreadMessageIdsRef = useRef(new Set());
   const seenIncomingMessageIdsRef = useRef(new Set());
   const hasHydratedIncomingRef = useRef(false);
@@ -221,6 +258,7 @@ export default function App() {
       ]);
       setIdentity(boot.identity);
       setSettings(boot.settings);
+      setRelayEndpointsDraft((boot.settings?.relayEndpoints || []).join("\n"));
       setContacts(boot.contacts || {});
       const initialChat = boot.chat || { selectedContact: null, threads: {}, newContacts: [] };
       if (!initialChat.selectedContact && Object.keys(boot.contacts || {}).length > 0) {
@@ -432,6 +470,11 @@ export default function App() {
     });
   }, [chat.selectedContact, contacts]);
 
+  useEffect(() => {
+    if (!settings) return;
+    setRelayEndpointsDraft((settings.relayEndpoints || []).join("\n"));
+  }, [settings]);
+
   const saveChat = async (nextChat) => {
     const saved = await invoke("save_chat", { chat: nextChat });
     setChat(saved);
@@ -482,21 +525,53 @@ export default function App() {
     }
   };
 
+  const onAttachmentPick = async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+
+    if (file.size > 2 * 1024 * 1024) {
+      setStatus("Attachment too large (max 2 MB)");
+      soundManager.play("error");
+      return;
+    }
+
+    try {
+      const contentB64 = await readFileAsBase64(file);
+      setComposerAttachment({
+        fileName: file.name,
+        mimeType: file.type || "application/octet-stream",
+        sizeBytes: file.size,
+        contentB64
+      });
+      setStatus(`Attached ${file.name}`);
+    } catch {
+      setStatus("Failed to read attachment");
+      soundManager.play("error");
+    }
+  };
+
+  const clearAttachment = () => {
+    setComposerAttachment(null);
+  };
+
   const sendMessage = async () => {
     if (!selectedContactId) return setStatus("Select a contact before sending");
     if (!canSendToSelectedContact) {
       return setStatus("Cannot send to unresolved peer thread. Select a saved Wayfarer contact.");
     }
     const body = composer.trim();
-    if (!body) return setStatus("Message body cannot be empty");
+    if (!body && !composerAttachment) return setStatus("Message must include text or a file");
 
     const localId = `ui-local-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
     const contactId = selectedContactId;
+    const pendingAttachment = composerAttachment;
     setComposer("");
+    setComposerAttachment(null);
     setChat((prev) => {
       const next = { ...prev, threads: { ...prev.threads } };
       const thread = [...(next.threads[contactId] || [])];
-      thread.push(createOptimisticOutgoingMessage(localId, body));
+      thread.push(createOptimisticOutgoingMessageWithAttachment(localId, body, pendingAttachment));
       next.threads[contactId] = thread;
       next.selectedContact = contactId;
       return next;
@@ -504,7 +579,20 @@ export default function App() {
     setStatus("Sending message...");
 
     try {
-      const response = await withNetworkPulse(() => invoke("send_message", { request: { wayfarerId: contactId, body } }));
+      const response = await withNetworkPulse(() => invoke("send_message", {
+        request: {
+          wayfarerId: contactId,
+          body,
+          attachment: pendingAttachment
+            ? {
+                fileName: pendingAttachment.fileName,
+                mimeType: pendingAttachment.mimeType,
+                sizeBytes: pendingAttachment.sizeBytes,
+                contentB64: pendingAttachment.contentB64
+              }
+            : null
+        }
+      }));
       setChat(response.chat);
       setContacts(response.contacts);
       setStatus(`${response.encounterStatus} · ${tinyId(response.message.msgId)}`);
@@ -589,7 +677,7 @@ export default function App() {
       verboseLoggingEnabled: form.get("verbose_logging_enabled") === "on",
       enterToSend: form.get("enter_to_send") === "on",
       messageTtlSeconds: Number(form.get("message_ttl_seconds") || settings.messageTtlSeconds),
-      relayEndpoints: String(form.get("relay_endpoints") || "")
+      relayEndpoints: String(relayEndpointsDraft || "")
         .split("\n")
         .map((v) => v.trim())
         .filter(Boolean)
@@ -603,6 +691,26 @@ export default function App() {
       setStatus("Settings saved");
     } catch (error) {
       setStatus(`Settings update failed: ${String(error)}`);
+      soundManager.play("error");
+    }
+  };
+
+  const resetRelayEndpoints = async () => {
+    if (!settings) return;
+    const defaults = [DEFAULT_RELAY_ENDPOINT];
+    try {
+      const saved = await withNetworkPulse(() => invoke("update_settings", {
+        settings: {
+          ...settings,
+          relayEndpoints: defaults
+        }
+      }));
+      setSettings(saved);
+      setRelayEndpointsDraft(defaults.join("\n"));
+      setRelayHealth(await invoke("relay_health_status"));
+      setStatus("Relay configuration reset to default");
+    } catch (error) {
+      setStatus(`Relay reset failed: ${String(error)}`);
       soundManager.play("error");
     }
   };
@@ -768,7 +876,36 @@ export default function App() {
                 <div ref={threadContainerRef} className="mb-1.5 min-h-0 flex-1 space-y-2 overflow-auto rounded-lg border border-border/60 bg-background/40 p-2.5">
                   {selectedThread.length === 0 ? <p className="text-sm text-muted-foreground">No messages in this thread yet.</p> : selectedThread.map((m) => (
                     <div key={m.msgId} className={cn("message-bubble max-w-[85%] rounded-xl px-3 py-2 text-sm", m.direction === "Incoming" ? "message-bubble-incoming" : "message-bubble-outgoing ml-auto", arrivingMessageIds[m.msgId] ? "message-arrive" : "") }>
-                      <p>{m.text}</p>
+                      {m.text ? <p>{m.text}</p> : null}
+                      {m.attachment ? (
+                        <div className="mt-1.5 rounded-md border border-cyan-300/30 bg-slate-900/35 p-2 text-xs">
+                          <p className="truncate font-semibold">{m.attachment.fileName}</p>
+                          <p className="text-cyan-100/75">{formatBytes(m.attachment.sizeBytes)} · {m.attachment.mimeType || "file"}</p>
+                          {m.attachment.contentB64 ? (
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="mt-1 h-7 px-2"
+                              onClick={() => {
+                                const bin = atob(m.attachment.contentB64);
+                                const bytes = new Uint8Array(bin.length);
+                                for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
+                                const blob = new Blob([bytes], { type: m.attachment.mimeType || "application/octet-stream" });
+                                const href = URL.createObjectURL(blob);
+                                const link = document.createElement("a");
+                                link.href = href;
+                                link.download = m.attachment.fileName || "aethos-attachment";
+                                document.body.appendChild(link);
+                                link.click();
+                                link.remove();
+                                setTimeout(() => URL.revokeObjectURL(href), 400);
+                              }}
+                            >
+                              <FileDown className="mr-1 h-3.5 w-3.5" />Download
+                            </Button>
+                          ) : null}
+                        </div>
+                      ) : null}
                       <div className="mt-1 flex items-center gap-2 text-[11px] text-slate-300">
                         <span>{formatMessageTimestamp(m)}</span>
                         {formatOutgoingStatus(m) ? <span className="text-cyan-200/90">{formatOutgoingStatus(m)}</span> : null}
@@ -776,7 +913,24 @@ export default function App() {
                     </div>
                   ))}
                 </div>
-                <div className="mb-1 flex gap-2"><Button variant="secondary" className="h-9" onClick={syncInbox}><RefreshCcw className="mr-2 h-4 w-4" />Sync Inbox</Button></div>
+                <div className="mb-1 flex items-center gap-2">
+                  <input ref={attachmentInputRef} type="file" className="hidden" onChange={onAttachmentPick} />
+                  <Button
+                    variant="ghost"
+                    className="h-8"
+                    disabled={!canSendToSelectedContact}
+                    onClick={() => attachmentInputRef.current?.click()}
+                  >
+                    <Paperclip className="mr-1 h-4 w-4" />Attach File
+                  </Button>
+                  {composerAttachment ? (
+                    <div className="flex min-w-0 items-center gap-2 rounded-md border border-cyan-300/30 bg-cyan-500/10 px-2 py-1 text-xs">
+                      <span className="truncate">{composerAttachment.fileName}</span>
+                      <span className="text-cyan-200/80">{formatBytes(composerAttachment.sizeBytes)}</span>
+                      <Button variant="ghost" size="sm" className="h-6 px-2" onClick={clearAttachment}>Remove</Button>
+                    </div>
+                  ) : null}
+                </div>
                 <Textarea
                   value={composer}
                   disabled={!canSendToSelectedContact}
@@ -789,9 +943,15 @@ export default function App() {
                     void sendMessage();
                   }}
                   rows={2}
-                  placeholder={!canSendToSelectedContact ? "Cannot reply to unresolved peer. Select a saved contact." : (settings?.enterToSend === false ? "Write a message..." : "Write a message... (Enter to send, Shift+Enter newline)")}
+                  placeholder={!canSendToSelectedContact ? "Cannot reply to unresolved peer. Select a saved contact." : (settings?.enterToSend === false ? "Write a message or drop in an emoji/file..." : "Write a message... (Enter to send, Shift+Enter newline)")}
                 />
-                <Button className="mt-1 h-9 w-full" disabled={!canSendToSelectedContact} onClick={sendMessage}>Send</Button>
+                <Button
+                  className="mt-1 h-9 w-full"
+                  disabled={!canSendToSelectedContact || (!composer.trim() && !composerAttachment)}
+                  onClick={sendMessage}
+                >
+                  Send
+                </Button>
               </CardContent>
             </Card>
           </div>
@@ -874,9 +1034,15 @@ export default function App() {
                   <label className="flex items-center gap-2 text-sm"><input type="checkbox" name="verbose_logging_enabled" defaultChecked={settings.verboseLoggingEnabled} /> Enable verbose logging</label>
                   <label className="flex items-center gap-2 text-sm"><input type="checkbox" name="enter_to_send" defaultChecked={settings.enterToSend !== false} /> Enter sends message (Shift+Enter newline)</label>
                   <Input name="message_ttl_seconds" type="number" defaultValue={settings.messageTtlSeconds} />
-                  <Textarea name="relay_endpoints" rows={4} defaultValue={(settings.relayEndpoints || []).join("\n")} />
+                  <Textarea
+                    name="relay_endpoints"
+                    rows={4}
+                    value={relayEndpointsDraft}
+                    onChange={(event) => setRelayEndpointsDraft(event.target.value)}
+                  />
                   <div className="flex flex-wrap gap-2">
                     <Button type="submit"><CheckCircle2 className="mr-2 h-4 w-4" />Save Settings</Button>
+                    <Button type="button" variant="secondary" onClick={resetRelayEndpoints}>Reset Relay Default</Button>
                     <Button type="button" variant="ghost" onClick={announceGossip}>Announce LAN Gossip</Button>
                   </div>
                 </form>

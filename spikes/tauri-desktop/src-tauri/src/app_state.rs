@@ -38,6 +38,16 @@ pub enum OutboundState {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ChatAttachment {
+    pub file_name: String,
+    pub mime_type: String,
+    pub size_bytes: u64,
+    #[serde(default)]
+    pub content_b64: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ChatMessage {
     #[serde(alias = "msg_id")]
     pub msg_id: String,
@@ -67,6 +77,8 @@ pub struct ChatMessage {
     #[serde(alias = "last_sync_error")]
     #[serde(default)]
     pub last_sync_error: Option<String>,
+    #[serde(default)]
+    pub attachment: Option<ChatAttachment>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -116,7 +116,15 @@ pub fn run_relay_encounter_gossipv1(
         relay_ws, peer_hello.node_id, peer_hello.max_want, peer_hello.max_transfer
     ));
 
+    log_verbose(&format!(
+        "relay_encounter_post_hello_send_summary: relay_ws={}",
+        relay_ws
+    ));
     send_binary_frame(&mut socket, &build_summary_frame(now_unix_ms())?)?;
+    log_verbose(&format!(
+        "relay_encounter_post_hello_send_relay_ingest: relay_ws={}",
+        relay_ws
+    ));
     send_binary_frame(&mut socket, &build_relay_ingest_frame(now_unix_ms())?)?;
 
     let mut transferred_items = 0usize;
@@ -125,16 +133,38 @@ pub fn run_relay_encounter_gossipv1(
     let mut relay_ingest_candidates = Vec::<String>::new();
     let relay_ingest_trusted = auth_token.is_some();
     let deadline = Instant::now() + Duration::from_secs(3);
+    let started_at = Instant::now();
+    let mut recv_frame_count = 0usize;
+    let mut saw_summary = false;
+    let mut saw_transfer = false;
+    let mut saw_request = false;
+    let mut saw_relay_ingest = false;
+    let mut saw_receipt = false;
 
     while Instant::now() <= deadline {
         let frame = match read_binary_frame(&mut socket) {
             Ok(frame) => frame,
-            Err(err) if is_nonfatal_read_timeout(&err) => break,
+            Err(err) if is_nonfatal_read_timeout(&err) => {
+                log_verbose(&format!(
+                    "relay_encounter_loop_timeout: relay_ws={} elapsed_ms={} recv_frames={} saw_summary={} saw_request={} saw_transfer={} saw_relay_ingest={} saw_receipt={}",
+                    relay_ws,
+                    started_at.elapsed().as_millis(),
+                    recv_frame_count,
+                    saw_summary,
+                    saw_request,
+                    saw_transfer,
+                    saw_relay_ingest,
+                    saw_receipt
+                ));
+                break;
+            }
             Err(err) => return Err(err),
         };
+        recv_frame_count = recv_frame_count.saturating_add(1);
 
         match frame {
             GossipSyncFrame::Summary(summary) => {
+                saw_summary = true;
                 log_verbose(&format!(
                     "relay_encounter_recv_summary: relay_ws={} item_count={} bloom_bytes={}",
                     relay_ws,
@@ -153,6 +183,7 @@ pub fn run_relay_encounter_gossipv1(
                 )?;
             }
             GossipSyncFrame::RelayIngest(RelayIngestFrame { item_ids }) => {
+                saw_relay_ingest = true;
                 if let Some(trace_item_id) = trace_item_id {
                     log_verbose(&format!(
                         "relay_trace_relay_ingest_contains_item: relay_ws={} item_id={} seen_in_relay_ingest={}",
@@ -193,6 +224,7 @@ pub fn run_relay_encounter_gossipv1(
                 }
             }
             GossipSyncFrame::Request(request) => {
+                saw_request = true;
                 if let Some(trace_item_id) = trace_item_id {
                     log_verbose(&format!(
                         "relay_trace_request_contains_item: relay_ws={} item_id={} requested_by_peer={}",
@@ -234,6 +266,7 @@ pub fn run_relay_encounter_gossipv1(
                 }
             }
             GossipSyncFrame::Transfer(transfer) => {
+                saw_transfer = true;
                 log_verbose(&format!(
                     "relay_encounter_recv_transfer: relay_ws={} objects={}",
                     relay_ws,
@@ -283,6 +316,7 @@ pub fn run_relay_encounter_gossipv1(
                 }
             }
             GossipSyncFrame::Receipt(receipt) => {
+                saw_receipt = true;
                 log_verbose(&format!(
                     "relay_encounter_recv_receipt: relay_ws={} received_items={}",
                     relay_ws,
@@ -299,10 +333,17 @@ pub fn run_relay_encounter_gossipv1(
     }
 
     log_verbose(&format!(
-        "relay_encounter_done: relay_ws={} transferred_items={} pulled_messages={}",
+        "relay_encounter_done: relay_ws={} transferred_items={} pulled_messages={} recv_frames={} saw_summary={} saw_request={} saw_transfer={} saw_relay_ingest={} saw_receipt={} elapsed_ms={}",
         relay_ws,
         transferred_items,
-        pulled_messages.len()
+        pulled_messages.len(),
+        recv_frame_count,
+        saw_summary,
+        saw_request,
+        saw_transfer,
+        saw_relay_ingest,
+        saw_receipt,
+        started_at.elapsed().as_millis()
     ));
     Ok(EncounterReport {
         transferred_items,
