@@ -1196,6 +1196,7 @@ fn start_gossip_worker_if_needed(initial_enabled: bool) {
                                 peer_node_id,
                                 runtime,
                                 "inbound",
+                                false,
                             ) {
                                 log_verbose(&format!(
                                     "gossip_tcp_inbound_encounter_failed: peer={} error={}",
@@ -1350,16 +1351,27 @@ fn handle_gossip_frame(
             let _ = send_gossip_frame(socket, &source.ip().to_string(), source.port(), &request);
         }
         GossipSyncFrame::Request(_req) => {
+            if _req.want.is_empty() {
+                return Ok(());
+            }
             let peer_node_id = peer_node_by_addr
                 .get(&source.to_string())
                 .or_else(|| peer_node_by_addr.get(&source.ip().to_string()))
                 .cloned();
-            match run_gossip_tcp_encounter_with_peer(source.ip(), peer_node_id, runtime, "udp_request") {
+            match run_gossip_tcp_encounter_with_peer(
+                source.ip(),
+                peer_node_id,
+                runtime,
+                "udp_request",
+            ) {
                 Ok(_) => {}
-                Err(err) => log_verbose(&format!(
-                    "gossip_tcp_encounter_from_udp_request_failed: peer={} error={}",
-                    source, err
-                )),
+                Err(err) => {
+                    log_verbose(&format!(
+                        "gossip_tcp_encounter_from_udp_request_failed: peer={} error={}",
+                        source, err
+                    ));
+                    serve_udp_transfer_for_request(socket, source, &_req.want)?;
+                }
             }
         }
         GossipSyncFrame::Transfer(transfer) => {
@@ -1469,13 +1481,13 @@ fn run_gossip_tcp_encounter_with_peer(
         .set_nodelay(true)
         .map_err(|err| format!("tcp set_nodelay failed ({addr}): {err}"))?;
     stream
-        .set_read_timeout(Some(Duration::from_millis(700)))
+        .set_read_timeout(Some(Duration::from_millis(3000)))
         .map_err(|err| format!("tcp set_read_timeout failed ({addr}): {err}"))?;
     stream
-        .set_write_timeout(Some(Duration::from_millis(700)))
+        .set_write_timeout(Some(Duration::from_millis(3000)))
         .map_err(|err| format!("tcp set_write_timeout failed ({addr}): {err}"))?;
 
-    run_gossip_tcp_encounter_on_stream(&mut stream, peer_node_id, runtime, trigger)
+    run_gossip_tcp_encounter_on_stream(&mut stream, peer_node_id, runtime, trigger, true)
 }
 
 fn run_gossip_tcp_encounter_on_stream(
@@ -1483,6 +1495,7 @@ fn run_gossip_tcp_encounter_on_stream(
     peer_node_id: Option<String>,
     runtime: &GossipRuntime,
     trigger: &str,
+    initiate: bool,
 ) -> Result<(), String> {
     let identity = ensure_local_identity()?;
     let local_wayfarer = identity.wayfarer_id;
@@ -1492,18 +1505,20 @@ fn run_gossip_tcp_encounter_on_stream(
         .map_err(|err| format!("gossip pubkey decode failed: {err}"))?;
     let node_pubkey = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(node_pubkey_raw);
 
-    if let Ok(hello) = build_gossip_hello_frame(&local_wayfarer, &node_pubkey) {
-        send_gossip_frame_tcp(stream, &hello)?;
-    }
-    if let Ok(summary) = build_gossip_summary_frame(now_unix_ms()) {
-        send_gossip_frame_tcp(stream, &summary)?;
-    }
-    if let Ok(ingest) = build_gossip_relay_ingest_frame(now_unix_ms()) {
-        send_gossip_frame_tcp(stream, &ingest)?;
+    if initiate {
+        if let Ok(hello) = build_gossip_hello_frame(&local_wayfarer, &node_pubkey) {
+            send_gossip_frame_tcp(stream, &hello)?;
+        }
+        if let Ok(summary) = build_gossip_summary_frame(now_unix_ms()) {
+            send_gossip_frame_tcp(stream, &summary)?;
+        }
+        if let Ok(ingest) = build_gossip_relay_ingest_frame(now_unix_ms()) {
+            send_gossip_frame_tcp(stream, &ingest)?;
+        }
     }
 
     let started = Instant::now();
-    while started.elapsed() < Duration::from_millis(700) {
+    while started.elapsed() < Duration::from_millis(3000) {
         let frame = match read_gossip_frame_tcp(stream) {
             Ok(frame) => frame,
             Err(err)
@@ -1517,6 +1532,14 @@ fn run_gossip_tcp_encounter_on_stream(
         };
 
         match frame {
+            GossipSyncFrame::Hello(_) => {
+                if let Ok(summary) = build_gossip_summary_frame(now_unix_ms()) {
+                    send_gossip_frame_tcp(stream, &summary)?;
+                }
+                if let Ok(ingest) = build_gossip_relay_ingest_frame(now_unix_ms()) {
+                    send_gossip_frame_tcp(stream, &ingest)?;
+                }
+            }
             GossipSyncFrame::Summary(summary) => {
                 let request = build_request_from_summary(&summary, 256)?;
                 send_gossip_frame_tcp(stream, &request)?;
@@ -1591,12 +1614,33 @@ fn run_gossip_tcp_encounter_on_stream(
                 });
                 send_gossip_frame_tcp(stream, &receipt)?;
             }
-            GossipSyncFrame::Receipt(_) | GossipSyncFrame::Hello(_) => {}
+            GossipSyncFrame::Receipt(_) => {}
         }
     }
 
     log_verbose(&format!("gossip_tcp_encounter_done: trigger={trigger}"));
     Ok(())
+}
+
+fn serve_udp_transfer_for_request(
+    socket: &UdpSocket,
+    source: std::net::SocketAddr,
+    want: &[String],
+) -> Result<(), String> {
+    if want.is_empty() {
+        return Ok(());
+    }
+    let objects = gossip_transfer_items(
+        want,
+        MAX_TRANSFER_ITEMS as u32,
+        MAX_TRANSFER_BYTES,
+        now_unix_ms(),
+    )
+    .unwrap_or_default();
+    let transfer = GossipSyncFrame::Transfer(crate::aethos_core::gossip_sync::TransferFrame {
+        objects,
+    });
+    send_gossip_frame(socket, &source.ip().to_string(), source.port(), &transfer)
 }
 
 fn send_gossip_frame_tcp(stream: &mut TcpStream, frame: &GossipSyncFrame) -> Result<(), String> {
@@ -2287,11 +2331,20 @@ fn main() {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::net::{SocketAddr, TcpListener};
 
     fn maybe_relay_target() -> Option<String> {
         std::env::var("AETHOS_RELAY_TEST_HTTP")
             .ok()
             .filter(|value| !value.trim().is_empty())
+    }
+
+    fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let client = TcpStream::connect(addr).expect("connect client");
+        let (server, _) = listener.accept().expect("accept server");
+        (client, server)
     }
 
     #[test]
@@ -2506,6 +2559,82 @@ mod tests {
         let decoded_b = decode_envelope_payload_b64(&payload_b).expect("decode payload b");
 
         assert_ne!(decoded_a.manifest_id_hex, decoded_b.manifest_id_hex);
+    }
+
+    #[test]
+    fn tcp_frame_roundtrip_preserves_summary_frame() {
+        let (mut sender, mut receiver) = tcp_pair();
+        let frame = GossipSyncFrame::Summary(crate::aethos_core::gossip_sync::SummaryFrame {
+            bloom_filter: vec![0u8; crate::aethos_core::gossip_sync::BLOOM_FILTER_BYTES],
+            item_count: 0,
+            preview_item_ids: None,
+            preview_cursor: None,
+        });
+
+        send_gossip_frame_tcp(&mut sender, &frame).expect("send tcp frame");
+        let decoded = read_gossip_frame_tcp(&mut receiver).expect("read tcp frame");
+        match decoded {
+            GossipSyncFrame::Summary(summary) => {
+                assert_eq!(summary.item_count, 0);
+                assert_eq!(summary.bloom_filter.len(), crate::aethos_core::gossip_sync::BLOOM_FILTER_BYTES);
+            }
+            other => panic!("expected SUMMARY, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tcp_frame_rejects_oversize_length_prefix() {
+        let (mut client, mut server) = tcp_pair();
+        let oversized = (MAX_FRAME_BYTES as u32).saturating_add(1);
+        server
+            .write_all(&oversized.to_be_bytes())
+            .expect("write oversize length");
+
+        let err = read_gossip_frame_tcp(&mut client).expect_err("must reject oversize frame");
+        assert!(err.contains("exceeds max"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn udp_fallback_serves_transfer_for_requested_item() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aethos-tauri-test-udp-fallback-{}",
+            rand::random::<u64>()
+        ));
+        std::env::set_var("AETHOS_STATE_DIR", &temp_dir);
+
+        let identity = ensure_local_identity().expect("ensure identity");
+        let signing_seed = load_local_signing_key_seed().expect("load signing seed");
+        let payload = build_envelope_payload_b64_from_utf8(
+            &identity.wayfarer_id,
+            &build_outbound_chat_payload("udp fallback", "local-test", now_unix_ms(), None),
+            &signing_seed,
+        )
+        .expect("build envelope");
+        let item_id = gossip_record_local_payload(
+            &payload,
+            now_unix_ms().saturating_add(60_000),
+        )
+        .expect("record local payload");
+
+        let sender = UdpSocket::bind(("127.0.0.1", 0)).expect("bind sender udp");
+        let receiver = UdpSocket::bind(("127.0.0.1", 0)).expect("bind receiver udp");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("set receiver timeout");
+        let target: SocketAddr = receiver.local_addr().expect("receiver addr");
+
+        serve_udp_transfer_for_request(&sender, target, &[item_id.clone()])
+            .expect("serve udp fallback transfer");
+
+        let mut buf = [0u8; 65_535];
+        let (len, _) = receiver.recv_from(&mut buf).expect("receive transfer datagram");
+        let frame = parse_gossip_frame(&buf[..len]).expect("parse transfer frame");
+        match frame {
+            GossipSyncFrame::Transfer(transfer) => {
+                assert!(transfer.objects.iter().any(|object| object.item_id == item_id));
+            }
+            other => panic!("expected TRANSFER, got {other:?}"),
+        }
     }
 
     #[test]
