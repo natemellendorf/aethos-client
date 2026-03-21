@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::net::TcpStream;
-use std::sync::Once;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -21,6 +22,149 @@ use crate::aethos_core::protocol::decode_envelope_payload_utf8_preview;
 
 type RelaySocket = tungstenite::WebSocket<MaybeTlsStream<TcpStream>>;
 static RUSTLS_PROVIDER_INIT: Once = Once::new();
+static RELAY_SESSION_REGISTRY: OnceLock<Mutex<HashMap<String, ActiveRelaySession>>> =
+    OnceLock::new();
+static RELAY_ATTEMPT_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone)]
+struct ActiveRelaySession {
+    attempt_id: u64,
+    trigger: &'static str,
+    state: &'static str,
+    since: Instant,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct RelaySessionSnapshot {
+    pub attempt_id: u64,
+    pub trigger: String,
+    pub state: String,
+    pub age_ms: u128,
+}
+
+#[derive(Debug)]
+struct RelaySessionLease {
+    key: String,
+    attempt_id: u64,
+    trigger: &'static str,
+}
+
+impl RelaySessionLease {
+    fn acquire(relay_ws: &str, wayfarer_id: &str, trigger: &'static str) -> Result<Self, String> {
+        let key = relay_session_key(relay_ws, wayfarer_id);
+        let mut registry = relay_session_registry()
+            .lock()
+            .map_err(|_| "relay session registry poisoned".to_string())?;
+
+        if let Some(active) = registry.get(&key) {
+            return Err(format!(
+                "session already active (attempt_id={} state={} trigger={} age_ms={})",
+                active.attempt_id,
+                active.state,
+                active.trigger,
+                active.since.elapsed().as_millis()
+            ));
+        }
+
+        let attempt_id = RELAY_ATTEMPT_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+        registry.insert(
+            key.clone(),
+            ActiveRelaySession {
+                attempt_id,
+                trigger,
+                state: "connecting",
+                since: Instant::now(),
+            },
+        );
+        log_verbose(&format!(
+            "relay_session_state: key={} attempt_id={} state=connecting prev=idle trigger={}",
+            key, attempt_id, trigger
+        ));
+
+        Ok(Self {
+            key,
+            attempt_id,
+            trigger,
+        })
+    }
+
+    fn transition(&self, next_state: &'static str, event: &'static str) {
+        let Ok(mut registry) = relay_session_registry().lock() else {
+            return;
+        };
+
+        let Some(active) = registry.get_mut(&self.key) else {
+            log_verbose(&format!(
+                "relay_session_state_ignored: key={} attempt_id={} event={} reason=missing",
+                self.key, self.attempt_id, event
+            ));
+            return;
+        };
+
+        if active.attempt_id != self.attempt_id {
+            log_verbose(&format!(
+                "relay_session_state_ignored: key={} attempt_id={} event={} reason=stale active_attempt_id={}",
+                self.key, self.attempt_id, event, active.attempt_id
+            ));
+            return;
+        }
+
+        let prev = active.state;
+        active.state = next_state;
+        log_verbose(&format!(
+            "relay_session_state: key={} attempt_id={} state={} prev={} trigger={} event={}",
+            self.key, self.attempt_id, next_state, prev, self.trigger, event
+        ));
+    }
+}
+
+impl Drop for RelaySessionLease {
+    fn drop(&mut self) {
+        let Ok(mut registry) = relay_session_registry().lock() else {
+            return;
+        };
+
+        let Some(active) = registry.get(&self.key) else {
+            return;
+        };
+
+        if active.attempt_id != self.attempt_id {
+            return;
+        }
+
+        let prev = active.state;
+        let age_ms = active.since.elapsed().as_millis();
+        registry.remove(&self.key);
+        log_verbose(&format!(
+            "relay_session_state: key={} attempt_id={} state=closed prev={} trigger={} event=lease_dropped age_ms={}",
+            self.key, self.attempt_id, prev, self.trigger, age_ms
+        ));
+    }
+}
+
+fn relay_session_registry() -> &'static Mutex<HashMap<String, ActiveRelaySession>> {
+    RELAY_SESSION_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn relay_session_key(relay_ws: &str, wayfarer_id: &str) -> String {
+    format!("{}::{}", relay_ws, wayfarer_id)
+}
+
+#[allow(dead_code)]
+pub fn relay_session_snapshot(relay_ws: &str, wayfarer_id: &str) -> Option<RelaySessionSnapshot> {
+    let key = relay_session_key(relay_ws, wayfarer_id);
+    let Ok(registry) = relay_session_registry().lock() else {
+        return None;
+    };
+    let active = registry.get(&key)?;
+    Some(RelaySessionSnapshot {
+        attempt_id: active.attempt_id,
+        trigger: active.trigger.to_string(),
+        state: active.state.to_string(),
+        age_ms: active.since.elapsed().as_millis(),
+    })
+}
 
 pub fn normalize_http_endpoint(endpoint: &str) -> String {
     let trimmed = endpoint.trim();
@@ -70,15 +214,57 @@ pub fn connect_to_relay_gossipv1_with_auth(
     identity: &LocalIdentitySummary,
     auth_token: Option<&str>,
 ) -> String {
-    match open_relay_socket(relay_ws, auth_token)
-        .and_then(|mut socket| complete_hello_handshake(&mut socket, identity))
-    {
-        Ok(peer_hello) => format!(
-            "connected + HELLO(version={}, peer={})",
-            peer_hello.version,
-            &peer_hello.node_id[..12]
-        ),
-        Err(err) => err,
+    let lease = match RelaySessionLease::acquire(relay_ws, &identity.wayfarer_id, "connect_probe") {
+        Ok(lease) => lease,
+        Err(err) => {
+            log_verbose(&format!(
+                "relay_connect_probe_skipped: relay_ws={} wayfarer={} reason={}",
+                relay_ws, identity.wayfarer_id, err
+            ));
+            return format!("skipped: {err}");
+        }
+    };
+
+    let mut socket = match open_relay_socket(relay_ws, auth_token) {
+        Ok(socket) => {
+            lease.transition("connected", "socket_connected");
+            socket
+        }
+        Err(err) => {
+            lease.transition("closing", "connect_failed");
+            return err;
+        }
+    };
+
+    lease.transition("hello_sent", "hello_dispatch");
+    match complete_hello_handshake(&mut socket, identity) {
+        Ok(peer_hello) => {
+            lease.transition("active", "hello_validated");
+            lease.transition("closing", "connect_probe_complete");
+            graceful_close_socket(
+                &mut socket,
+                relay_ws,
+                lease.attempt_id,
+                "probe_complete",
+                "connect_to_relay_gossipv1_with_auth",
+            );
+            format!(
+                "connected + HELLO(version={}, peer={})",
+                peer_hello.version,
+                &peer_hello.node_id[..12]
+            )
+        }
+        Err(err) => {
+            lease.transition("closing", "hello_failed");
+            graceful_close_socket(
+                &mut socket,
+                relay_ws,
+                lease.attempt_id,
+                "hello_failed",
+                "connect_to_relay_gossipv1_with_auth",
+            );
+            err
+        }
     }
 }
 
@@ -105,6 +291,24 @@ pub fn run_relay_encounter_gossipv1(
     auth_token: Option<&str>,
     trace_item_id: Option<&str>,
 ) -> Result<EncounterReport, String> {
+    run_relay_encounter_gossipv1_for_duration(
+        relay_ws,
+        identity,
+        auth_token,
+        trace_item_id,
+        Duration::from_secs(3),
+    )
+}
+
+pub fn run_relay_encounter_gossipv1_for_duration(
+    relay_ws: &str,
+    identity: &LocalIdentitySummary,
+    auth_token: Option<&str>,
+    trace_item_id: Option<&str>,
+    encounter_window: Duration,
+) -> Result<EncounterReport, String> {
+    let lease = RelaySessionLease::acquire(relay_ws, &identity.wayfarer_id, "encounter")
+        .map_err(|err| format!("relay encounter skipped: {err}"))?;
     log_verbose(&format!(
         "relay_encounter_open: relay_ws={} wayfarer={} auth={} trace_item_id={}",
         relay_ws,
@@ -112,8 +316,34 @@ pub fn run_relay_encounter_gossipv1(
         auth_token.is_some(),
         trace_item_id.unwrap_or("none")
     ));
-    let mut socket = open_relay_socket(relay_ws, auth_token)?;
-    let peer_hello = complete_hello_handshake(&mut socket, identity)?;
+    let mut socket = match open_relay_socket(relay_ws, auth_token) {
+        Ok(socket) => {
+            lease.transition("connected", "socket_connected");
+            socket
+        }
+        Err(err) => {
+            lease.transition("closing", "connect_failed");
+            return Err(err);
+        }
+    };
+    lease.transition("hello_sent", "hello_dispatch");
+    let peer_hello = match complete_hello_handshake(&mut socket, identity) {
+        Ok(peer_hello) => {
+            lease.transition("active", "hello_validated");
+            peer_hello
+        }
+        Err(err) => {
+            lease.transition("closing", "hello_failed");
+            graceful_close_socket(
+                &mut socket,
+                relay_ws,
+                lease.attempt_id,
+                "hello_failed",
+                "run_relay_encounter_gossipv1",
+            );
+            return Err(err);
+        }
+    };
     log_verbose(&format!(
         "relay_encounter_hello_ok: relay_ws={} peer_node={} peer_max_want={} peer_max_transfer={}",
         relay_ws, peer_hello.node_id, peer_hello.max_want, peer_hello.max_transfer
@@ -135,7 +365,7 @@ pub fn run_relay_encounter_gossipv1(
     let mut latest_summary: Option<crate::aethos_core::gossip_sync::SummaryFrame> = None;
     let mut relay_ingest_candidates = Vec::<String>::new();
     let relay_ingest_trusted = auth_token.is_some();
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + encounter_window.max(Duration::from_millis(250));
     let started_at = Instant::now();
     let mut recv_frame_count = 0usize;
     let mut saw_summary = false;
@@ -161,7 +391,24 @@ pub fn run_relay_encounter_gossipv1(
                 ));
                 break;
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                log_verbose(&format!(
+                    "relay_encounter_loop_read_failed: relay_ws={} elapsed_ms={} recv_frames={} error={}",
+                    relay_ws,
+                    started_at.elapsed().as_millis(),
+                    recv_frame_count,
+                    err
+                ));
+                lease.transition("closing", "read_failed");
+                graceful_close_socket(
+                    &mut socket,
+                    relay_ws,
+                    lease.attempt_id,
+                    "read_failed",
+                    "run_relay_encounter_gossipv1",
+                );
+                return Err(err);
+            }
         };
         recv_frame_count = recv_frame_count.saturating_add(1);
 
@@ -348,6 +595,14 @@ pub fn run_relay_encounter_gossipv1(
         saw_receipt,
         started_at.elapsed().as_millis()
     ));
+    lease.transition("closing", "encounter_complete");
+    graceful_close_socket(
+        &mut socket,
+        relay_ws,
+        lease.attempt_id,
+        "encounter_complete",
+        "run_relay_encounter_gossipv1",
+    );
     Ok(EncounterReport {
         transferred_items,
         pulled_messages,
@@ -389,7 +644,14 @@ fn open_relay_socket(relay_ws: &str, auth_token: Option<&str>) -> Result<RelaySo
     }
 
     connect(request)
-        .map(|(socket, _)| socket)
+        .map(|(socket, _)| {
+            log_verbose(&format!(
+                "relay_socket_connected: relay_ws={} max_frame_bytes={} framing=ws-binary",
+                relay_ws,
+                crate::aethos_core::gossip_sync::MAX_FRAME_BYTES
+            ));
+            socket
+        })
         .map_err(|err| format!("websocket handshake failed: {err}"))
 }
 
@@ -459,6 +721,13 @@ fn read_binary_frame(socket: &mut RelaySocket) -> Result<GossipSyncFrame, String
 }
 
 fn parse_relay_binary_message(raw: &[u8]) -> Result<GossipSyncFrame, String> {
+    log_verbose(&format!(
+        "relay_frame_recv_binary_raw: ws_bytes={} max_frame_bytes={} prefix_hex={}",
+        raw.len(),
+        crate::aethos_core::gossip_sync::MAX_FRAME_BYTES,
+        hex_prefix(raw, 16)
+    ));
+
     match decode_stream_frame(raw) {
         Ok(payload) => {
             log_verbose(&format!(
@@ -466,7 +735,29 @@ fn parse_relay_binary_message(raw: &[u8]) -> Result<GossipSyncFrame, String> {
                 raw.len(),
                 payload.len()
             ));
-            parse_frame(payload)
+            match parse_frame(payload) {
+                Ok(frame) => Ok(frame),
+                Err(payload_err) => {
+                    log_verbose(&format!(
+                        "relay_frame_parse_failed_prefixed_payload: framed_bytes={} payload_bytes={} error={}",
+                        raw.len(),
+                        payload.len(),
+                        payload_err
+                    ));
+                    match parse_frame(raw) {
+                        Ok(frame) => {
+                            log_verbose(&format!(
+                                "relay_frame_recv_binary: framing=raw-cbor-after-prefixed-failure bytes={}",
+                                raw.len()
+                            ));
+                            Ok(frame)
+                        }
+                        Err(raw_err) => Err(format!(
+                            "relay frame parse failed after prefixed decode (payload: {payload_err}; raw: {raw_err})"
+                        )),
+                    }
+                }
+            }
         }
         Err(prefix_err) => {
             log_verbose(&format!(
@@ -488,6 +779,37 @@ fn parse_relay_binary_message(raw: &[u8]) -> Result<GossipSyncFrame, String> {
             }
         }
     }
+}
+
+fn graceful_close_socket(
+    socket: &mut RelaySocket,
+    relay_ws: &str,
+    attempt_id: u64,
+    reason: &str,
+    callsite: &str,
+) {
+    log_verbose(&format!(
+        "relay_socket_close_initiated: relay_ws={} attempt_id={} reason={} callsite={}",
+        relay_ws, attempt_id, reason, callsite
+    ));
+    match socket.send(Message::Close(None)) {
+        Ok(_) => log_verbose(&format!(
+            "relay_socket_close_sent: relay_ws={} attempt_id={} reason={}",
+            relay_ws, attempt_id, reason
+        )),
+        Err(err) => log_verbose(&format!(
+            "relay_socket_close_send_failed: relay_ws={} attempt_id={} reason={} error={}",
+            relay_ws, attempt_id, reason, err
+        )),
+    }
+}
+
+fn hex_prefix(data: &[u8], count: usize) -> String {
+    data.iter()
+        .take(count)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 fn encode_stream_frame(payload: &[u8]) -> Result<Vec<u8>, String> {

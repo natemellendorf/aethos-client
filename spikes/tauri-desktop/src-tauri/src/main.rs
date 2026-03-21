@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -52,8 +53,8 @@ use crate::aethos_core::protocol::{
     build_envelope_payload_b64_from_utf8, decode_envelope_payload_b64, is_valid_wayfarer_id,
 };
 use crate::relay::client::{
-    connect_to_relay_gossipv1_with_auth, normalize_http_endpoint, run_relay_encounter_gossipv1,
-    to_ws_endpoint,
+    connect_to_relay_gossipv1_with_auth, normalize_http_endpoint, relay_session_snapshot,
+    run_relay_encounter_gossipv1, run_relay_encounter_gossipv1_for_duration, to_ws_endpoint,
 };
 
 const SHARE_QR_FILE_NAME: &str = "share-wayfarer-qr.png";
@@ -92,6 +93,73 @@ struct GossipStatus {
 
 static GOSSIP_RUNTIME: OnceLock<GossipRuntime> = OnceLock::new();
 static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
+static RELAY_WORKER_RUNTIME: OnceLock<RelayWorkerRuntime> = OnceLock::new();
+
+struct RelayWorkerRuntime {
+    running: AtomicBool,
+    command_tx: Mutex<Option<Sender<RelayWorkerCommand>>>,
+    sync_epoch: AtomicU64,
+    last_status: Mutex<String>,
+    last_activity_ms: AtomicU64,
+}
+
+enum RelayWorkerCommand {
+    SyncNow(&'static str),
+}
+
+impl RelayWorkerRuntime {
+    fn new() -> Self {
+        Self {
+            running: AtomicBool::new(false),
+            command_tx: Mutex::new(None),
+            sync_epoch: AtomicU64::new(1),
+            last_status: Mutex::new("idle".to_string()),
+            last_activity_ms: AtomicU64::new(0),
+        }
+    }
+}
+
+fn relay_worker_runtime() -> &'static RelayWorkerRuntime {
+    RELAY_WORKER_RUNTIME.get_or_init(RelayWorkerRuntime::new)
+}
+
+fn set_relay_worker_status(status: &str) {
+    let runtime = relay_worker_runtime();
+    if let Ok(mut slot) = runtime.last_status.lock() {
+        *slot = status.to_string();
+    }
+    runtime.last_activity_ms.store(now_unix_ms(), Ordering::SeqCst);
+}
+
+fn request_relay_sync(reason: &str) {
+    let runtime = relay_worker_runtime();
+    runtime.sync_epoch.fetch_add(1, Ordering::SeqCst);
+    if let Ok(slot) = runtime.command_tx.lock() {
+        if let Some(tx) = slot.as_ref() {
+            let command_reason = match reason {
+                "bootstrap_state" => "bootstrap_state",
+                "settings_updated" => "settings_updated",
+                "send_message" => "send_message",
+                "sync_inbox_command" => "sync_inbox_command",
+                "relay_diagnostics" => "relay_diagnostics",
+                _ => "manual",
+            };
+            let _ = tx.send(RelayWorkerCommand::SyncNow(command_reason));
+        }
+    }
+    log_verbose(&format!("relay_worker_sync_requested: reason={reason}"));
+}
+
+fn relay_worker_wait_for_command(
+    rx: &Receiver<RelayWorkerCommand>,
+    timeout: Duration,
+) -> Option<RelayWorkerCommand> {
+    match rx.recv_timeout(timeout) {
+        Ok(command) => Some(command),
+        Err(mpsc::RecvTimeoutError::Timeout) => None,
+        Err(mpsc::RecvTimeoutError::Disconnected) => None,
+    }
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -324,6 +392,8 @@ fn bootstrap_state() -> Result<BootstrapState, String> {
     set_verbose_logging_enabled(settings.verbose_logging_enabled);
     start_gossip_worker_if_needed(settings.gossip_sync_enabled);
     set_gossip_enabled(settings.gossip_sync_enabled);
+    start_relay_worker_if_needed();
+    request_relay_sync("bootstrap_state");
     let identity = ensure_local_identity()?;
     let contacts = load_contact_aliases()?;
     let chat = load_chat_state()?;
@@ -364,6 +434,7 @@ fn update_settings(settings: AppSettings) -> Result<AppSettings, String> {
     set_verbose_logging_enabled(saved.verbose_logging_enabled);
     start_gossip_worker_if_needed(saved.gossip_sync_enabled);
     set_gossip_enabled(saved.gossip_sync_enabled);
+    request_relay_sync("settings_updated");
     Ok(saved)
 }
 
@@ -409,7 +480,6 @@ fn relay_health_status_blocking() -> Result<RelayHealthStatus, String> {
     }
 
     let identity = ensure_local_identity()?;
-    let auth = std::env::var("AETHOS_RELAY_AUTH_TOKEN").ok();
     let primary_endpoint = settings
         .relay_endpoints
         .first()
@@ -419,15 +489,39 @@ fn relay_health_status_blocking() -> Result<RelayHealthStatus, String> {
         .get(1)
         .map(|value| to_ws_endpoint(&normalize_http_endpoint(value)));
 
+    let worker_status = relay_worker_runtime()
+        .last_status
+        .lock()
+        .map(|value| value.clone())
+        .unwrap_or_else(|_| "status unavailable".to_string());
+
     let primary_status = primary_endpoint
-        .map(|relay_ws| connect_to_relay_gossipv1_with_auth(&relay_ws, &identity, auth.as_deref()))
+        .map(|relay_ws| {
+            if let Some(active) = relay_session_snapshot(&relay_ws, &identity.wayfarer_id) {
+                return format!(
+                    "active relay session (attempt_id={} state={} trigger={} age_ms={})",
+                    active.attempt_id, active.state, active.trigger, active.age_ms
+                );
+            }
+            format!("idle (worker={worker_status})")
+        })
         .unwrap_or_else(|| "idle".to_string());
     let secondary_status = secondary_endpoint
-        .map(|relay_ws| connect_to_relay_gossipv1_with_auth(&relay_ws, &identity, auth.as_deref()))
+        .map(|relay_ws| {
+            if let Some(active) = relay_session_snapshot(&relay_ws, &identity.wayfarer_id) {
+                return format!(
+                    "active relay session (attempt_id={} state={} trigger={} age_ms={})",
+                    active.attempt_id, active.state, active.trigger, active.age_ms
+                );
+            }
+            format!("idle (worker={worker_status})")
+        })
         .unwrap_or_else(|| "idle".to_string());
 
-    let primary_ok = primary_status.contains("connected + HELLO");
-    let secondary_ok = secondary_status.contains("connected + HELLO");
+    let primary_ok =
+        primary_status.contains("connected + HELLO") || primary_status.contains("active relay session");
+    let secondary_ok =
+        secondary_status.contains("connected + HELLO") || secondary_status.contains("active relay session");
     let (chip_text, chip_state) = match (primary_ok, secondary_ok) {
         (true, true) => ("Relays: healthy (2/2)".to_string(), "ok".to_string()),
         (true, false) | (false, true) => {
@@ -533,7 +627,7 @@ fn send_message_blocking(request: SendMessageRequest) -> Result<SendMessageRespo
     let settings = load_app_settings()?;
     let identity = ensure_local_identity()?;
     let author_signing_seed = load_local_signing_key_seed()?;
-    let mut contacts = load_contact_aliases()?;
+    let contacts = load_contact_aliases()?;
     let expiry_ms = now_ms.saturating_add(settings.message_ttl_seconds.saturating_mul(1000));
     let local_id = format!("local-{now_ms}-{:08x}", rand::random::<u32>());
     let outbound_payload = build_outbound_chat_payload(body, &local_id, now_ms, attachment.as_ref());
@@ -583,26 +677,20 @@ fn send_message_blocking(request: SendMessageRequest) -> Result<SendMessageRespo
     let relay_enabled = settings.relay_sync_enabled && relay_http.is_some();
 
     let mut encounter_status = "message queued locally (LAN-only)".to_string();
-    let mut pulled_messages_count = 0usize;
+    let pulled_messages_count = 0usize;
 
     if relay_enabled {
         let relay_ws = to_ws_endpoint(relay_http.as_deref().unwrap_or_default());
-        let auth = std::env::var("AETHOS_RELAY_AUTH_TOKEN").ok();
-        match run_relay_encounter_gossipv1(&relay_ws, &identity, auth.as_deref(), Some(&item_id)) {
-            Ok(report) => {
-                pulled_messages_count = report.pulled_messages.len();
-                encounter_status = format!(
-                    "encounter complete: {} transfer(s), {} pulled",
-                    report.transferred_items, pulled_messages_count
-                );
-                mark_outgoing_message(&mut chat, wayfarer_id, &local_id, &item_id, None);
-                merge_pulled_messages(&mut chat, &mut contacts, report.pulled_messages);
-            }
-            Err(err) => {
-                encounter_status = format!("message queued locally; awaiting ACK ({err})");
-                mark_outgoing_message(&mut chat, wayfarer_id, &local_id, &item_id, Some(err));
-            }
-        }
+        request_relay_sync("send_message");
+        encounter_status = if let Some(active) = relay_session_snapshot(&relay_ws, &identity.wayfarer_id) {
+            format!(
+                "message queued locally; relay sync active (attempt_id={} state={} trigger={})",
+                active.attempt_id, active.state, active.trigger
+            )
+        } else {
+            "message queued locally; relay worker scheduled".to_string()
+        };
+        mark_outgoing_message(&mut chat, wayfarer_id, &local_id, &item_id, None);
     } else {
         mark_outgoing_message(&mut chat, wayfarer_id, &local_id, &item_id, None);
     }
@@ -646,35 +734,24 @@ fn sync_inbox_blocking() -> Result<SyncInboxResponse, String> {
         });
     }
 
-    let relay_http = settings
-        .relay_endpoints
-        .first()
-        .cloned()
-        .ok_or_else(|| "no relay endpoints configured".to_string())
-        .map(|endpoint| normalize_http_endpoint(&endpoint))?;
-    let relay_ws = to_ws_endpoint(&relay_http);
-    let identity = ensure_local_identity()?;
-    let auth = std::env::var("AETHOS_RELAY_AUTH_TOKEN").ok();
+    if settings.relay_endpoints.is_empty() {
+        return Ok(SyncInboxResponse {
+            chat: load_chat_state()?,
+            contacts: load_contact_aliases()?,
+            pulled_messages: 0,
+            status: "no relay endpoints configured".to_string(),
+        });
+    }
 
-    let report = run_relay_encounter_gossipv1(&relay_ws, &identity, auth.as_deref(), None)?;
-
-    let mut chat = load_chat_state()?;
-    let mut contacts = load_contact_aliases()?;
-    let pulled = report.pulled_messages.len();
-    merge_pulled_messages(&mut chat, &mut contacts, report.pulled_messages);
-    save_chat_state(&chat)?;
-    save_contact_aliases(&contacts)?;
-    emit_chat_snapshot_event_best_effort("sync_inbox_blocking");
+    request_relay_sync("sync_inbox_command");
+    let chat = load_chat_state()?;
+    let contacts = load_contact_aliases()?;
 
     Ok(SyncInboxResponse {
         chat,
         contacts,
-        pulled_messages: pulled,
-        status: if pulled == 0 {
-            "inbox sync complete (no new messages)".to_string()
-        } else {
-            format!("inbox sync complete ({} new message(s))", pulled)
-        },
+        pulled_messages: 0,
+        status: "relay sync scheduled".to_string(),
     })
 }
 
@@ -747,6 +824,7 @@ async fn run_relay_diagnostics(
 fn run_relay_diagnostics_blocking(
     request: Option<RelayDiagnosticsRequest>,
 ) -> Result<Vec<RelayEndpointDiagnostics>, String> {
+    request_relay_sync("relay_diagnostics");
     let settings = load_app_settings()?;
     let identity = ensure_local_identity()?;
     let auth_token = request.as_ref().and_then(|value| value.auth_token.clone());
@@ -848,6 +926,196 @@ fn current_gossip_status() -> GossipStatus {
         last_activity_ms: runtime.last_activity_ms.load(Ordering::SeqCst),
         last_event,
     }
+}
+
+fn start_relay_worker_if_needed() {
+    let runtime = relay_worker_runtime();
+    if runtime.running.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let (tx, rx) = mpsc::channel::<RelayWorkerCommand>();
+    if let Ok(mut slot) = runtime.command_tx.lock() {
+        *slot = Some(tx);
+    }
+
+    thread::spawn(move || {
+        let runtime = relay_worker_runtime();
+        let auth = std::env::var("AETHOS_RELAY_AUTH_TOKEN").ok();
+        let mut relay_http_endpoints: Vec<String> = Vec::new();
+        let mut relay_ws_endpoints: Vec<String> = Vec::new();
+        let mut relay_failures: Vec<u32> = Vec::new();
+        let mut relay_next_attempt_at: Vec<Instant> = Vec::new();
+        let mut rr_cursor = 0usize;
+        let mut known_sync_epoch = runtime.sync_epoch.load(Ordering::SeqCst);
+
+        set_relay_worker_status("starting");
+        log_verbose("relay_worker_started");
+
+        loop {
+            let settings = match load_app_settings() {
+                Ok(settings) => settings,
+                Err(err) => {
+                    set_relay_worker_status("settings_read_failed");
+                    log_info(&format!("relay_worker_settings_read_failed: {err}"));
+                    thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+            };
+
+            if !settings.relay_sync_enabled {
+                set_relay_worker_status("disabled");
+                let _ = relay_worker_wait_for_command(&rx, Duration::from_millis(800));
+                continue;
+            }
+
+            let endpoints = settings
+                .relay_endpoints
+                .iter()
+                .map(|endpoint| normalize_http_endpoint(endpoint))
+                .filter(|endpoint| !endpoint.trim().is_empty())
+                .collect::<Vec<_>>();
+
+            if endpoints.is_empty() {
+                set_relay_worker_status("no_relays_configured");
+                let _ = relay_worker_wait_for_command(&rx, Duration::from_millis(800));
+                continue;
+            }
+
+            if endpoints != relay_http_endpoints {
+                relay_http_endpoints = endpoints.clone();
+                relay_ws_endpoints = endpoints.into_iter().map(|endpoint| to_ws_endpoint(&endpoint)).collect();
+                relay_failures = vec![0; relay_ws_endpoints.len()];
+                relay_next_attempt_at = vec![Instant::now(); relay_ws_endpoints.len()];
+                rr_cursor = 0;
+                known_sync_epoch = runtime.sync_epoch.fetch_add(1, Ordering::SeqCst);
+                log_verbose("relay_worker_endpoints_reloaded");
+            }
+
+            let identity = match ensure_local_identity() {
+                Ok(identity) => identity,
+                Err(err) => {
+                    set_relay_worker_status("identity_unavailable");
+                    log_info(&format!("relay_worker_identity_unavailable: {err}"));
+                    let _ = relay_worker_wait_for_command(&rx, Duration::from_secs(1));
+                    continue;
+                }
+            };
+
+            let sync_epoch = runtime.sync_epoch.load(Ordering::SeqCst);
+            let sync_trigger = if sync_epoch != known_sync_epoch {
+                known_sync_epoch = sync_epoch;
+                match relay_worker_wait_for_command(&rx, Duration::from_millis(1)) {
+                    Some(RelayWorkerCommand::SyncNow(reason)) => reason,
+                    None => "periodic",
+                }
+            } else {
+                match relay_worker_wait_for_command(&rx, Duration::from_millis(250)) {
+                    Some(RelayWorkerCommand::SyncNow(reason)) => {
+                        known_sync_epoch = runtime.sync_epoch.load(Ordering::SeqCst);
+                        reason
+                    }
+                    None => "periodic",
+                }
+            };
+
+            let now = Instant::now();
+            let mut selected_idx: Option<usize> = None;
+            for offset in 0..relay_ws_endpoints.len() {
+                let idx = (rr_cursor + offset) % relay_ws_endpoints.len();
+                if relay_next_attempt_at[idx] <= now {
+                    selected_idx = Some(idx);
+                    rr_cursor = (idx + 1) % relay_ws_endpoints.len();
+                    break;
+                }
+            }
+
+            let Some(relay_slot) = selected_idx else {
+                set_relay_worker_status("backoff_wait");
+                let _ = relay_worker_wait_for_command(&rx, Duration::from_millis(350));
+                continue;
+            };
+
+            let relay_ws = relay_ws_endpoints[relay_slot].clone();
+
+            set_relay_worker_status(&format!(
+                "connecting slot={} relay={}",
+                relay_slot, relay_ws
+            ));
+            log_verbose(&format!(
+                "relay_worker_sync_attempt: slot={} relay_ws={} trigger={}",
+                relay_slot, relay_ws, sync_trigger
+            ));
+
+            match run_relay_encounter_gossipv1_for_duration(
+                &relay_ws,
+                &identity,
+                auth.as_deref(),
+                None,
+                Duration::from_secs(45),
+            ) {
+                Ok(report) => {
+                    relay_failures[relay_slot] = 0;
+                    relay_next_attempt_at[relay_slot] = Instant::now();
+                    let pulled = report.pulled_messages.len();
+                    if let Err(err) = apply_relay_pulled_messages(
+                        report.pulled_messages,
+                        "relay_worker_encounter",
+                    ) {
+                        log_info(&format!(
+                            "relay_worker_apply_pulled_messages_failed: slot={} relay_ws={} error={}",
+                            relay_slot, relay_ws, err
+                        ));
+                    }
+                    set_relay_worker_status(&format!(
+                        "active slot={} relay={} transfers={} pulled={}",
+                        relay_slot, relay_ws, report.transferred_items, pulled
+                    ));
+                    log_verbose(&format!(
+                        "relay_worker_sync_success: slot={} relay_ws={} transfers={} pulled={}",
+                        relay_slot, relay_ws, report.transferred_items, pulled
+                    ));
+                }
+                Err(err) => {
+                    relay_failures[relay_slot] = relay_failures[relay_slot].saturating_add(1);
+                    let backoff_secs = 2_u64
+                        .saturating_pow(relay_failures[relay_slot].saturating_sub(1).min(6));
+                    relay_next_attempt_at[relay_slot] =
+                        Instant::now() + Duration::from_secs(backoff_secs.min(60));
+                    set_relay_worker_status(&format!(
+                        "disconnected slot={} relay={} error={}",
+                        relay_slot, relay_ws, err
+                    ));
+                    log_info(&format!(
+                        "relay_worker_sync_failed: slot={} relay_ws={} error={} backoff_s={}",
+                        relay_slot,
+                        relay_ws,
+                        err,
+                        backoff_secs.min(60)
+                    ));
+                }
+            }
+        }
+    });
+}
+
+fn apply_relay_pulled_messages(
+    pulled_messages: Vec<crate::relay::client::EncounterMessagePreview>,
+    context: &str,
+) -> Result<usize, String> {
+    if pulled_messages.is_empty() {
+        return Ok(0);
+    }
+
+    let mut chat = load_chat_state()?;
+    let mut contacts = load_contact_aliases()?;
+    let pulled_count = pulled_messages.len();
+    merge_pulled_messages(&mut chat, &mut contacts, pulled_messages);
+    save_chat_state(&chat)?;
+    save_contact_aliases(&contacts)?;
+    emit_chat_snapshot_event_best_effort(context);
+    emit_sound_event_best_effort("sync", context);
+    Ok(pulled_count)
 }
 
 fn start_gossip_worker_if_needed(initial_enabled: bool) {
