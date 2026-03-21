@@ -672,6 +672,7 @@ fn send_message_blocking(request: SendMessageRequest) -> Result<SendMessageRespo
         text: body.to_string(),
         timestamp: format_timestamp_from_unix(now_secs),
         created_at_unix: now_secs,
+        created_at_unix_ms: now_ms,
         direction: ChatDirection::Outgoing,
         seen: true,
         manifest_id_hex: Some(decoded.manifest_id_hex),
@@ -1917,12 +1918,21 @@ fn merge_pulled_messages(
             continue;
         }
 
-        let message_unix = extract_sent_at_unix_if_json(&pulled.text).unwrap_or(pulled.received_at_unix);
+        let message_unix_ms =
+            extract_sent_at_unix_ms_if_json(&pulled.text).unwrap_or_else(|| {
+                if pulled.received_at_unix > 1_000_000_000_000 {
+                    pulled.received_at_unix as u64
+                } else {
+                    (pulled.received_at_unix.max(0) as u64).saturating_mul(1000)
+                }
+            });
+        let message_unix = (message_unix_ms / 1000) as i64;
         thread.push(ChatMessage {
             msg_id: pulled.item_id,
             text: extract_chat_text_if_json(&pulled.text),
             timestamp: format_timestamp_from_unix(message_unix),
             created_at_unix: message_unix,
+            created_at_unix_ms: message_unix_ms,
             direction: ChatDirection::Incoming,
             seen: seen_on_insert,
             manifest_id_hex: pulled.manifest_id_hex,
@@ -2041,13 +2051,12 @@ fn extract_chat_text_if_json(input: &str) -> String {
     input.to_string()
 }
 
-fn extract_sent_at_unix_if_json(input: &str) -> Option<i64> {
+fn extract_sent_at_unix_ms_if_json(input: &str) -> Option<u64> {
     let value = serde_json::from_str::<serde_json::Value>(input).ok()?;
-    let sent_ms = value
+    value
         .get("sent_at_unix_ms")
         .or_else(|| value.get("sentAtUnixMs"))
-        .and_then(|v| v.as_u64())?;
-    Some((sent_ms / 1000) as i64)
+        .and_then(|v| v.as_u64())
 }
 
 fn sort_thread_messages(thread: &mut [ChatMessage]) {
@@ -2654,7 +2663,7 @@ mod tests {
     #[test]
     fn outbound_chat_payload_exposes_sent_at_for_thread_sorting() {
         let payload = build_outbound_chat_payload("hello", "local-123", 1700000000123, None);
-        assert_eq!(extract_sent_at_unix_if_json(&payload), Some(1_700_000_000));
+        assert_eq!(extract_sent_at_unix_ms_if_json(&payload), Some(1_700_000_000_123));
     }
 
     #[test]

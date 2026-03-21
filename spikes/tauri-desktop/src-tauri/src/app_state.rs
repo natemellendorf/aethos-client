@@ -56,6 +56,9 @@ pub struct ChatMessage {
     #[serde(alias = "created_at_unix")]
     #[serde(default)]
     pub created_at_unix: i64,
+    #[serde(alias = "created_at_unix_ms")]
+    #[serde(default)]
+    pub created_at_unix_ms: u64,
     pub direction: ChatDirection,
     #[serde(default)]
     pub seen: bool,

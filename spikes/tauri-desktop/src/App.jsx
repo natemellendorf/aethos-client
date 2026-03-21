@@ -56,10 +56,51 @@ function tinyId(id = "") {
 }
 
 function formatMessageTimestamp(message) {
-  const raw = Number(message?.createdAtUnix ?? message?.timestamp);
-  if (!Number.isFinite(raw) || raw <= 0) return String(message?.timestamp || "");
-  const ms = raw > 1_000_000_000_000 ? raw : raw * 1000;
-  return new Date(ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" });
+  const ms = messageUnixMs(message);
+  if (!Number.isFinite(ms) || ms <= 0) return String(message?.timestamp || "");
+  return new Date(ms).toLocaleTimeString([], {
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+    fractionalSecondDigits: 3
+  });
+}
+
+function parseSentAtUnixMsFromText(input) {
+  if (typeof input !== "string" || input.length === 0) return null;
+  try {
+    const value = JSON.parse(input);
+    const sentMs = Number(value?.sent_at_unix_ms ?? value?.sentAtUnixMs);
+    return Number.isFinite(sentMs) && sentMs > 0 ? sentMs : null;
+  } catch {
+    return null;
+  }
+}
+
+function messageUnixMs(message) {
+  const createdAtMs = Number(message?.createdAtUnixMs);
+  if (Number.isFinite(createdAtMs) && createdAtMs > 0) return createdAtMs;
+
+  const createdRaw = Number(message?.createdAtUnix);
+  if (Number.isFinite(createdRaw) && createdRaw > 0) {
+    return createdRaw > 1_000_000_000_000 ? createdRaw : createdRaw * 1000;
+  }
+
+  const timestampRaw = Number(message?.timestamp);
+  if (Number.isFinite(timestampRaw) && timestampRaw > 0) {
+    return timestampRaw > 1_000_000_000_000 ? timestampRaw : timestampRaw * 1000;
+  }
+
+  const localIdMatch = String(message?.msgId || "").match(/^local-(\d+)-/);
+  if (localIdMatch) {
+    const localMs = Number(localIdMatch[1]);
+    if (Number.isFinite(localMs) && localMs > 0) return localMs;
+  }
+
+  const payloadSentMs = parseSentAtUnixMsFromText(message?.text);
+  if (Number.isFinite(payloadSentMs) && payloadSentMs > 0) return payloadSentMs;
+
+  return 0;
 }
 
 function createOptimisticOutgoingMessage(localId, text) {
@@ -196,6 +237,7 @@ export default function App() {
   const [logStreaming, setLogStreaming] = useState(true);
   const [logFilter, setLogFilter] = useState("all");
   const [arrivingMessageIds, setArrivingMessageIds] = useState({});
+  const [confirmDialog, setConfirmDialog] = useState(null);
   const logContainerRef = useRef(null);
   const threadContainerRef = useRef(null);
   const attachmentInputRef = useRef(null);
@@ -209,7 +251,16 @@ export default function App() {
   );
 
   const selectedContactId = chat.selectedContact;
-  const selectedThread = selectedContactId ? chat.threads[selectedContactId] || [] : [];
+  const selectedThread = useMemo(() => {
+    if (!selectedContactId) return [];
+    const thread = chat.threads[selectedContactId] || [];
+    return [...thread].sort((left, right) => {
+      const leftMs = messageUnixMs(left);
+      const rightMs = messageUnixMs(right);
+      if (leftMs !== rightMs) return leftMs - rightMs;
+      return String(left.msgId || "").localeCompare(String(right.msgId || ""));
+    });
+  }, [chat.threads, selectedContactId]);
 
   useEffect(() => {
     const baseline = new Set(selectedThread.map((message) => message.msgId));
@@ -528,9 +579,12 @@ export default function App() {
     }
   };
 
-  const deleteMessage = async (msgId) => {
+  const requestConfirmation = ({ title, body, confirmLabel, confirmClassName, onConfirm }) => {
+    setConfirmDialog({ title, body, confirmLabel, confirmClassName, onConfirm });
+  };
+
+  const performDeleteMessage = async (msgId) => {
     if (!selectedContactId) return;
-    if (!window.confirm("Delete this message? This cannot be undone.")) return;
     try {
       const nextChat = {
         ...chat,
@@ -547,9 +601,18 @@ export default function App() {
     }
   };
 
-  const clearThreadMessages = async () => {
+  const deleteMessage = (msgId) => {
+    requestConfirmation({
+      title: "Delete message?",
+      body: "This permanently removes the selected message from local chat history.",
+      confirmLabel: "Delete",
+      confirmClassName: "bg-red-600 text-white hover:bg-red-500",
+      onConfirm: () => performDeleteMessage(msgId)
+    });
+  };
+
+  const performClearThreadMessages = async () => {
     if (!selectedContactId) return setStatus("Select a thread first");
-    if (!window.confirm("Delete all messages in this thread? This cannot be undone.")) return;
     try {
       const nextChat = {
         ...chat,
@@ -566,8 +629,17 @@ export default function App() {
     }
   };
 
-  const clearAllMessages = async () => {
-    if (!window.confirm("Delete ALL local messages on this client? This cannot be undone.")) return;
+  const clearThreadMessages = () => {
+    requestConfirmation({
+      title: "Clear this thread?",
+      body: "This permanently removes all local messages in the current thread.",
+      confirmLabel: "Clear Thread",
+      confirmClassName: "bg-red-600 text-white hover:bg-red-500",
+      onConfirm: performClearThreadMessages
+    });
+  };
+
+  const performClearAllMessages = async () => {
     try {
       const nextChat = {
         ...chat,
@@ -580,6 +652,24 @@ export default function App() {
     } catch (error) {
       setStatus(`Delete all failed: ${String(error)}`);
       soundManager.play("error");
+    }
+  };
+
+  const clearAllMessages = () => {
+    requestConfirmation({
+      title: "Delete all messages?",
+      body: "This permanently removes all local messages on this client.",
+      confirmLabel: "Delete All",
+      confirmClassName: "bg-red-600 text-white hover:bg-red-500",
+      onConfirm: performClearAllMessages
+    });
+  };
+
+  const handleConfirmDialogProceed = async () => {
+    const action = confirmDialog?.onConfirm;
+    setConfirmDialog(null);
+    if (typeof action === "function") {
+      await action();
     }
   };
 
@@ -987,34 +1077,11 @@ export default function App() {
               </CardContent>
             </Card>
             <Card className="flex min-h-[360px] flex-col lg:h-full">
-              <CardHeader className="p-3 pb-1">
-                <div className="flex items-center justify-between gap-2">
-                  <CardTitle className="text-base">{selectedName}</CardTitle>
-                  <Button
-                    variant="destructive"
-                    size="sm"
-                    className="h-7 px-2"
-                    disabled={!selectedContactId || selectedThread.length === 0}
-                    onClick={clearThreadMessages}
-                  >
-                    Clear Thread
-                  </Button>
-                </div>
-              </CardHeader>
+              <CardHeader className="p-3 pb-1"><CardTitle className="text-base">{selectedName}</CardTitle></CardHeader>
               <CardContent className="flex min-h-0 flex-1 flex-col p-3 pt-1">
                 <div ref={threadContainerRef} className="mb-1.5 min-h-0 flex-1 space-y-2 overflow-auto rounded-lg border border-border/60 bg-background/40 p-2.5">
                   {selectedThread.length === 0 ? <p className="text-sm text-muted-foreground">No messages in this thread yet.</p> : selectedThread.map((m) => (
                     <div key={m.msgId} className={cn("message-bubble max-w-[85%] rounded-xl px-3 py-2 text-sm", m.direction === "Incoming" ? "message-bubble-incoming" : "message-bubble-outgoing ml-auto", arrivingMessageIds[m.msgId] ? "message-arrive" : "") }>
-                      <div className="mb-1 flex justify-end">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="h-6 px-2 text-[10px]"
-                          onClick={() => deleteMessage(m.msgId)}
-                        >
-                          Delete
-                        </Button>
-                      </div>
                       {m.text ? <p>{m.text}</p> : null}
                       {m.attachment ? (
                         <div className="mt-1.5 rounded-md border border-cyan-300/30 bg-slate-900/35 p-2 text-xs">
@@ -1045,9 +1112,17 @@ export default function App() {
                           ) : null}
                         </div>
                       ) : null}
-                      <div className="mt-1 flex items-center gap-2 text-[11px] text-slate-300">
+                      <div className="mt-1 flex items-center justify-end gap-2 text-[11px] text-slate-300">
                         <span>{formatMessageTimestamp(m)}</span>
                         {formatOutgoingStatus(m) ? <span className="text-cyan-200/90">{formatOutgoingStatus(m)}</span> : null}
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-6 px-2 text-[10px]"
+                          onClick={() => deleteMessage(m.msgId)}
+                        >
+                          Delete
+                        </Button>
                       </div>
                     </div>
                   ))}
@@ -1069,6 +1144,13 @@ export default function App() {
                       <Button variant="ghost" size="sm" className="h-6 px-2" onClick={clearAttachment}>Remove</Button>
                     </div>
                   ) : null}
+                  <Button
+                    className="ml-auto h-8"
+                    disabled={!selectedContactId || selectedThread.length === 0}
+                    onClick={clearThreadMessages}
+                  >
+                    Clear Thread
+                  </Button>
                 </div>
                 <Textarea
                   value={composer}
@@ -1095,6 +1177,21 @@ export default function App() {
             </Card>
           </div>
         )}
+
+        {confirmDialog ? (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 p-4">
+            <div className="w-full max-w-md rounded-xl border border-border/70 bg-slate-900 p-4 shadow-xl">
+              <h3 className="text-base font-semibold text-slate-100">{confirmDialog.title}</h3>
+              <p className="mt-1 text-sm text-slate-300">{confirmDialog.body}</p>
+              <div className="mt-4 flex justify-end gap-2">
+                <Button variant="ghost" onClick={() => setConfirmDialog(null)}>Cancel</Button>
+                <Button className={confirmDialog.confirmClassName || ""} onClick={handleConfirmDialogProceed}>
+                  {confirmDialog.confirmLabel || "Confirm"}
+                </Button>
+              </div>
+            </div>
+          </div>
+        ) : null}
 
         {tab === "contacts" && (
           <div className="grid gap-3 lg:grid-cols-2">
