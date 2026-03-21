@@ -73,6 +73,7 @@ const LAN_FALLBACK_TRANSFER_MAX_ITEMS: u32 = 2;
 const LAN_FALLBACK_TRANSFER_MAX_BYTES: u64 = 1024;
 const LAN_DUP_REQUEST_COOLDOWN_MS: u64 = 700;
 const LAN_FALLBACK_CHUNK_PACING_MS: u64 = 3;
+const LAN_OUTBOUND_REQUEST_DEBOUNCE_MS: u64 = 700;
 
 struct GossipRuntime {
     enabled: AtomicBool,
@@ -1172,6 +1173,7 @@ fn start_gossip_worker_if_needed(initial_enabled: bool) {
         let mut peer_tcp_capable_by_ip: HashMap<String, bool> = HashMap::new();
         let mut tcp_backoff_until_by_ip: HashMap<String, Instant> = HashMap::new();
         let mut recent_served_request_by_peer: HashMap<String, (u64, Instant)> = HashMap::new();
+        let mut recent_outbound_request_by_peer: HashMap<String, (u64, Instant)> = HashMap::new();
         let tcp_listener = match bind_gossip_tcp_listener() {
             Ok(listener) => Some(listener),
             Err(err) => {
@@ -1239,6 +1241,7 @@ fn start_gossip_worker_if_needed(initial_enabled: bool) {
                         &mut peer_tcp_capable_by_ip,
                         &mut tcp_backoff_until_by_ip,
                         &mut recent_served_request_by_peer,
+                        &mut recent_outbound_request_by_peer,
                         runtime,
                     ) {
                         log_info(&format!("gossip_frame_handle_error from {source}: {err}"));
@@ -1303,6 +1306,7 @@ fn handle_gossip_frame(
     peer_tcp_capable_by_ip: &mut HashMap<String, bool>,
     tcp_backoff_until_by_ip: &mut HashMap<String, Instant>,
     recent_served_request_by_peer: &mut HashMap<String, (u64, Instant)>,
+    recent_outbound_request_by_peer: &mut HashMap<String, (u64, Instant)>,
     runtime: &GossipRuntime,
 ) -> Result<(), String> {
     let frame = parse_gossip_frame(raw)?;
@@ -1342,15 +1346,10 @@ fn handle_gossip_frame(
                 summary.item_count,
                 summary.preview_item_ids.as_ref().map(|v| v.len()).unwrap_or(0)
             ));
-            let request = build_request_from_summary(&summary, 256)?;
-            if let GossipSyncFrame::Request(request_frame) = &request {
-                log_verbose(&format!(
-                    "gossip_send_request_from_summary: to={} want_items={}",
-                    source,
-                    request_frame.want.len()
-                ));
-            }
-            let _ = send_gossip_frame(socket, &source.ip().to_string(), source.port(), &request);
+            log_verbose(&format!(
+                "gossip_request_from_summary_skipped: to={} reason=prefer_relay_ingest_candidates",
+                source
+            ));
         }
         GossipSyncFrame::RelayIngest(ingest) => {
             log_verbose(&format!(
@@ -1366,11 +1365,29 @@ fn handle_gossip_frame(
             missing_item_ids.sort();
             let request = build_gossip_request_frame(missing_item_ids, 256)?;
             if let GossipSyncFrame::Request(request_frame) = &request {
+                let peer_key = source.ip().to_string();
+                let fingerprint = request_fingerprint(&request_frame.want);
+                if let Some((previous_fingerprint, seen_at)) =
+                    recent_outbound_request_by_peer.get(&peer_key)
+                {
+                    if *previous_fingerprint == fingerprint
+                        && seen_at.elapsed() < Duration::from_millis(LAN_OUTBOUND_REQUEST_DEBOUNCE_MS)
+                    {
+                        log_verbose(&format!(
+                            "gossip_outbound_request_debounced: to={} want_items={} debounce_ms={}",
+                            source,
+                            request_frame.want.len(),
+                            LAN_OUTBOUND_REQUEST_DEBOUNCE_MS
+                        ));
+                        return Ok(());
+                    }
+                }
                 log_verbose(&format!(
                     "gossip_send_request_from_relay_ingest: to={} want_items={}",
                     source,
                     request_frame.want.len()
                 ));
+                recent_outbound_request_by_peer.insert(peer_key, (fingerprint, Instant::now()));
             }
             let _ = send_gossip_frame(socket, &source.ip().to_string(), source.port(), &request);
         }
@@ -1464,6 +1481,23 @@ fn handle_gossip_frame(
                 &transfer.objects,
                 now_unix_ms(),
             )?;
+
+            if !result.rejected_items.is_empty() {
+                let mut reasons = std::collections::BTreeMap::<String, usize>::new();
+                for rejected in &result.rejected_items {
+                    *reasons.entry(rejected.code.clone()).or_insert(0) += 1;
+                }
+                let reason_parts = reasons
+                    .into_iter()
+                    .map(|(code, count)| format!("{}:{}", code, count))
+                    .collect::<Vec<_>>();
+                log_verbose(&format!(
+                    "gossip_transfer_rejected_summary: from={} rejected_total={} reasons={}",
+                    source,
+                    result.rejected_items.len(),
+                    reason_parts.join(",")
+                ));
+            }
 
             if !result.new_messages.is_empty() {
                 let imported_count = result.new_messages.len();
