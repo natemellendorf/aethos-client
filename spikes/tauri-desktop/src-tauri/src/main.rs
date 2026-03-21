@@ -10,6 +10,7 @@ mod aethos_core;
 mod relay;
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
@@ -64,6 +65,10 @@ const CHAT_SNAPSHOT_EVENT: &str = "chat_snapshot";
 const SOUND_EVENT: &str = "sound_event";
 const MAX_ATTACHMENT_BYTES: u64 = 2 * 1024 * 1024;
 const LAN_TRANSFER_TCP_PORT: u16 = GOSSIP_LAN_PORT;
+const LAN_TCP_CAPABILITY: &str = "lan_tcp_transfer_v1";
+const LAN_TCP_FAILURE_COOLDOWN_SECS: u64 = 45;
+const LAN_FALLBACK_TRANSFER_MAX_ITEMS: u32 = 2;
+const LAN_FALLBACK_TRANSFER_MAX_BYTES: u64 = 1024;
 
 struct GossipRuntime {
     enabled: AtomicBool,
@@ -1160,6 +1165,8 @@ fn start_gossip_worker_if_needed(initial_enabled: bool) {
         ));
         let mut peer_node_by_addr: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
+        let mut peer_tcp_capable_by_ip: HashMap<String, bool> = HashMap::new();
+        let mut tcp_backoff_until_by_ip: HashMap<String, Instant> = HashMap::new();
         let tcp_listener = match bind_gossip_tcp_listener() {
             Ok(listener) => Some(listener),
             Err(err) => {
@@ -1224,6 +1231,8 @@ fn start_gossip_worker_if_needed(initial_enabled: bool) {
                         &buf[..len],
                         source,
                         &mut peer_node_by_addr,
+                        &mut peer_tcp_capable_by_ip,
+                        &mut tcp_backoff_until_by_ip,
                         runtime,
                     ) {
                         log_info(&format!("gossip_frame_handle_error from {source}: {err}"));
@@ -1265,7 +1274,7 @@ fn gossip_broadcast_inventory(socket: &UdpSocket) -> Result<(), String> {
         .map_err(|err| format!("gossip pubkey decode failed: {err}"))?;
     let node_pubkey = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(node_pubkey_raw);
 
-    if let Ok(hello) = build_gossip_hello_frame(&identity.wayfarer_id, &node_pubkey) {
+    if let Ok(hello) = build_lan_hello_frame(&identity.wayfarer_id, &node_pubkey) {
         let _ = send_gossip_frame(socket, "255.255.255.255", GOSSIP_LAN_PORT, &hello);
     }
     if let Ok(ingest) = build_gossip_relay_ingest_frame(now_unix_ms()) {
@@ -1285,6 +1294,8 @@ fn handle_gossip_frame(
     raw: &[u8],
     source: std::net::SocketAddr,
     peer_node_by_addr: &mut std::collections::HashMap<String, String>,
+    peer_tcp_capable_by_ip: &mut HashMap<String, bool>,
+    tcp_backoff_until_by_ip: &mut HashMap<String, Instant>,
     runtime: &GossipRuntime,
 ) -> Result<(), String> {
     let frame = parse_gossip_frame(raw)?;
@@ -1298,11 +1309,17 @@ fn handle_gossip_frame(
             let node_id = hello.node_id;
             peer_node_by_addr.insert(source_key.clone(), node_id.clone());
             peer_node_by_addr.insert(source_ip_key.clone(), node_id);
+            let tcp_capable = hello
+                .capabilities
+                .iter()
+                .any(|capability| capability == LAN_TCP_CAPABILITY);
+            peer_tcp_capable_by_ip.insert(source_ip_key.clone(), tcp_capable);
             log_verbose(&format!(
-                "gossip_peer_hello_mapped: source={} source_ip={} peers={}",
+                "gossip_peer_hello_mapped: source={} source_ip={} peers={} tcp_capable={}",
                 source_key,
                 source_ip_key,
-                peer_node_by_addr.len()
+                peer_node_by_addr.len(),
+                tcp_capable
             ));
             if let Ok(summary) = build_gossip_summary_frame(now_unix_ms()) {
                 let _ = send_gossip_frame(socket, &source.ip().to_string(), source.port(), &summary);
@@ -1358,20 +1375,46 @@ fn handle_gossip_frame(
                 .get(&source.to_string())
                 .or_else(|| peer_node_by_addr.get(&source.ip().to_string()))
                 .cloned();
-            match run_gossip_tcp_encounter_with_peer(
-                source.ip(),
-                peer_node_id,
-                runtime,
-                "udp_request",
-            ) {
-                Ok(_) => {}
-                Err(err) => {
-                    log_verbose(&format!(
-                        "gossip_tcp_encounter_from_udp_request_failed: peer={} error={}",
-                        source, err
-                    ));
-                    serve_udp_transfer_for_request(socket, source, &_req.want)?;
+            let peer_ip_key = source.ip().to_string();
+            let tcp_capable = peer_tcp_capable_by_ip
+                .get(&peer_ip_key)
+                .copied()
+                .unwrap_or(false);
+            let tcp_backoff_active = tcp_backoff_until_by_ip
+                .get(&peer_ip_key)
+                .map(|until| *until > Instant::now())
+                .unwrap_or(false);
+
+            if tcp_capable && !tcp_backoff_active {
+                match run_gossip_tcp_encounter_with_peer(
+                    source.ip(),
+                    peer_node_id,
+                    runtime,
+                    "udp_request",
+                ) {
+                    Ok(_) => {
+                        tcp_backoff_until_by_ip.remove(&peer_ip_key);
+                    }
+                    Err(err) => {
+                        tcp_backoff_until_by_ip.insert(
+                            peer_ip_key.clone(),
+                            Instant::now() + Duration::from_secs(LAN_TCP_FAILURE_COOLDOWN_SECS),
+                        );
+                        log_verbose(&format!(
+                            "gossip_tcp_encounter_from_udp_request_failed: peer={} error={} cooldown_s={}",
+                            source, err, LAN_TCP_FAILURE_COOLDOWN_SECS
+                        ));
+                        serve_udp_transfer_for_request(socket, source, &_req.want)?;
+                    }
                 }
+            } else {
+                if !tcp_capable {
+                    log_verbose(&format!(
+                        "gossip_tcp_skipped_not_capable: peer={} capability={}",
+                        source, LAN_TCP_CAPABILITY
+                    ));
+                }
+                serve_udp_transfer_for_request(socket, source, &_req.want)?;
             }
         }
         GossipSyncFrame::Transfer(transfer) => {
@@ -1506,7 +1549,7 @@ fn run_gossip_tcp_encounter_on_stream(
     let node_pubkey = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(node_pubkey_raw);
 
     if initiate {
-        if let Ok(hello) = build_gossip_hello_frame(&local_wayfarer, &node_pubkey) {
+        if let Ok(hello) = build_lan_hello_frame(&local_wayfarer, &node_pubkey) {
             send_gossip_frame_tcp(stream, &hello)?;
         }
         if let Ok(summary) = build_gossip_summary_frame(now_unix_ms()) {
@@ -1630,17 +1673,50 @@ fn serve_udp_transfer_for_request(
     if want.is_empty() {
         return Ok(());
     }
-    let objects = gossip_transfer_items(
-        want,
-        MAX_TRANSFER_ITEMS as u32,
-        MAX_TRANSFER_BYTES,
-        now_unix_ms(),
-    )
-    .unwrap_or_default();
-    let transfer = GossipSyncFrame::Transfer(crate::aethos_core::gossip_sync::TransferFrame {
-        objects,
-    });
-    send_gossip_frame(socket, &source.ip().to_string(), source.port(), &transfer)
+    let mut pending = want.to_vec();
+    while !pending.is_empty() {
+        let objects = gossip_transfer_items(
+            &pending,
+            LAN_FALLBACK_TRANSFER_MAX_ITEMS,
+            LAN_FALLBACK_TRANSFER_MAX_BYTES,
+            now_unix_ms(),
+        )
+        .unwrap_or_default();
+        if objects.is_empty() {
+            break;
+        }
+
+        let mut sent_ids = std::collections::HashSet::new();
+        for object in &objects {
+            sent_ids.insert(object.item_id.clone());
+        }
+        let before = pending.len();
+        pending.retain(|item_id| !sent_ids.contains(item_id));
+        let removed = before.saturating_sub(pending.len());
+        if removed == 0 {
+            break;
+        }
+
+        let transfer = GossipSyncFrame::Transfer(crate::aethos_core::gossip_sync::TransferFrame {
+            objects,
+        });
+        send_gossip_frame(socket, &source.ip().to_string(), source.port(), &transfer)?;
+    }
+    Ok(())
+}
+
+fn build_lan_hello_frame(wayfarer_id: &str, node_pubkey: &str) -> Result<GossipSyncFrame, String> {
+    let mut frame = build_gossip_hello_frame(wayfarer_id, node_pubkey)?;
+    if let GossipSyncFrame::Hello(hello) = &mut frame {
+        if !hello
+            .capabilities
+            .iter()
+            .any(|capability| capability == LAN_TCP_CAPABILITY)
+        {
+            hello.capabilities.push(LAN_TCP_CAPABILITY.to_string());
+        }
+    }
+    Ok(frame)
 }
 
 fn send_gossip_frame_tcp(stream: &mut TcpStream, frame: &GossipSyncFrame) -> Result<(), String> {
@@ -2634,6 +2710,92 @@ mod tests {
                 assert!(transfer.objects.iter().any(|object| object.item_id == item_id));
             }
             other => panic!("expected TRANSFER, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn udp_fallback_chunks_large_want_into_multiple_transfers() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aethos-tauri-test-udp-chunk-{}",
+            rand::random::<u64>()
+        ));
+        std::env::set_var("AETHOS_STATE_DIR", &temp_dir);
+
+        let identity = ensure_local_identity().expect("ensure identity");
+        let signing_seed = load_local_signing_key_seed().expect("load signing seed");
+
+        let mut item_ids = Vec::new();
+        for idx in 0..3 {
+            let payload = build_envelope_payload_b64_from_utf8(
+                &identity.wayfarer_id,
+                &build_outbound_chat_payload(
+                    &format!("udp chunk {idx}"),
+                    &format!("local-chunk-{idx}"),
+                    now_unix_ms().saturating_add(idx),
+                    None,
+                ),
+                &signing_seed,
+            )
+            .expect("build envelope");
+            let item_id = gossip_record_local_payload(
+                &payload,
+                now_unix_ms().saturating_add(60_000),
+            )
+            .expect("record local payload");
+            item_ids.push(item_id);
+        }
+
+        let sender = UdpSocket::bind(("127.0.0.1", 0)).expect("bind sender udp");
+        let receiver = UdpSocket::bind(("127.0.0.1", 0)).expect("bind receiver udp");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("set receiver timeout");
+        let target: SocketAddr = receiver.local_addr().expect("receiver addr");
+
+        serve_udp_transfer_for_request(&sender, target, &item_ids)
+            .expect("serve udp fallback transfer");
+
+        let mut datagrams = 0usize;
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            let mut buf = [0u8; 65_535];
+            match receiver.recv_from(&mut buf) {
+                Ok((len, _)) => {
+                    datagrams = datagrams.saturating_add(1);
+                    let frame = parse_gossip_frame(&buf[..len]).expect("parse transfer frame");
+                    if let GossipSyncFrame::Transfer(transfer) = frame {
+                        for object in transfer.objects {
+                            seen.insert(object.item_id);
+                        }
+                    }
+                    if seen.len() >= item_ids.len() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        assert!(datagrams >= 2, "expected at least 2 transfer datagrams, got {datagrams}");
+        for item_id in item_ids {
+            assert!(seen.contains(&item_id), "missing item_id {item_id}");
+        }
+    }
+
+    #[test]
+    fn lan_hello_frame_includes_tcp_capability() {
+        let identity = ensure_local_identity().expect("ensure identity");
+        let node_pubkey_raw = base64::engine::general_purpose::STANDARD
+            .decode(&identity.verifying_key_b64)
+            .expect("decode pubkey");
+        let node_pubkey = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(node_pubkey_raw);
+        let frame = build_lan_hello_frame(&identity.wayfarer_id, &node_pubkey).expect("build hello");
+
+        match frame {
+            GossipSyncFrame::Hello(hello) => {
+                assert!(hello.capabilities.iter().any(|capability| capability == LAN_TCP_CAPABILITY));
+            }
+            other => panic!("expected HELLO, got {other:?}"),
         }
     }
 
