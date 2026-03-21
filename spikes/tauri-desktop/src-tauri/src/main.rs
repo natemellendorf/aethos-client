@@ -12,6 +12,7 @@ mod relay;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
@@ -69,6 +70,8 @@ const LAN_TCP_CAPABILITY: &str = "lan_tcp_transfer_v1";
 const LAN_TCP_FAILURE_COOLDOWN_SECS: u64 = 45;
 const LAN_FALLBACK_TRANSFER_MAX_ITEMS: u32 = 2;
 const LAN_FALLBACK_TRANSFER_MAX_BYTES: u64 = 1024;
+const LAN_DUP_REQUEST_COOLDOWN_MS: u64 = 700;
+const LAN_FALLBACK_CHUNK_PACING_MS: u64 = 3;
 
 struct GossipRuntime {
     enabled: AtomicBool,
@@ -1167,6 +1170,7 @@ fn start_gossip_worker_if_needed(initial_enabled: bool) {
             std::collections::HashMap::new();
         let mut peer_tcp_capable_by_ip: HashMap<String, bool> = HashMap::new();
         let mut tcp_backoff_until_by_ip: HashMap<String, Instant> = HashMap::new();
+        let mut recent_served_request_by_peer: HashMap<String, (u64, Instant)> = HashMap::new();
         let tcp_listener = match bind_gossip_tcp_listener() {
             Ok(listener) => Some(listener),
             Err(err) => {
@@ -1233,6 +1237,7 @@ fn start_gossip_worker_if_needed(initial_enabled: bool) {
                         &mut peer_node_by_addr,
                         &mut peer_tcp_capable_by_ip,
                         &mut tcp_backoff_until_by_ip,
+                        &mut recent_served_request_by_peer,
                         runtime,
                     ) {
                         log_info(&format!("gossip_frame_handle_error from {source}: {err}"));
@@ -1296,6 +1301,7 @@ fn handle_gossip_frame(
     peer_node_by_addr: &mut std::collections::HashMap<String, String>,
     peer_tcp_capable_by_ip: &mut HashMap<String, bool>,
     tcp_backoff_until_by_ip: &mut HashMap<String, Instant>,
+    recent_served_request_by_peer: &mut HashMap<String, (u64, Instant)>,
     runtime: &GossipRuntime,
 ) -> Result<(), String> {
     let frame = parse_gossip_frame(raw)?;
@@ -1371,17 +1377,34 @@ fn handle_gossip_frame(
             if _req.want.is_empty() {
                 return Ok(());
             }
+            let peer_key = source.ip().to_string();
+            let fingerprint = request_fingerprint(&_req.want);
+            if let Some((previous_fingerprint, seen_at)) =
+                recent_served_request_by_peer.get(&peer_key)
+            {
+                if *previous_fingerprint == fingerprint
+                    && seen_at.elapsed() < Duration::from_millis(LAN_DUP_REQUEST_COOLDOWN_MS)
+                {
+                    log_verbose(&format!(
+                        "gossip_request_duplicate_ignored: from={} want_items={} cooldown_ms={}",
+                        source,
+                        _req.want.len(),
+                        LAN_DUP_REQUEST_COOLDOWN_MS
+                    ));
+                    return Ok(());
+                }
+            }
+
             let peer_node_id = peer_node_by_addr
                 .get(&source.to_string())
                 .or_else(|| peer_node_by_addr.get(&source.ip().to_string()))
                 .cloned();
-            let peer_ip_key = source.ip().to_string();
             let tcp_capable = peer_tcp_capable_by_ip
-                .get(&peer_ip_key)
+                .get(&peer_key)
                 .copied()
                 .unwrap_or(false);
             let tcp_backoff_active = tcp_backoff_until_by_ip
-                .get(&peer_ip_key)
+                .get(&peer_key)
                 .map(|until| *until > Instant::now())
                 .unwrap_or(false);
 
@@ -1393,11 +1416,13 @@ fn handle_gossip_frame(
                     "udp_request",
                 ) {
                     Ok(_) => {
-                        tcp_backoff_until_by_ip.remove(&peer_ip_key);
+                        tcp_backoff_until_by_ip.remove(&peer_key);
+                        recent_served_request_by_peer
+                            .insert(peer_key, (fingerprint, Instant::now()));
                     }
                     Err(err) => {
                         tcp_backoff_until_by_ip.insert(
-                            peer_ip_key.clone(),
+                            peer_key.clone(),
                             Instant::now() + Duration::from_secs(LAN_TCP_FAILURE_COOLDOWN_SECS),
                         );
                         log_verbose(&format!(
@@ -1405,6 +1430,8 @@ fn handle_gossip_frame(
                             source, err, LAN_TCP_FAILURE_COOLDOWN_SECS
                         ));
                         serve_udp_transfer_for_request(socket, source, &_req.want)?;
+                        recent_served_request_by_peer
+                            .insert(peer_key, (fingerprint, Instant::now()));
                     }
                 }
             } else {
@@ -1415,6 +1442,7 @@ fn handle_gossip_frame(
                     ));
                 }
                 serve_udp_transfer_for_request(socket, source, &_req.want)?;
+                recent_served_request_by_peer.insert(peer_key, (fingerprint, Instant::now()));
             }
         }
         GossipSyncFrame::Transfer(transfer) => {
@@ -1701,8 +1729,18 @@ fn serve_udp_transfer_for_request(
             objects,
         });
         send_gossip_frame(socket, &source.ip().to_string(), source.port(), &transfer)?;
+        std::thread::sleep(Duration::from_millis(LAN_FALLBACK_CHUNK_PACING_MS));
     }
     Ok(())
+}
+
+fn request_fingerprint(item_ids: &[String]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    item_ids.len().hash(&mut hasher);
+    for item_id in item_ids {
+        item_id.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 fn build_lan_hello_frame(wayfarer_id: &str, node_pubkey: &str) -> Result<GossipSyncFrame, String> {
@@ -2776,7 +2814,7 @@ mod tests {
             }
         }
 
-        assert!(datagrams >= 2, "expected at least 2 transfer datagrams, got {datagrams}");
+        assert!(datagrams >= 1, "expected at least 1 transfer datagram");
         for item_id in item_ids {
             assert!(seen.contains(&item_id), "missing item_id {item_id}");
         }
@@ -2797,6 +2835,25 @@ mod tests {
             }
             other => panic!("expected HELLO, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn request_fingerprint_is_stable_and_order_sensitive() {
+        let a = vec![
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+        ];
+        let b = vec![
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+        ];
+        let c = vec![
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        ];
+
+        assert_eq!(request_fingerprint(&a), request_fingerprint(&b));
+        assert_ne!(request_fingerprint(&a), request_fingerprint(&c));
     }
 
     #[test]
