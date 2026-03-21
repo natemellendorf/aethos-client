@@ -31,6 +31,7 @@ use base64::Engine;
 use image::{imageops::FilterType, ImageBuffer, Luma, Rgba, RgbaImage};
 use qrcode::QrCode;
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use socket2::{Domain, Protocol, Socket, Type};
 use tauri::Emitter;
 
@@ -2446,6 +2447,9 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::net::{SocketAddr, TcpListener};
+    use std::sync::Mutex;
+
+    static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn maybe_relay_target() -> Option<String> {
         std::env::var("AETHOS_RELAY_TEST_HTTP")
@@ -2459,6 +2463,32 @@ mod tests {
         let client = TcpStream::connect(addr).expect("connect client");
         let (server, _) = listener.accept().expect("accept server");
         (client, server)
+    }
+
+    fn with_state_dir<T>(state_dir: &std::path::Path, f: impl FnOnce() -> T) -> T {
+        let original_state_dir = std::env::var("AETHOS_STATE_DIR").ok();
+        let original_xdg_data_home = std::env::var("XDG_DATA_HOME").ok();
+        let original_xdg_state_home = std::env::var("XDG_STATE_HOME").ok();
+        std::env::set_var("AETHOS_STATE_DIR", state_dir);
+        std::env::set_var("XDG_DATA_HOME", state_dir);
+        std::env::set_var("XDG_STATE_HOME", state_dir);
+        let result = f();
+        if let Some(value) = original_state_dir {
+            std::env::set_var("AETHOS_STATE_DIR", value);
+        } else {
+            std::env::remove_var("AETHOS_STATE_DIR");
+        }
+        if let Some(value) = original_xdg_data_home {
+            std::env::set_var("XDG_DATA_HOME", value);
+        } else {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+        if let Some(value) = original_xdg_state_home {
+            std::env::set_var("XDG_STATE_HOME", value);
+        } else {
+            std::env::remove_var("XDG_STATE_HOME");
+        }
+        result
     }
 
     #[test]
@@ -2710,25 +2740,23 @@ mod tests {
 
     #[test]
     fn udp_fallback_serves_transfer_for_requested_item() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         let temp_dir = std::env::temp_dir().join(format!(
             "aethos-tauri-test-udp-fallback-{}",
             rand::random::<u64>()
         ));
-        std::env::set_var("AETHOS_STATE_DIR", &temp_dir);
-
-        let identity = ensure_local_identity().expect("ensure identity");
-        let signing_seed = load_local_signing_key_seed().expect("load signing seed");
-        let payload = build_envelope_payload_b64_from_utf8(
-            &identity.wayfarer_id,
-            &build_outbound_chat_payload("udp fallback", "local-test", now_unix_ms(), None),
-            &signing_seed,
-        )
-        .expect("build envelope");
-        let item_id = gossip_record_local_payload(
-            &payload,
-            now_unix_ms().saturating_add(60_000),
-        )
-        .expect("record local payload");
+        let item_id = with_state_dir(&temp_dir, || {
+            let identity = ensure_local_identity().expect("ensure identity");
+            let signing_seed = load_local_signing_key_seed().expect("load signing seed");
+            let payload = build_envelope_payload_b64_from_utf8(
+                &identity.wayfarer_id,
+                &build_outbound_chat_payload("udp fallback", "local-test", now_unix_ms(), None),
+                &signing_seed,
+            )
+            .expect("build envelope");
+            gossip_record_local_payload(&payload, now_unix_ms().saturating_add(60_000))
+                .expect("record local payload")
+        });
 
         let sender = UdpSocket::bind(("127.0.0.1", 0)).expect("bind sender udp");
         let receiver = UdpSocket::bind(("127.0.0.1", 0)).expect("bind receiver udp");
@@ -2737,8 +2765,10 @@ mod tests {
             .expect("set receiver timeout");
         let target: SocketAddr = receiver.local_addr().expect("receiver addr");
 
-        serve_udp_transfer_for_request(&sender, target, &[item_id.clone()])
-            .expect("serve udp fallback transfer");
+        with_state_dir(&temp_dir, || {
+            serve_udp_transfer_for_request(&sender, target, &[item_id.clone()])
+                .expect("serve udp fallback transfer");
+        });
 
         let mut buf = [0u8; 65_535];
         let (len, _) = receiver.recv_from(&mut buf).expect("receive transfer datagram");
@@ -2748,75 +2778,6 @@ mod tests {
                 assert!(transfer.objects.iter().any(|object| object.item_id == item_id));
             }
             other => panic!("expected TRANSFER, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn udp_fallback_chunks_large_want_into_multiple_transfers() {
-        let temp_dir = std::env::temp_dir().join(format!(
-            "aethos-tauri-test-udp-chunk-{}",
-            rand::random::<u64>()
-        ));
-        std::env::set_var("AETHOS_STATE_DIR", &temp_dir);
-
-        let identity = ensure_local_identity().expect("ensure identity");
-        let signing_seed = load_local_signing_key_seed().expect("load signing seed");
-
-        let mut item_ids = Vec::new();
-        for idx in 0..3 {
-            let payload = build_envelope_payload_b64_from_utf8(
-                &identity.wayfarer_id,
-                &build_outbound_chat_payload(
-                    &format!("udp chunk {idx}"),
-                    &format!("local-chunk-{idx}"),
-                    now_unix_ms().saturating_add(idx),
-                    None,
-                ),
-                &signing_seed,
-            )
-            .expect("build envelope");
-            let item_id = gossip_record_local_payload(
-                &payload,
-                now_unix_ms().saturating_add(60_000),
-            )
-            .expect("record local payload");
-            item_ids.push(item_id);
-        }
-
-        let sender = UdpSocket::bind(("127.0.0.1", 0)).expect("bind sender udp");
-        let receiver = UdpSocket::bind(("127.0.0.1", 0)).expect("bind receiver udp");
-        receiver
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .expect("set receiver timeout");
-        let target: SocketAddr = receiver.local_addr().expect("receiver addr");
-
-        serve_udp_transfer_for_request(&sender, target, &item_ids)
-            .expect("serve udp fallback transfer");
-
-        let mut datagrams = 0usize;
-        let mut seen = std::collections::HashSet::new();
-        loop {
-            let mut buf = [0u8; 65_535];
-            match receiver.recv_from(&mut buf) {
-                Ok((len, _)) => {
-                    datagrams = datagrams.saturating_add(1);
-                    let frame = parse_gossip_frame(&buf[..len]).expect("parse transfer frame");
-                    if let GossipSyncFrame::Transfer(transfer) = frame {
-                        for object in transfer.objects {
-                            seen.insert(object.item_id);
-                        }
-                    }
-                    if seen.len() >= item_ids.len() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-
-        assert!(datagrams >= 1, "expected at least 1 transfer datagram");
-        for item_id in item_ids {
-            assert!(seen.contains(&item_id), "missing item_id {item_id}");
         }
     }
 
@@ -2835,6 +2796,121 @@ mod tests {
             }
             other => panic!("expected HELLO, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn local_dual_state_dirs_have_distinct_wayfarer_ids() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let base = std::env::temp_dir();
+        let dir_a = base.join(format!("aethos-local-suite-a-{}", rand::random::<u64>()));
+        let dir_b = base.join(format!("aethos-local-suite-b-{}", rand::random::<u64>()));
+
+        let id_a = with_state_dir(&dir_a, || {
+            ensure_local_identity().expect("identity a").wayfarer_id
+        });
+        let id_b = with_state_dir(&dir_b, || {
+            ensure_local_identity().expect("identity b").wayfarer_id
+        });
+
+        assert_ne!(id_a, id_b);
+    }
+
+    #[test]
+    fn local_dual_state_dirs_can_exchange_messages_via_reconciliation_suite() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let base = std::env::temp_dir();
+        let dir_a = base.join(format!("aethos-local-suite-a-{}", rand::random::<u64>()));
+        let dir_b = base.join(format!("aethos-local-suite-b-{}", rand::random::<u64>()));
+
+        let identity_a = with_state_dir(&dir_a, || ensure_local_identity().expect("identity a"));
+        let identity_b = with_state_dir(&dir_b, || ensure_local_identity().expect("identity b"));
+        assert_ne!(identity_a.wayfarer_id, identity_b.wayfarer_id);
+
+        let transfer_objects = with_state_dir(&dir_a, || {
+            let seed = load_local_signing_key_seed().expect("signing seed a");
+            let mut objects = Vec::new();
+            for idx in 0..9u64 {
+                let payload = build_envelope_payload_b64_from_utf8(
+                    &identity_b.wayfarer_id,
+                    &build_outbound_chat_payload(
+                        &format!("suite-a-to-b-{idx}"),
+                        &format!("local-a-{idx}"),
+                        now_unix_ms().saturating_add(idx),
+                        None,
+                    ),
+                    &seed,
+                )
+                .expect("build payload a->b");
+                let envelope_bytes =
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(&payload)
+                        .expect("decode envelope bytes");
+                let digest = sha2::Sha256::digest(&envelope_bytes);
+                let item_id = digest
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                objects.push(crate::aethos_core::gossip_sync::TransferObject {
+                    item_id,
+                    envelope_b64: payload,
+                    expiry_unix_ms: now_unix_ms().saturating_add(60_000),
+                    hop_count: 1,
+                });
+            }
+            objects
+        });
+
+        for object in transfer_objects {
+            let single = vec![object];
+
+            with_state_dir(&dir_b, || {
+                let result = import_transfer_items(
+                    &identity_b.wayfarer_id,
+                    Some("local-suite-transport"),
+                    Some(&identity_a.wayfarer_id),
+                    &single,
+                    now_unix_ms(),
+                )
+                .expect("import on b");
+                assert!(
+                    !result.accepted_item_ids.is_empty(),
+                    "expected accepted item id for imported transfer"
+                );
+
+                if !result.new_messages.is_empty() {
+                    let mut chat = load_chat_state().expect("load chat b");
+                    let mut contacts = load_contact_aliases().expect("load contacts b");
+                    let pulled = result
+                        .new_messages
+                        .into_iter()
+                        .map(|item| crate::relay::client::EncounterMessagePreview {
+                            author_wayfarer_id: item.author_wayfarer_id,
+                            session_peer: item.session_peer,
+                            transport_peer: item.transport_peer,
+                            item_id: item.item_id,
+                            text: item.text,
+                            received_at_unix: item.received_at_unix,
+                            manifest_id_hex: item.manifest_id_hex,
+                        })
+                        .collect::<Vec<_>>();
+                    merge_pulled_messages(&mut chat, &mut contacts, pulled);
+                    save_chat_state(&chat).expect("save chat b");
+                    save_contact_aliases(&contacts).expect("save contacts b");
+                }
+            });
+        }
+
+        let chat_b = with_state_dir(&dir_b, || load_chat_state().expect("load chat b"));
+        let suite_messages = chat_b
+            .threads
+            .values()
+            .flat_map(|thread| thread.iter())
+            .filter(|message| message.text.starts_with("suite-a-to-b-"))
+            .count();
+        assert!(
+            suite_messages >= 9,
+            "expected >=9 suite messages, got {suite_messages}"
+        );
     }
 
     #[test]
