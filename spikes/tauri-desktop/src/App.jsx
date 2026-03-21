@@ -528,6 +528,61 @@ export default function App() {
     }
   };
 
+  const deleteMessage = async (msgId) => {
+    if (!selectedContactId) return;
+    if (!window.confirm("Delete this message? This cannot be undone.")) return;
+    try {
+      const nextChat = {
+        ...chat,
+        threads: {
+          ...chat.threads,
+          [selectedContactId]: (chat.threads[selectedContactId] || []).filter((message) => message.msgId !== msgId)
+        }
+      };
+      await saveChat(nextChat);
+      setStatus("Message deleted");
+    } catch (error) {
+      setStatus(`Delete failed: ${String(error)}`);
+      soundManager.play("error");
+    }
+  };
+
+  const clearThreadMessages = async () => {
+    if (!selectedContactId) return setStatus("Select a thread first");
+    if (!window.confirm("Delete all messages in this thread? This cannot be undone.")) return;
+    try {
+      const nextChat = {
+        ...chat,
+        threads: {
+          ...chat.threads,
+          [selectedContactId]: []
+        }
+      };
+      await saveChat(nextChat);
+      setStatus("Thread cleared");
+    } catch (error) {
+      setStatus(`Thread clear failed: ${String(error)}`);
+      soundManager.play("error");
+    }
+  };
+
+  const clearAllMessages = async () => {
+    if (!window.confirm("Delete ALL local messages on this client? This cannot be undone.")) return;
+    try {
+      const nextChat = {
+        ...chat,
+        selectedContact: null,
+        threads: {},
+        newContacts: []
+      };
+      await saveChat(nextChat);
+      setStatus("All local messages deleted");
+    } catch (error) {
+      setStatus(`Delete all failed: ${String(error)}`);
+      soundManager.play("error");
+    }
+  };
+
   const onAttachmentPick = async (event) => {
     const file = event.target.files?.[0];
     event.target.value = "";
@@ -932,11 +987,34 @@ export default function App() {
               </CardContent>
             </Card>
             <Card className="flex min-h-[360px] flex-col lg:h-full">
-              <CardHeader className="p-3 pb-1"><CardTitle className="text-base">{selectedName}</CardTitle></CardHeader>
+              <CardHeader className="p-3 pb-1">
+                <div className="flex items-center justify-between gap-2">
+                  <CardTitle className="text-base">{selectedName}</CardTitle>
+                  <Button
+                    variant="destructive"
+                    size="sm"
+                    className="h-7 px-2"
+                    disabled={!selectedContactId || selectedThread.length === 0}
+                    onClick={clearThreadMessages}
+                  >
+                    Clear Thread
+                  </Button>
+                </div>
+              </CardHeader>
               <CardContent className="flex min-h-0 flex-1 flex-col p-3 pt-1">
                 <div ref={threadContainerRef} className="mb-1.5 min-h-0 flex-1 space-y-2 overflow-auto rounded-lg border border-border/60 bg-background/40 p-2.5">
                   {selectedThread.length === 0 ? <p className="text-sm text-muted-foreground">No messages in this thread yet.</p> : selectedThread.map((m) => (
                     <div key={m.msgId} className={cn("message-bubble max-w-[85%] rounded-xl px-3 py-2 text-sm", m.direction === "Incoming" ? "message-bubble-incoming" : "message-bubble-outgoing ml-auto", arrivingMessageIds[m.msgId] ? "message-arrive" : "") }>
+                      <div className="mb-1 flex justify-end">
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-6 px-2 text-[10px]"
+                          onClick={() => deleteMessage(m.msgId)}
+                        >
+                          Delete
+                        </Button>
+                      </div>
                       {m.text ? <p>{m.text}</p> : null}
                       {m.attachment ? (
                         <div className="mt-1.5 rounded-md border border-cyan-300/30 bg-slate-900/35 p-2 text-xs">
@@ -1105,6 +1183,7 @@ export default function App() {
                     <Button type="submit"><CheckCircle2 className="mr-2 h-4 w-4" />Save Settings</Button>
                     <Button type="button" variant="secondary" onClick={resetRelayEndpoints}>Reset Relay Default</Button>
                     <Button type="button" variant="ghost" onClick={announceGossip}>Announce LAN Gossip</Button>
+                    <Button type="button" variant="destructive" onClick={clearAllMessages}>Delete ALL Messages</Button>
                   </div>
                 </form>
               </CardContent>
