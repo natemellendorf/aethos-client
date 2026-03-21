@@ -10,6 +10,8 @@ mod aethos_core;
 mod relay;
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::fs;
 use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
@@ -63,6 +65,8 @@ const SOUND_EVENT: &str = "sound_event";
 const MAX_ATTACHMENT_BYTES: u64 = 2 * 1024 * 1024;
 const LAN_TRANSFER_MAX_ITEMS_PER_FRAME: usize = 2;
 const LAN_TRANSFER_MAX_OBJECT_BYTES: u64 = 1024;
+const LAN_REQUEST_MAX_WANT_ITEMS: usize = 4;
+const LAN_DUP_REQUEST_COOLDOWN_MS: u64 = 500;
 
 struct GossipRuntime {
     enabled: AtomicBool,
@@ -1159,6 +1163,7 @@ fn start_gossip_worker_if_needed(initial_enabled: bool) {
         ));
         let mut peer_node_by_addr: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
+        let mut recent_request_fingerprint_by_peer: HashMap<String, (u64, Instant)> = HashMap::new();
         let mut last_inventory_broadcast = Instant::now() - Duration::from_secs(10);
 
         loop {
@@ -1188,6 +1193,7 @@ fn start_gossip_worker_if_needed(initial_enabled: bool) {
                         &buf[..len],
                         source,
                         &mut peer_node_by_addr,
+                        &mut recent_request_fingerprint_by_peer,
                         runtime,
                     ) {
                         log_info(&format!("gossip_frame_handle_error from {source}: {err}"));
@@ -1249,6 +1255,7 @@ fn handle_gossip_frame(
     raw: &[u8],
     source: std::net::SocketAddr,
     peer_node_by_addr: &mut std::collections::HashMap<String, String>,
+    recent_request_fingerprint_by_peer: &mut HashMap<String, (u64, Instant)>,
     runtime: &GossipRuntime,
 ) -> Result<(), String> {
     let frame = parse_gossip_frame(raw)?;
@@ -1282,7 +1289,7 @@ fn handle_gossip_frame(
                 summary.item_count,
                 summary.preview_item_ids.as_ref().map(|v| v.len()).unwrap_or(0)
             ));
-            let request = build_request_from_summary(&summary, 256)?;
+            let request = build_request_from_summary(&summary, LAN_REQUEST_MAX_WANT_ITEMS)?;
             if let GossipSyncFrame::Request(request_frame) = &request {
                 log_verbose(&format!(
                     "gossip_send_request_from_summary: to={} want_items={}",
@@ -1304,7 +1311,7 @@ fn handle_gossip_frame(
                 .filter(|item_id| gossip_has_item(item_id).map(|have| !have).unwrap_or(false))
                 .collect::<Vec<_>>();
             missing_item_ids.sort();
-            let request = build_gossip_request_frame(missing_item_ids, 256)?;
+            let request = build_gossip_request_frame(missing_item_ids, LAN_REQUEST_MAX_WANT_ITEMS)?;
             if let GossipSyncFrame::Request(request_frame) = &request {
                 log_verbose(&format!(
                     "gossip_send_request_from_relay_ingest: to={} want_items={}",
@@ -1315,6 +1322,25 @@ fn handle_gossip_frame(
             let _ = send_gossip_frame(socket, &source.ip().to_string(), source.port(), &request);
         }
         GossipSyncFrame::Request(req) => {
+            let peer_key = source.to_string();
+            let fingerprint = request_fingerprint(&req.want);
+            if let Some((previous_fingerprint, seen_at)) =
+                recent_request_fingerprint_by_peer.get(&peer_key)
+            {
+                if *previous_fingerprint == fingerprint
+                    && seen_at.elapsed() < Duration::from_millis(LAN_DUP_REQUEST_COOLDOWN_MS)
+                {
+                    log_verbose(&format!(
+                        "gossip_request_duplicate_ignored: from={} want_items={} cooldown_ms={}",
+                        source,
+                        req.want.len(),
+                        LAN_DUP_REQUEST_COOLDOWN_MS
+                    ));
+                    return Ok(());
+                }
+            }
+            recent_request_fingerprint_by_peer.insert(peer_key, (fingerprint, Instant::now()));
+
             let mut pending = req.want;
             let mut chunk_idx = 0usize;
             while !pending.is_empty() {
@@ -1364,6 +1390,7 @@ fn handle_gossip_frame(
                         objects,
                     });
                 let _ = send_gossip_frame(socket, &source.ip().to_string(), source.port(), &transfer);
+                std::thread::sleep(Duration::from_millis(2));
 
                 if removed == 0 {
                     log_verbose(&format!(
@@ -1438,6 +1465,15 @@ fn handle_gossip_frame(
     }
 
     Ok(())
+}
+
+fn request_fingerprint(item_ids: &[String]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    item_ids.len().hash(&mut hasher);
+    for item_id in item_ids {
+        item_id.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 fn send_gossip_frame(socket: &UdpSocket, host: &str, port: u16, frame: &GossipSyncFrame) -> Result<(), String> {
