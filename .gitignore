@@ -1,3 +1,6 @@
 target/*
 __pycache__/
 *.pyc
+spikes/tauri-desktop/e2e/workdir/
+spikes/tauri-desktop/e2e/artifacts/
+tests/e2e-harness/artifacts/

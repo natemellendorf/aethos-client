@@ -19,6 +19,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--scenario-file", required=True)
     parser.add_argument("--toxiproxy-url", default="http://127.0.0.1:8474")
+    parser.add_argument("--strict", action="store_true")
     args = parser.parse_args()
 
     with open(args.scenario_file, "r", encoding="utf-8") as f:
@@ -37,7 +38,9 @@ def main():
         for toxic in existing:
             http("DELETE", f"{base}/proxies/{proxy_name}/toxics/{toxic['name']}")
     except Exception:
-        pass
+        if args.strict:
+            raise
+        return
 
     for toxic in toxics:
         payload = {

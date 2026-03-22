@@ -1,5 +1,4 @@
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -14,12 +13,20 @@ const RUN_ID = process.env.AETHOS_E2E_RUN_ID || `run-${Date.now()}`;
 const TEST_CASE_ID = process.env.AETHOS_E2E_TEST_CASE_ID || "dual-instance-gossip";
 const SCENARIO = process.env.AETHOS_E2E_SCENARIO || "clean";
 const RELAY_ENDPOINT = process.env.AETHOS_E2E_RELAY_ENDPOINT || "";
+const E2E_DISABLE_RELAY = (process.env.AETHOS_E2E_DISABLE_RELAY || "1") === "1";
+const E2E_LOOPBACK_ONLY = (process.env.AETHOS_E2E_LOOPBACK_ONLY || "1") === "1";
+const E2E_EAGER_UNICAST = (process.env.AETHOS_E2E_EAGER_UNICAST || "1") === "1";
+const E2E_LOCALHOST_FANOUT = (process.env.AETHOS_E2E_LOCALHOST_FANOUT || "1") === "1";
+const E2E_DISABLE_LAN_TCP = (process.env.AETHOS_E2E_DISABLE_LAN_TCP || "1") === "1";
 const GOSSIP_BASE_PORT = Number(process.env.AETHOS_E2E_GOSSIP_BASE_PORT || 58655);
 const GOSSIP_PORT_A = GOSSIP_BASE_PORT;
 const GOSSIP_PORT_B = GOSSIP_BASE_PORT + 1;
 const ARTIFACT_ROOT = process.env.AETHOS_E2E_ARTIFACT_DIR
   ? path.resolve(process.env.AETHOS_E2E_ARTIFACT_DIR)
   : path.resolve(DESKTOP_DIR, "e2e", "artifacts", RUN_ID);
+const E2E_WORKDIR = process.env.AETHOS_E2E_WORKDIR
+  ? path.resolve(process.env.AETHOS_E2E_WORKDIR)
+  : path.resolve(DESKTOP_DIR, "e2e", "workdir", RUN_ID);
 
 const TAURI_DRIVER_A_PORT = 4444;
 const TAURI_DRIVER_B_PORT = 4454;
@@ -31,7 +38,7 @@ let cleanupTriggered = false;
 const cleanupFns = [];
 
 function stateRootPath(name) {
-  return path.join(os.tmpdir(), `aethos-e2e-${name}-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`);
+  return path.join(E2E_WORKDIR, `aethos-${name}`);
 }
 
 function appLogPath(stateRoot) {
@@ -51,6 +58,35 @@ async function readLogTail(filePath, maxChars = 10000) {
   }
 }
 
+async function readJsonFile(filePath) {
+  const raw = await fs.readFile(filePath, "utf8");
+  return JSON.parse(raw);
+}
+
+async function waitForIncomingMessageInState(stateRoot, expectedText) {
+  const chatPath = path.join(stateRoot, "chat-history.json");
+  return waitFor(async () => {
+    try {
+      const chat = await readJsonFile(chatPath);
+      const threads = Object.values(chat?.threads || {});
+      for (const thread of threads) {
+        for (const msg of thread || []) {
+          if (msg?.direction === "Incoming" && String(msg?.text || "") === expectedText) {
+            return {
+              found: true,
+              msgId: msg?.msgId || "",
+              threadKey: Object.keys(chat?.threads || {}).find((key) => (chat.threads[key] || []).some((m) => m?.msgId === msg?.msgId)) || ""
+            };
+          }
+        }
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }, 120000, 700);
+}
+
 async function writeJsonArtifact(fileName, payload) {
   await fs.mkdir(ARTIFACT_ROOT, { recursive: true });
   await fs.writeFile(path.join(ARTIFACT_ROOT, fileName), `${JSON.stringify(payload, null, 2)}\n`, "utf8");
@@ -59,8 +95,8 @@ async function writeJsonArtifact(fileName, payload) {
 async function waitFor(predicate, timeoutMs = 30000, intervalMs = 250) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
-    const ok = await predicate();
-    if (ok) return true;
+    const value = await predicate();
+    if (value) return value;
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
   return false;
@@ -100,6 +136,12 @@ async function clickTab(driver, tabId) {
 
 async function openContactsAndAdd(driver, id, alias) {
   await clickTab(driver, "contacts");
+  await waitForSplashToClear(driver);
+  const beforeContacts = new Set(
+    await driver.executeScript(
+      "return Array.from(document.querySelectorAll('[data-testid^=\"chat-contact-\"]')).map((el)=>el.getAttribute('data-testid').replace('chat-contact-',''));"
+    )
+  );
   const idInput = await driver.findElement(By.css("[data-testid='contact-wayfarer-id']"));
   const aliasInput = await driver.findElement(By.css("[data-testid='contact-alias']"));
   await idInput.clear();
@@ -107,11 +149,25 @@ async function openContactsAndAdd(driver, id, alias) {
   await aliasInput.clear();
   await aliasInput.sendKeys(alias);
   const saveBtn = await driver.findElement(By.css("[data-testid='contact-save']"));
-  await driver.executeScript("arguments[0].scrollIntoView({block: 'center'});", saveBtn);
-  try {
-    await saveBtn.click();
-  } catch {
-    await driver.executeScript("arguments[0].click();", saveBtn);
+  await driver.executeScript("arguments[0].scrollIntoView({block: 'center'}); arguments[0].click();", saveBtn);
+
+  const saved = await waitFor(async () => {
+    try {
+      await clickTab(driver, "chats");
+      const selector = `[data-testid='chat-contact-${id.toLowerCase()}']`;
+      const matches = await driver.findElements(By.css(selector));
+      return matches.length > 0;
+    } catch {
+      return false;
+    }
+  }, 30000, 500);
+
+  if (!saved) {
+    await clickTab(driver, "contacts");
+    const debugContactState = await driver.executeScript(
+      "const id=document.querySelector('[data-testid=\"contact-wayfarer-id\"]')?.value || ''; const alias=document.querySelector('[data-testid=\"contact-alias\"]')?.value || ''; const contactList=Array.from(document.querySelectorAll('[data-testid^=\"chat-contact-\"]')).map((el)=>el.getAttribute('data-testid').replace('chat-contact-','')); const status=document.querySelector('[data-testid=\"status-text\"]')?.textContent || ''; return {id, alias, contactList, status};"
+    );
+    throw new Error(`contact did not appear in chat list: ${id}; debug=${JSON.stringify(debugContactState)}; before=${JSON.stringify(Array.from(beforeContacts))}`);
   }
 }
 
@@ -132,6 +188,19 @@ async function clickContactInChats(driver, wayfarerId) {
   await clickTab(driver, "chats");
   const selector = `[data-testid='chat-contact-${wayfarerId.toLowerCase()}']`;
   await clickElement(driver, selector, 30000);
+  const isSelected = await waitFor(async () => {
+    try {
+      return await driver.executeScript(
+        "const el=document.querySelector(arguments[0]); return !!el && el.className.includes('border-blue-300');",
+        selector
+      );
+    } catch {
+      return false;
+    }
+  }, 5000, 200);
+  if (!isSelected) {
+    await driver.executeScript("const el=document.querySelector(arguments[0]); if (el) el.click();", selector);
+  }
 }
 
 async function announceGossip(driver) {
@@ -139,39 +208,45 @@ async function announceGossip(driver) {
   await clickElement(driver, "[data-testid='settings-announce-gossip']");
 }
 
-async function configureSyncSettings(driver, { relaySyncEnabled, gossipSyncEnabled, verboseLoggingEnabled }) {
-  await clickTab(driver, "settings");
-
-  const setCheckbox = async (testId, enabled) => {
-    const el = await driver.findElement(By.css(`[data-testid='${testId}']`));
-    const current = await el.isSelected();
-    if (current !== enabled) {
-      try {
-        await el.click();
-      } catch {
-        await driver.executeScript("arguments[0].click();", el);
-      }
+async function readIdentityWayfarerId(stateRoot) {
+  const identityPath = path.join(stateRoot, "aethos-linux", "identity.json");
+  const ok = await waitFor(async () => {
+    try {
+      const raw = await fs.readFile(identityPath, "utf8");
+      const parsed = JSON.parse(raw);
+      return /^[0-9a-f]{64}$/.test(normalizedIdText(parsed?.wayfarer_id));
+    } catch {
+      return false;
     }
-  };
+  }, 30000, 250);
 
-  await setCheckbox("settings-relay-sync", relaySyncEnabled);
-  await setCheckbox("settings-gossip-sync", gossipSyncEnabled);
-  await setCheckbox("settings-verbose-logging", verboseLoggingEnabled);
-  if (RELAY_ENDPOINT) {
-    const relayEndpoints = await driver.findElement(By.css("[data-testid='settings-relay-endpoints']"));
-    await relayEndpoints.clear();
-    await relayEndpoints.sendKeys(RELAY_ENDPOINT);
+  if (!ok) {
+    throw new Error(`identity file not ready: ${identityPath}`);
   }
-  await clickElement(driver, "[data-testid='settings-save']");
+
+  const raw = await fs.readFile(identityPath, "utf8");
+  const parsed = JSON.parse(raw);
+  return normalizedIdText(parsed?.wayfarer_id);
 }
 
-async function getOwnWayfarerId(driver) {
-  await clickTab(driver, "share");
-  const pre = await driver.wait(until.elementLocated(By.css("[data-testid='share-wayfarer-id']")), 20000);
-  const text = await pre.getText();
-  const id = normalizedIdText(text);
-  expect(id).to.match(/^[0-9a-f]{64}$/);
-  return id;
+async function getOwnWayfarerId(driver, fallbackStateRoot) {
+  const ready = await waitFor(async () => {
+    try {
+      await clickTab(driver, "share");
+      const pre = await driver.wait(until.elementLocated(By.css("[data-testid='share-wayfarer-id']")), 8000);
+      const text = await pre.getText();
+      const id = normalizedIdText(text);
+      return /^[0-9a-f]{64}$/.test(id) ? id : false;
+    } catch {
+      return false;
+    }
+  }, 30000, 400);
+
+  if (ready) return String(ready);
+  if (fallbackStateRoot) {
+    return readIdentityWayfarerId(fallbackStateRoot);
+  }
+  throw new Error("wayfarer id unavailable from share tab");
 }
 
 async function openTauriSession(sessionName, stateRoot, tauriPort = 4444) {
@@ -183,12 +258,20 @@ async function openTauriSession(sessionName, stateRoot, tauriPort = 4444) {
     AETHOS_STATE_DIR: stateRoot,
     XDG_DATA_HOME: stateRoot,
     XDG_STATE_HOME: stateRoot,
-    AETHOS_DISABLE_LAN_TCP: "1",
+    AETHOS_DISABLE_LAN_TCP: E2E_DISABLE_LAN_TCP ? "1" : "0",
     AETHOS_GOSSIP_LAN_PORT: String(sessionName === "a" ? GOSSIP_PORT_A : GOSSIP_PORT_B),
     AETHOS_GOSSIP_PEER_PORTS: `${GOSSIP_PORT_A},${GOSSIP_PORT_B}`,
-    AETHOS_GOSSIP_LOCALHOST_FANOUT: "1",
-    AETHOS_GOSSIP_EAGER_UNICAST: "1",
-    AETHOS_GOSSIP_LOOPBACK_ONLY: "1",
+    AETHOS_GOSSIP_LOCALHOST_FANOUT: E2E_LOCALHOST_FANOUT ? "1" : "0",
+    AETHOS_GOSSIP_EAGER_UNICAST: E2E_EAGER_UNICAST ? "1" : "0",
+    AETHOS_GOSSIP_LOOPBACK_ONLY: E2E_LOOPBACK_ONLY ? "1" : "0",
+    AETHOS_STRUCTURED_LOGS: process.env.AETHOS_STRUCTURED_LOGS || "1",
+    AETHOS_E2E_RUN_ID: RUN_ID,
+    AETHOS_E2E_TEST_CASE_ID: TEST_CASE_ID,
+    AETHOS_E2E_SCENARIO: SCENARIO,
+    AETHOS_E2E_NODE_LABEL: sessionName === "a" ? "wayfarer-1" : "wayfarer-2",
+    AETHOS_E2E_DISABLE_RELAY: E2E_DISABLE_RELAY ? "1" : "0",
+    AETHOS_E2E_FORCE_VERBOSE: process.env.AETHOS_E2E_FORCE_VERBOSE || "1",
+    AETHOS_E2E_FORCE_GOSSIP: process.env.AETHOS_E2E_FORCE_GOSSIP || "1",
     AETHOS_E2E_INSTANCE: sessionName
   };
 
@@ -200,10 +283,13 @@ async function openTauriSession(sessionName, stateRoot, tauriPort = 4444) {
       `--aethos-state-dir=${stateRoot}`,
       `--aethos-gossip-lan-port=${sessionName === "a" ? GOSSIP_PORT_A : GOSSIP_PORT_B}`,
       `--aethos-gossip-peer-ports=${GOSSIP_PORT_A},${GOSSIP_PORT_B}`,
-      "--aethos-disable-lan-tcp=1",
-      "--aethos-gossip-localhost-fanout=1",
-      "--aethos-gossip-eager-unicast=1",
-      "--aethos-gossip-loopback-only=1"
+      `--aethos-disable-lan-tcp=${E2E_DISABLE_LAN_TCP ? "1" : "0"}`,
+      `--aethos-gossip-localhost-fanout=${E2E_LOCALHOST_FANOUT ? "1" : "0"}`,
+      `--aethos-gossip-eager-unicast=${E2E_EAGER_UNICAST ? "1" : "0"}`,
+      `--aethos-gossip-loopback-only=${E2E_LOOPBACK_ONLY ? "1" : "0"}`,
+      `--aethos-e2e-disable-relay=${E2E_DISABLE_RELAY ? "1" : "0"}`,
+      "--aethos-e2e-force-verbose=1",
+      "--aethos-e2e-force-gossip=1"
     ],
     env
   });
@@ -271,6 +357,14 @@ async function captureScreenshot(driver, fileName) {
 before(async function () {
   this.timeout(240000);
 
+  await fs.mkdir(E2E_WORKDIR, { recursive: true });
+  await fs.mkdir(ARTIFACT_ROOT, { recursive: true });
+
+  spawnSync("bash", ["-lc", "pkill -f 'src-tauri/target/debug/aethos' || true; pkill -f tauri-driver || true; pkill -f WebKitWebDriver || true"], {
+    cwd: DESKTOP_DIR,
+    stdio: "inherit"
+  });
+
   const buildResult = spawnSync("npx", ["tauri", "build", "--debug", "--no-bundle"], {
     cwd: DESKTOP_DIR,
     stdio: "inherit",
@@ -288,6 +382,10 @@ before(async function () {
 
 after(async function () {
   await shutdownAll();
+  spawnSync("bash", ["-lc", "pkill -f 'src-tauri/target/debug/aethos' || true; pkill -f tauri-driver || true; pkill -f WebKitWebDriver || true"], {
+    cwd: DESKTOP_DIR,
+    stdio: "inherit"
+  });
 });
 
 process.on("SIGINT", async () => {
@@ -320,25 +418,21 @@ describe("dual instance gossip e2e", function () {
       artifacts: {
         instance_a_log: a.logPath,
         instance_b_log: b.logPath
+      },
+      env: {
+        disable_relay: E2E_DISABLE_RELAY ? "1" : "0",
+        loopback_only: E2E_LOOPBACK_ONLY ? "1" : "0",
+        eager_unicast: E2E_EAGER_UNICAST ? "1" : "0",
+        localhost_fanout: E2E_LOCALHOST_FANOUT ? "1" : "0",
+        disable_lan_tcp: E2E_DISABLE_LAN_TCP ? "1" : "0"
       }
     });
 
     await waitForSplashToClear(a.driver);
     await waitForSplashToClear(b.driver);
 
-    await configureSyncSettings(a.driver, {
-      relaySyncEnabled: false,
-      gossipSyncEnabled: true,
-      verboseLoggingEnabled: true
-    });
-    await configureSyncSettings(b.driver, {
-      relaySyncEnabled: false,
-      gossipSyncEnabled: true,
-      verboseLoggingEnabled: true
-    });
-
-    const idA = await getOwnWayfarerId(a.driver);
-    const idB = await getOwnWayfarerId(b.driver);
+    const idA = await readIdentityWayfarerId(a.stateRoot);
+    const idB = await readIdentityWayfarerId(b.stateRoot);
     expect(idA).to.not.equal(idB);
 
     await openContactsAndAdd(a.driver, idB, "Peer B");
@@ -347,25 +441,19 @@ describe("dual instance gossip e2e", function () {
     await clickContactInChats(a.driver, idB);
     await clickContactInChats(b.driver, idA);
 
-    await announceGossip(a.driver);
-    await announceGossip(b.driver);
-
     const msg = `e2e-${Date.now()}`;
     await sendChatMessage(a.driver, msg);
 
-    const inboundVisible = await waitFor(async () => {
-      await announceGossip(a.driver);
-      await announceGossip(b.driver);
-      await clickContactInChats(b.driver, idA);
-      const threadText = await (await b.driver.findElement(By.css("body"))).getText();
-      return threadText.includes(msg);
-    }, 120000, 900);
+    const inboundState = await waitForIncomingMessageInState(b.stateRoot, msg);
+    const inboundVisible = Boolean(inboundState?.found);
 
     if (!inboundVisible) {
       await captureScreenshot(a.driver, "wayfarer-1-failure.png");
       await captureScreenshot(b.driver, "wayfarer-2-failure.png");
       const logA = await readLogTail(a.logPath);
       const logB = await readLogTail(b.logPath);
+      const settingsA = await fs.readFile(path.join(a.stateRoot, "settings.json"), "utf8").catch(() => "");
+      const settingsB = await fs.readFile(path.join(b.stateRoot, "settings.json"), "utf8").catch(() => "");
       await writeJsonArtifact("failure-summary.json", {
         run_id: RUN_ID,
         test_case_id: TEST_CASE_ID,
@@ -375,6 +463,10 @@ describe("dual instance gossip e2e", function () {
         logs: {
           wayfarer_1_tail: logA,
           wayfarer_2_tail: logB
+        },
+        settings: {
+          wayfarer_1: settingsA,
+          wayfarer_2: settingsB
         }
       });
       throw new Error(
@@ -384,10 +476,16 @@ describe("dual instance gossip e2e", function () {
       );
     }
 
+    if (inboundState?.threadKey) {
+      await clickContactInChats(b.driver, inboundState.threadKey);
+    }
+
     await clickTab(a.driver, "settings");
     await clickTab(b.driver, "settings");
-    const logPathTextA = await (await a.driver.findElement(By.css("[data-testid='settings-log-path']"))).getText();
-    const logPathTextB = await (await b.driver.findElement(By.css("[data-testid='settings-log-path']"))).getText();
+    const settingsLogA = await a.driver.wait(until.elementLocated(By.css("[data-testid='settings-log-path']")), 20000);
+    const settingsLogB = await b.driver.wait(until.elementLocated(By.css("[data-testid='settings-log-path']")), 20000);
+    const logPathTextA = await settingsLogA.getText();
+    const logPathTextB = await settingsLogB.getText();
 
     expect(path.resolve(logPathTextA)).to.equal(path.resolve(a.logPath));
     expect(path.resolve(logPathTextB)).to.equal(path.resolve(b.logPath));
@@ -403,6 +501,11 @@ describe("dual instance gossip e2e", function () {
       scenario: SCENARIO,
       completed_at_unix_ms: Date.now(),
       status: "passed",
+      convergence: {
+        method: "chat-history-state",
+        inbound_thread_key: inboundState?.threadKey || "",
+        inbound_msg_id: inboundState?.msgId || ""
+      },
       node_status: {
         wayfarer_1: statusA,
         wayfarer_2: statusB

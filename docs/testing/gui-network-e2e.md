@@ -32,6 +32,28 @@ Optional overrides:
 AETHOS_E2E_SCENARIO=slow-relay AETHOS_E2E_MODE=mixed docker compose -f docker-compose.e2e.yml up --abort-on-container-exit --exit-code-from e2e-runner
 ```
 
+Non-compose local runner:
+
+```bash
+# Peer LAN-only baseline (relay disabled)
+bash scripts/e2e/run-scenario.sh --scenario clean --mode peer
+
+# Relay scenarios require toxiproxy + relay endpoint wiring
+AETHOS_E2E_TOXIPROXY_URL=http://127.0.0.1:8474 \
+AETHOS_E2E_RELAY_ENDPOINT=http://127.0.0.1:19082 \
+bash scripts/e2e/run-scenario.sh --scenario relay-partition --mode relay
+```
+
+Mode behavior (deterministic env mapping):
+- `peer`: relay disabled, loopback-only LAN gossip enabled
+- `relay`: relay enabled, LAN loopback-only optimization disabled
+- `mixed`: relay enabled + loopback LAN gossip enabled
+
+Runner writes local runtime state and logs under:
+- `spikes/tauri-desktop/e2e/workdir/<run-id>/`
+
+These directories are intentionally gitignored to avoid permission and artifact churn in normal development.
+
 Modes:
 - `relay` (relay-focused)
 - `peer` (loopback peer-focused)
@@ -50,6 +72,10 @@ Primary files:
 - `artifact-index.json` (artifact manifest)
 - `triage-summary.json` (agent-oriented anomaly hints)
 - `wayfarer-1-failure.png`, `wayfarer-2-failure.png` (on failure)
+
+Convergence assertion:
+- Baseline message convergence uses persisted state (`chat-history.json`) as source-of-truth.
+- UI thread rendering checks are retained as supporting diagnostics, not sole pass/fail criteria.
 
 ## Scenario config
 

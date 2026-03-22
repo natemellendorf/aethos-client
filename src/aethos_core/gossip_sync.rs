@@ -819,6 +819,12 @@ fn save_store(store: &GossipStore) -> Result<(), String> {
 }
 
 fn gossip_store_path() -> PathBuf {
+    if let Ok(state_dir) = std::env::var("AETHOS_STATE_DIR") {
+        if !state_dir.trim().is_empty() {
+            return Path::new(&state_dir).join(GOSSIP_STORE_FILE_NAME);
+        }
+    }
+
     if let Ok(xdg_state_home) = std::env::var("XDG_STATE_HOME") {
         if !xdg_state_home.trim().is_empty() {
             return Path::new(&xdg_state_home)

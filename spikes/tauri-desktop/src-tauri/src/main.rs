@@ -446,15 +446,45 @@ fn clear_app_log() -> Result<AppLogTail, String> {
 #[tauri::command]
 fn bootstrap_state() -> Result<BootstrapState, String> {
     let mut settings = load_app_settings()?;
+    let e2e_disable_relay = std::env::var("AETHOS_E2E_DISABLE_RELAY")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let e2e_force_verbose = std::env::var("AETHOS_E2E_FORCE_VERBOSE")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let e2e_force_gossip = std::env::var("AETHOS_E2E_FORCE_GOSSIP")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    let mut settings_changed = false;
+    if e2e_disable_relay && settings.relay_sync_enabled {
+        settings.relay_sync_enabled = false;
+        settings_changed = true;
+    }
+    if e2e_force_verbose && !settings.verbose_logging_enabled {
+        settings.verbose_logging_enabled = true;
+        settings_changed = true;
+    }
+    if e2e_force_gossip && !settings.gossip_sync_enabled {
+        settings.gossip_sync_enabled = true;
+        settings_changed = true;
+    }
+
     if !settings.gossip_sync_enabled {
         settings.gossip_sync_enabled = true;
+        settings_changed = true;
+    }
+
+    if settings_changed {
         settings = save_app_settings(&settings)?;
     }
     set_verbose_logging_enabled(settings.verbose_logging_enabled);
     start_gossip_worker_if_needed(settings.gossip_sync_enabled);
     set_gossip_enabled(settings.gossip_sync_enabled);
     start_relay_worker_if_needed();
-    request_relay_sync("bootstrap_state");
+    if settings.relay_sync_enabled {
+        request_relay_sync("bootstrap_state");
+    }
     let identity = ensure_local_identity()?;
     let contacts = load_contact_aliases()?;
     let chat = load_chat_state()?;
@@ -1003,6 +1033,16 @@ fn start_relay_worker_if_needed() {
 
     thread::spawn(move || {
         let runtime = relay_worker_runtime();
+        let e2e_disable_relay = std::env::var("AETHOS_E2E_DISABLE_RELAY")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if e2e_disable_relay {
+            set_relay_worker_status("disabled_by_e2e_env");
+            log_verbose("relay_worker_disabled_by_e2e_env");
+            loop {
+                let _ = relay_worker_wait_for_command(&rx, Duration::from_millis(1000));
+            }
+        }
         let auth = std::env::var("AETHOS_RELAY_AUTH_TOKEN").ok();
         let mut relay_http_endpoints: Vec<String> = Vec::new();
         let mut relay_ws_endpoints: Vec<String> = Vec::new();
@@ -2609,6 +2649,18 @@ fn apply_cli_state_overrides() {
         } else if let Some(value) = arg.strip_prefix("--aethos-gossip-loopback-only=") {
             if !value.trim().is_empty() {
                 std::env::set_var("AETHOS_GOSSIP_LOOPBACK_ONLY", value.trim());
+            }
+        } else if let Some(value) = arg.strip_prefix("--aethos-e2e-disable-relay=") {
+            if !value.trim().is_empty() {
+                std::env::set_var("AETHOS_E2E_DISABLE_RELAY", value.trim());
+            }
+        } else if let Some(value) = arg.strip_prefix("--aethos-e2e-force-verbose=") {
+            if !value.trim().is_empty() {
+                std::env::set_var("AETHOS_E2E_FORCE_VERBOSE", value.trim());
+            }
+        } else if let Some(value) = arg.strip_prefix("--aethos-e2e-force-gossip=") {
+            if !value.trim().is_empty() {
+                std::env::set_var("AETHOS_E2E_FORCE_GOSSIP", value.trim());
             }
         }
     }
