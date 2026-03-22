@@ -38,6 +38,12 @@ Non-compose local runner:
 # Peer LAN-only baseline (relay disabled)
 bash scripts/e2e/run-scenario.sh --scenario clean --mode peer
 
+# 100-message LAN burst (1 message/second), expect eventual full convergence
+AETHOS_E2E_BURST_COUNT=100 \
+AETHOS_E2E_BURST_INTERVAL_MS=1000 \
+AETHOS_E2E_BURST_RECEIVE_TIMEOUT_MS=900000 \
+bash scripts/e2e/run-scenario.sh --scenario clean --mode peer
+
 # Relay scenarios require toxiproxy + relay endpoint wiring
 AETHOS_E2E_TOXIPROXY_URL=http://127.0.0.1:8474 \
 AETHOS_E2E_RELAY_ENDPOINT=http://127.0.0.1:19082 \
@@ -53,6 +59,11 @@ Runner writes local runtime state and logs under:
 - `spikes/tauri-desktop/e2e/workdir/<run-id>/`
 
 These directories are intentionally gitignored to avoid permission and artifact churn in normal development.
+
+Burst controls:
+- `AETHOS_E2E_BURST_COUNT` (default `1`)
+- `AETHOS_E2E_BURST_INTERVAL_MS` (default `1000`)
+- `AETHOS_E2E_BURST_RECEIVE_TIMEOUT_MS` (default `600000`)
 
 Modes:
 - `relay` (relay-focused)

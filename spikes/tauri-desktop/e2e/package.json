@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "doctor": "node scripts/doctor.mjs",
-    "test": "npm run doctor && mocha --timeout 180000 \"test/**/*.mjs\""
+    "test": "npm run doctor && mocha --timeout 1200000 \"test/**/*.mjs\""
   },
   "dependencies": {
     "chai": "^5.2.1",

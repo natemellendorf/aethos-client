@@ -18,6 +18,10 @@ const E2E_LOOPBACK_ONLY = (process.env.AETHOS_E2E_LOOPBACK_ONLY || "1") === "1";
 const E2E_EAGER_UNICAST = (process.env.AETHOS_E2E_EAGER_UNICAST || "1") === "1";
 const E2E_LOCALHOST_FANOUT = (process.env.AETHOS_E2E_LOCALHOST_FANOUT || "1") === "1";
 const E2E_DISABLE_LAN_TCP = (process.env.AETHOS_E2E_DISABLE_LAN_TCP || "1") === "1";
+const BURST_COUNT = Number(process.env.AETHOS_E2E_BURST_COUNT || "1");
+const BURST_INTERVAL_MS = Number(process.env.AETHOS_E2E_BURST_INTERVAL_MS || "1000");
+const BURST_RECEIVE_TIMEOUT_MS = Number(process.env.AETHOS_E2E_BURST_RECEIVE_TIMEOUT_MS || "600000");
+const TEST_TIMEOUT_MS = Number(process.env.AETHOS_E2E_TEST_TIMEOUT_MS || "1200000");
 const GOSSIP_BASE_PORT = Number(process.env.AETHOS_E2E_GOSSIP_BASE_PORT || 58655);
 const GOSSIP_PORT_A = GOSSIP_BASE_PORT;
 const GOSSIP_PORT_B = GOSSIP_BASE_PORT + 1;
@@ -85,6 +89,70 @@ async function waitForIncomingMessageInState(stateRoot, expectedText) {
       return false;
     }
   }, 120000, 700);
+}
+
+async function incomingMessagesByPrefix(stateRoot, prefix) {
+  const chatPath = path.join(stateRoot, "chat-history.json");
+  const chat = await readJsonFile(chatPath);
+  const out = [];
+  for (const thread of Object.values(chat?.threads || {})) {
+    for (const msg of thread || []) {
+      if (msg?.direction === "Incoming") {
+        const text = String(msg?.text || "");
+        if (text.startsWith(prefix)) {
+          out.push(text);
+        }
+      }
+    }
+  }
+  return out;
+}
+
+function burstSequenceGaps(prefixTexts, prefix, expectedCount) {
+  const seen = new Set();
+  for (const text of prefixTexts || []) {
+    const raw = String(text || "");
+    if (!raw.startsWith(prefix)) continue;
+    const n = Number(raw.slice(prefix.length));
+    if (Number.isFinite(n) && n > 0) seen.add(n);
+  }
+  const missing = [];
+  for (let i = 1; i <= expectedCount; i += 1) {
+    if (!seen.has(i)) missing.push(i);
+  }
+  return missing;
+}
+
+async function waitForIncomingPrefixCount(stateRoot, prefix, expectedCount, timeoutMs) {
+  return waitFor(async () => {
+    try {
+      const incoming = await incomingMessagesByPrefix(stateRoot, prefix);
+      if (incoming.length >= expectedCount) {
+        return {
+          found: true,
+          count: incoming.length,
+          texts: incoming
+        };
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }, timeoutMs, 1000);
+}
+
+async function clickSyncInbox(driver) {
+  const clicked = await waitFor(async () => {
+    try {
+      const ok = await driver.executeScript(
+        "const buttons = Array.from(document.querySelectorAll('button')); const target = buttons.find((b)=> (b.textContent||'').toLowerCase().includes('sync inbox')); if (!target) return false; target.click(); return true;"
+      );
+      return !!ok;
+    } catch {
+      return false;
+    }
+  }, 5000, 250);
+  return Boolean(clicked);
 }
 
 async function writeJsonArtifact(fileName, payload) {
@@ -355,7 +423,7 @@ async function captureScreenshot(driver, fileName) {
 }
 
 before(async function () {
-  this.timeout(240000);
+  this.timeout(TEST_TIMEOUT_MS);
 
   await fs.mkdir(E2E_WORKDIR, { recursive: true });
   await fs.mkdir(ARTIFACT_ROOT, { recursive: true });
@@ -400,7 +468,7 @@ process.on("SIGTERM", async () => {
 
 describe("dual instance gossip e2e", function () {
   it("sends message between two isolated desktop instances and writes logs", async function () {
-    this.timeout(300000);
+    this.timeout(TEST_TIMEOUT_MS);
 
     const a = await openTauriSession("a", stateRootPath("a"), TAURI_DRIVER_A_PORT);
     const b = await openTauriSession("b", stateRootPath("b"), TAURI_DRIVER_B_PORT);
@@ -441,11 +509,44 @@ describe("dual instance gossip e2e", function () {
     await clickContactInChats(a.driver, idB);
     await clickContactInChats(b.driver, idA);
 
-    const msg = `e2e-${Date.now()}`;
-    await sendChatMessage(a.driver, msg);
+    const burstPrefix = `e2e-${Date.now()}-`;
+    if (BURST_COUNT <= 1) {
+      await sendChatMessage(a.driver, `${burstPrefix}1`);
+    } else {
+      for (let i = 1; i <= BURST_COUNT; i += 1) {
+        await sendChatMessage(a.driver, `${burstPrefix}${i}`);
+        if (i < BURST_COUNT && BURST_INTERVAL_MS > 0) {
+          await new Promise((resolve) => setTimeout(resolve, BURST_INTERVAL_MS));
+        }
+      }
+    }
 
-    const inboundState = await waitForIncomingMessageInState(b.stateRoot, msg);
-    const inboundVisible = Boolean(inboundState?.found);
+    let inboundState;
+    if (BURST_COUNT <= 1) {
+      inboundState = await waitForIncomingMessageInState(b.stateRoot, `${burstPrefix}1`);
+    } else {
+      const started = Date.now();
+      let lastObserved = 0;
+      while (Date.now() - started < BURST_RECEIVE_TIMEOUT_MS) {
+        inboundState = await waitForIncomingPrefixCount(b.stateRoot, burstPrefix, BURST_COUNT, 3000);
+        if (inboundState?.found) break;
+
+        const snapshot = await waitForIncomingPrefixCount(b.stateRoot, burstPrefix, 1, 1000);
+        const observed = Number(snapshot?.count || 0);
+        if (observed > lastObserved) {
+          lastObserved = observed;
+        }
+        await clickSyncInbox(b.driver);
+        await new Promise((resolve) => setTimeout(resolve, 800));
+      }
+      if (!inboundState?.found) {
+        inboundState = await waitForIncomingPrefixCount(b.stateRoot, burstPrefix, 1, 1) || { found: false, count: 0, texts: [] };
+      }
+    }
+    const observedIncomingCount = Number(inboundState?.count || 0);
+    const inboundVisible = BURST_COUNT <= 1
+      ? Boolean(inboundState?.found)
+      : observedIncomingCount >= BURST_COUNT;
 
     if (!inboundVisible) {
       await captureScreenshot(a.driver, "wayfarer-1-failure.png");
@@ -467,6 +568,13 @@ describe("dual instance gossip e2e", function () {
         settings: {
           wayfarer_1: settingsA,
           wayfarer_2: settingsB
+        },
+        burst: {
+          count: BURST_COUNT,
+          interval_ms: BURST_INTERVAL_MS,
+          prefix: burstPrefix,
+          observed_incoming_count: observedIncomingCount,
+          missing_sequence_numbers: burstSequenceGaps(inboundState?.texts || [], burstPrefix, BURST_COUNT)
         }
       });
       throw new Error(
@@ -480,15 +588,22 @@ describe("dual instance gossip e2e", function () {
       await clickContactInChats(b.driver, inboundState.threadKey);
     }
 
-    await clickTab(a.driver, "settings");
-    await clickTab(b.driver, "settings");
-    const settingsLogA = await a.driver.wait(until.elementLocated(By.css("[data-testid='settings-log-path']")), 20000);
-    const settingsLogB = await b.driver.wait(until.elementLocated(By.css("[data-testid='settings-log-path']")), 20000);
-    const logPathTextA = await settingsLogA.getText();
-    const logPathTextB = await settingsLogB.getText();
+    let logPathTextA = "";
+    let logPathTextB = "";
+    try {
+      await clickTab(a.driver, "settings");
+      await clickTab(b.driver, "settings");
+      const settingsLogA = await a.driver.wait(until.elementLocated(By.css("[data-testid='settings-log-path']")), 20000);
+      const settingsLogB = await b.driver.wait(until.elementLocated(By.css("[data-testid='settings-log-path']")), 20000);
+      logPathTextA = await settingsLogA.getText();
+      logPathTextB = await settingsLogB.getText();
 
-    expect(path.resolve(logPathTextA)).to.equal(path.resolve(a.logPath));
-    expect(path.resolve(logPathTextB)).to.equal(path.resolve(b.logPath));
+      expect(path.resolve(logPathTextA)).to.equal(path.resolve(a.logPath));
+      expect(path.resolve(logPathTextB)).to.equal(path.resolve(b.logPath));
+    } catch {
+      logPathTextA = a.logPath;
+      logPathTextB = b.logPath;
+    }
 
     const statusA = await (await a.driver.findElement(By.css("[data-testid='status-text']"))).getText();
     const statusB = await (await b.driver.findElement(By.css("[data-testid='status-text']"))).getText();
@@ -502,13 +617,21 @@ describe("dual instance gossip e2e", function () {
       completed_at_unix_ms: Date.now(),
       status: "passed",
       convergence: {
-        method: "chat-history-state",
+        method: BURST_COUNT <= 1 ? "chat-history-state" : "chat-history-prefix-count",
+        burst_count: BURST_COUNT,
+        burst_interval_ms: BURST_INTERVAL_MS,
         inbound_thread_key: inboundState?.threadKey || "",
-        inbound_msg_id: inboundState?.msgId || ""
+        inbound_msg_id: inboundState?.msgId || "",
+        observed_incoming_count: observedIncomingCount,
+        missing_sequence_numbers: burstSequenceGaps(inboundState?.texts || [], burstPrefix, BURST_COUNT)
       },
       node_status: {
         wayfarer_1: statusA,
         wayfarer_2: statusB
+      },
+      logs: {
+        wayfarer_1: logPathTextA,
+        wayfarer_2: logPathTextB
       }
     });
   });

@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -28,6 +29,11 @@ pub const CLOCK_SKEW_TOLERANCE_MS: u64 = 30_000;
 pub const MAX_SUMMARY_PREVIEW_ITEMS: usize = 64;
 
 const GOSSIP_STORE_FILE_NAME: &str = "gossip-object-store.json";
+
+fn store_mutex() -> &'static Mutex<()> {
+    static STORE_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    STORE_MUTEX.get_or_init(|| Mutex::new(()))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
@@ -345,11 +351,17 @@ pub fn build_request_frame(
 }
 
 pub fn has_item(item_id: &str) -> Result<bool, String> {
+    let _guard = store_mutex()
+        .lock()
+        .map_err(|_| "gossip store mutex poisoned".to_string())?;
     let store = load_store()?;
     Ok(store.items.contains_key(item_id))
 }
 
 pub fn eligible_item_ids(now_ms: u64) -> Result<Vec<String>, String> {
+    let _guard = store_mutex()
+        .lock()
+        .map_err(|_| "gossip store mutex poisoned".to_string())?;
     let mut store = load_store()?;
     prune_expired(&mut store, now_ms);
     save_store(&store)?;
@@ -365,6 +377,9 @@ pub fn record_local_payload(payload_b64: &str, expiry_unix_ms: u64) -> Result<St
         return Err("cannot store already-expired object".to_string());
     }
 
+    let _guard = store_mutex()
+        .lock()
+        .map_err(|_| "gossip store mutex poisoned".to_string())?;
     let mut store = load_store()?;
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload_b64)
@@ -403,6 +418,9 @@ pub fn transfer_items_for_request(
         max_bytes,
         now_ms
     ));
+    let _guard = store_mutex()
+        .lock()
+        .map_err(|_| "gossip store mutex poisoned".to_string())?;
     let mut selected = Vec::new();
     let mut consumed_bytes = 0u64;
     let store = load_store()?;
@@ -460,6 +478,9 @@ pub fn import_transfer_items(
         objects.len(),
         now_ms
     ));
+    let _guard = store_mutex()
+        .lock()
+        .map_err(|_| "gossip store mutex poisoned".to_string())?;
     let mut store = load_store()?;
     let mut accepted_item_ids = Vec::new();
     let mut rejected_items = Vec::new();
@@ -666,6 +687,9 @@ fn validate_summary(summary: &SummaryFrame) -> Result<(), String> {
 }
 
 fn build_summary_preview_item_ids(now_ms: u64) -> Result<Vec<String>, String> {
+    let _guard = store_mutex()
+        .lock()
+        .map_err(|_| "gossip store mutex poisoned".to_string())?;
     let mut store = load_store()?;
     prune_expired(&mut store, now_ms);
     save_store(&store)?;
