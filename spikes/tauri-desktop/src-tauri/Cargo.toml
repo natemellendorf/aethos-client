@@ -27,6 +27,7 @@ tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 url = "2"
 webbrowser = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [features]
 default = []

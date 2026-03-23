@@ -1,7 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -10,6 +7,9 @@ use ciborium::{de::from_reader, ser::into_writer};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::aethos_core::gossip_store_sqlite::{
+    self, ImportWriteObject, RecordPutOutcome, StoredItemRecord,
+};
 use crate::aethos_core::logging::log_verbose;
 use crate::aethos_core::protocol::{
     bytes_to_hex_lower, decode_cbor_value_exact, decode_envelope_payload_b64,
@@ -28,13 +28,6 @@ pub const BLOOM_HASH_COUNT: u8 = 4;
 pub const CLOCK_SKEW_TOLERANCE_MS: u64 = 30_000;
 pub const MAX_SUMMARY_PREVIEW_ITEMS: usize = 64;
 const RELAY_INGEST_MAX_ITEMS_DEFAULT: usize = 96;
-
-const GOSSIP_STORE_FILE_NAME: &str = "gossip-object-store.json";
-
-fn store_mutex() -> &'static Mutex<()> {
-    static STORE_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
-    STORE_MUTEX.get_or_init(|| Mutex::new(()))
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
@@ -136,20 +129,6 @@ pub struct RejectedItem {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct GossipStore {
-    items: BTreeMap<String, StoredItem>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StoredItem {
-    item_id: String,
-    envelope_b64: String,
-    expiry_unix_ms: u64,
-    hop_count: u16,
-    recorded_at_unix_ms: u64,
-}
-
 pub fn serialize_frame(frame: &GossipSyncFrame) -> Result<Vec<u8>, String> {
     let (frame_type, payload) = frame_type_and_payload(frame)?;
     let envelope = Value::Map(vec![
@@ -174,19 +153,34 @@ pub fn parse_frame(raw: &[u8]) -> Result<GossipSyncFrame, String> {
 
     let envelope = decode_cbor_value_exact(raw, "gossip frame")
         .map_err(|err| classify_frame_parse_error(&err))?;
-    let canonical = encode_cbor_value_deterministic(&envelope).map_err(|err| {
-        classify_frame_parse_error(&format!("canonical frame encode failed: {err}"))
-    })?;
-    if canonical.as_slice() != raw {
-        return Err(
-            "parse gossip frame cbor: frame is not deterministic canonical CBOR".to_string(),
-        );
+    if require_canonical_inbound_frame() {
+        let canonical = encode_cbor_value_deterministic(&envelope).map_err(|err| {
+            classify_frame_parse_error(&format!("canonical frame encode failed: {err}"))
+        })?;
+        if canonical.as_slice() != raw {
+            return Err(
+                "parse gossip frame cbor: frame is not deterministic canonical CBOR"
+                    .to_string(),
+            );
+        }
     }
 
     let frame =
         frame_from_envelope_value(envelope).map_err(|err| classify_frame_parse_error(&err))?;
     validate_frame(&frame)?;
     Ok(frame)
+}
+
+fn require_canonical_inbound_frame() -> bool {
+    std::env::var("AETHOS_GOSSIP_REQUIRE_CANONICAL_INBOUND_CBOR")
+        .ok()
+        .map(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn classify_frame_parse_error(parse_error: &str) -> String {
@@ -365,45 +359,15 @@ pub fn build_request_frame(
 }
 
 pub fn has_item(item_id: &str) -> Result<bool, String> {
-    let _guard = store_mutex()
-        .lock()
-        .map_err(|_| "gossip store mutex poisoned".to_string())?;
-    let store = load_store()?;
-    Ok(store.items.contains_key(item_id))
+    gossip_store_sqlite::has_item(item_id)
 }
 
 pub fn eligible_item_ids(now_ms: u64) -> Result<Vec<String>, String> {
-    let _guard = store_mutex()
-        .lock()
-        .map_err(|_| "gossip store mutex poisoned".to_string())?;
-    let mut store = load_store()?;
-    prune_expired(&mut store, now_ms);
-    save_store(&store)?;
-    Ok(store.items.keys().cloned().collect())
+    gossip_store_sqlite::eligible_item_ids(now_ms)
 }
 
 fn eligible_relay_ingest_item_ids(now_ms: u64, max_items: usize) -> Result<Vec<String>, String> {
-    let _guard = store_mutex()
-        .lock()
-        .map_err(|_| "gossip store mutex poisoned".to_string())?;
-    let mut store = load_store()?;
-    prune_expired(&mut store, now_ms);
-    save_store(&store)?;
-
-    let mut items = store.items.values().collect::<Vec<_>>();
-    items.sort_by(|a, b| {
-        a.hop_count
-            .cmp(&b.hop_count)
-            .then_with(|| a.envelope_b64.len().cmp(&b.envelope_b64.len()))
-            .then_with(|| b.recorded_at_unix_ms.cmp(&a.recorded_at_unix_ms))
-            .then_with(|| a.item_id.cmp(&b.item_id))
-    });
-
-    let mut selected = items
-        .into_iter()
-        .take(max_items)
-        .map(|item| item.item_id.clone())
-        .collect::<Vec<_>>();
+    let mut selected = gossip_store_sqlite::eligible_relay_ingest_item_ids(now_ms, max_items)?;
     selected.sort_by_key(|item_id| decode_item_id(item_id).unwrap_or_default());
     Ok(selected)
 }
@@ -417,10 +381,6 @@ pub fn record_local_payload(payload_b64: &str, expiry_unix_ms: u64) -> Result<St
         return Err("cannot store already-expired object".to_string());
     }
 
-    let _guard = store_mutex()
-        .lock()
-        .map_err(|_| "gossip store mutex poisoned".to_string())?;
-    let mut store = load_store()?;
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload_b64)
         .map_err(|err| format!("payload decode failed: {err}"))?;
@@ -432,43 +392,24 @@ pub fn record_local_payload(payload_b64: &str, expiry_unix_ms: u64) -> Result<St
         raw.len()
     ));
 
-    if let Some(existing) = store.items.get_mut(&item_id) {
-        if existing.envelope_b64 != payload_b64 {
-            return Err("existing item_id maps to different envelope bytes".to_string());
+    let outcome =
+        gossip_store_sqlite::record_local_item(&item_id, payload_b64, expiry_unix_ms, 0, now)?;
+    match outcome {
+        RecordPutOutcome::Inserted => {
+            log_verbose(&format!("object_store_put_insert: item_id={item_id}"));
         }
-        let mut changed = false;
-        if existing.expiry_unix_ms < expiry_unix_ms {
-            existing.expiry_unix_ms = expiry_unix_ms;
-            changed = true;
-        }
-        if existing.recorded_at_unix_ms < now {
-            existing.recorded_at_unix_ms = now;
-            changed = true;
-        }
-        let refreshed_expiry = existing.expiry_unix_ms;
-        if changed {
-            prune_expired(&mut store, now);
-            save_store(&store)?;
+        RecordPutOutcome::Refreshed {
+            refreshed_expiry_unix_ms,
+        } => {
             log_verbose(&format!(
                 "object_store_put_refresh: item_id={} expiry_unix_ms={}",
-                item_id, refreshed_expiry
+                item_id, refreshed_expiry_unix_ms
             ));
-        } else {
+        }
+        RecordPutOutcome::Dedupe => {
             log_verbose(&format!("object_store_put_dedupe: item_id={item_id}"));
         }
-        return Ok(item_id);
     }
-
-    let item = StoredItem {
-        item_id: item_id.clone(),
-        envelope_b64: payload_b64.to_string(),
-        expiry_unix_ms,
-        hop_count: 0,
-        recorded_at_unix_ms: now,
-    };
-    store.items.insert(item_id.clone(), item);
-    prune_expired(&mut store, now);
-    save_store(&store)?;
     Ok(item_id)
 }
 
@@ -485,24 +426,12 @@ pub fn transfer_items_for_request(
         max_bytes,
         now_ms
     ));
-    let _guard = store_mutex()
-        .lock()
-        .map_err(|_| "gossip store mutex poisoned".to_string())?;
     let mut selected = Vec::new();
     let mut consumed_bytes = 0u64;
-    let store = load_store()?;
     let max_transfer_bytes = max_bytes.min(MAX_TRANSFER_BYTES);
 
-    let mut candidates = requested_item_ids
-        .iter()
-        .filter_map(|item_id| {
-            let stored = store.items.get(item_id)?;
-            if now_ms + CLOCK_SKEW_TOLERANCE_MS >= stored.expiry_unix_ms {
-                return None;
-            }
-            Some(stored)
-        })
-        .collect::<Vec<_>>();
+    let mut candidates =
+        gossip_store_sqlite::transfer_candidates_for_request(requested_item_ids, now_ms)?;
     candidates.sort_by(|a, b| {
         a.envelope_b64
             .len()
@@ -556,13 +485,17 @@ pub fn import_transfer_items(
         objects.len(),
         now_ms
     ));
-    let _guard = store_mutex()
-        .lock()
-        .map_err(|_| "gossip store mutex poisoned".to_string())?;
-    let mut store = load_store()?;
     let mut accepted_item_ids = Vec::new();
     let mut rejected_items = Vec::new();
     let mut new_messages = Vec::new();
+    let mut pending_new_records = BTreeMap::<String, ImportWriteObject>::new();
+    let mut pending_new_inserts = Vec::new();
+    let existing = gossip_store_sqlite::get_existing_items_for_ids(
+        &objects
+            .iter()
+            .map(|object| object.item_id.clone())
+            .collect::<Vec<_>>(),
+    )?;
 
     for object in objects {
         let parsed = match validate_transfer_object(object)
@@ -588,23 +521,27 @@ pub fn import_transfer_items(
             continue;
         }
 
-        let incoming = StoredItem {
-            item_id: object.item_id.clone(),
-            envelope_b64: object.envelope_b64.clone(),
-            expiry_unix_ms: object.expiry_unix_ms,
-            hop_count: object.hop_count,
-            recorded_at_unix_ms: now_ms,
+        let existing_item = if let Some(pending) = pending_new_records.get(&object.item_id) {
+            Some(StoredItemRecord {
+                item_id: pending.item_id.clone(),
+                envelope_b64: pending.envelope_b64.clone(),
+                expiry_unix_ms: pending.expiry_unix_ms,
+                hop_count: pending.hop_count,
+                recorded_at_unix_ms: pending.recorded_at_unix_ms,
+            })
+        } else {
+            existing.get(&object.item_id).cloned()
         };
 
-        match store.items.get(&object.item_id) {
-            Some(existing) if existing.envelope_b64 != incoming.envelope_b64 => {
+        match existing_item {
+            Some(existing_item) if existing_item.envelope_b64 != object.envelope_b64 => {
                 rejected_items.push(RejectedItem {
                     item_id: object.item_id.clone(),
                     code: "ITEM_ID_MISMATCH".to_string(),
                     message: "existing item_id maps to different envelope bytes".to_string(),
                 });
             }
-            Some(existing) if object.hop_count < existing.hop_count => {
+            Some(existing_item) if object.hop_count < existing_item.hop_count => {
                 rejected_items.push(RejectedItem {
                     item_id: object.item_id.clone(),
                     code: "HOP_REGRESSION".to_string(),
@@ -615,7 +552,15 @@ pub fn import_transfer_items(
                 accepted_item_ids.push(object.item_id.clone());
             }
             None => {
-                store.items.insert(object.item_id.clone(), incoming);
+                let insert = ImportWriteObject {
+                    item_id: object.item_id.clone(),
+                    envelope_b64: object.envelope_b64.clone(),
+                    expiry_unix_ms: object.expiry_unix_ms,
+                    hop_count: object.hop_count,
+                    recorded_at_unix_ms: now_ms,
+                };
+                pending_new_records.insert(object.item_id.clone(), insert.clone());
+                pending_new_inserts.push(insert);
                 accepted_item_ids.push(object.item_id.clone());
                 if parsed.to_wayfarer_id_hex == local_wayfarer_id {
                     match decode_envelope_payload_utf8_preview(&object.envelope_b64) {
@@ -650,8 +595,7 @@ pub fn import_transfer_items(
         }
     }
 
-    prune_expired(&mut store, now_ms);
-    save_store(&store)?;
+    gossip_store_sqlite::insert_import_items(&pending_new_inserts, now_ms)?;
     log_verbose(&format!(
         "transfer_import_done: accepted={} rejected={} new_messages={}",
         accepted_item_ids.len(),
@@ -765,16 +709,8 @@ fn validate_summary(summary: &SummaryFrame) -> Result<(), String> {
 }
 
 fn build_summary_preview_item_ids(now_ms: u64) -> Result<Vec<String>, String> {
-    let _guard = store_mutex()
-        .lock()
-        .map_err(|_| "gossip store mutex poisoned".to_string())?;
-    let mut store = load_store()?;
-    prune_expired(&mut store, now_ms);
-    save_store(&store)?;
-
-    let mut ranked = store
-        .items
-        .values()
+    let mut ranked = gossip_store_sqlite::summary_preview_candidates(now_ms)?
+        .iter()
         .map(|item| {
             (
                 item.hop_count,
@@ -891,63 +827,6 @@ fn is_valid_item_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
-fn prune_expired(store: &mut GossipStore, now_ms: u64) {
-    store.items.retain(|_, item| {
-        !item.envelope_b64.is_empty()
-            && now_ms + CLOCK_SKEW_TOLERANCE_MS < item.expiry_unix_ms
-            && decode_envelope_payload_b64(&item.envelope_b64).is_ok()
-    });
-}
-
-fn load_store() -> Result<GossipStore, String> {
-    let path = gossip_store_path();
-    if !path.exists() {
-        return Ok(GossipStore::default());
-    }
-    let content = fs::read_to_string(&path)
-        .map_err(|err| format!("failed to read gossip store at {}: {err}", path.display()))?;
-    serde_json::from_str(&content)
-        .map_err(|err| format!("failed to parse gossip store at {}: {err}", path.display()))
-}
-
-fn save_store(store: &GossipStore) -> Result<(), String> {
-    let path = gossip_store_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|err| format!("failed creating gossip store directory: {err}"))?;
-    }
-    let serialized = serde_json::to_string_pretty(store)
-        .map_err(|err| format!("failed serializing gossip store: {err}"))?;
-    fs::write(&path, serialized)
-        .map_err(|err| format!("failed writing gossip store at {}: {err}", path.display()))
-}
-
-fn gossip_store_path() -> PathBuf {
-    if let Ok(state_dir) = std::env::var("AETHOS_STATE_DIR") {
-        if !state_dir.trim().is_empty() {
-            return Path::new(&state_dir).join(GOSSIP_STORE_FILE_NAME);
-        }
-    }
-
-    if let Ok(xdg_state_home) = std::env::var("XDG_STATE_HOME") {
-        if !xdg_state_home.trim().is_empty() {
-            return Path::new(&xdg_state_home)
-                .join("aethos-linux")
-                .join(GOSSIP_STORE_FILE_NAME);
-        }
-    }
-
-    if let Ok(home) = std::env::var("HOME") {
-        return Path::new(&home)
-            .join(".local")
-            .join("state")
-            .join("aethos-linux")
-            .join(GOSSIP_STORE_FILE_NAME);
-    }
-
-    std::env::temp_dir().join(GOSSIP_STORE_FILE_NAME)
-}
-
 fn now_unix_ms() -> u64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => duration.as_millis() as u64,
@@ -1057,6 +936,12 @@ mod tests {
         fn set(key: &'static str, value: &std::path::Path) -> Self {
             let previous = std::env::var(key).ok();
             std::env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn clear(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::remove_var(key);
             Self { key, previous }
         }
     }
@@ -1222,6 +1107,53 @@ mod tests {
         assert!(parse_frame(&combined)
             .expect_err("must reject trailing frame data")
             .contains("exactly one complete CBOR value"));
+    }
+
+    #[test]
+    fn parse_frame_accepts_noncanonical_semantic_equivalent_cbor() {
+        let _lock = test_env_lock().lock().expect("lock test env");
+        let _canonical_off_guard =
+            EnvVarGuard::clear("AETHOS_GOSSIP_REQUIRE_CANONICAL_INBOUND_CBOR");
+
+        let pubkey = [0x22u8; 32];
+        let node_id = bytes_to_hex_lower(&Sha256::digest(pubkey));
+        let hello = build_hello_frame(
+            &node_id,
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(pubkey),
+        )
+        .expect("hello");
+        let canonical_raw = serialize_frame(&hello).expect("serialize");
+
+        let envelope = decode_cbor_value_exact(&canonical_raw, "frame").expect("decode");
+        let Value::Map(entries) = envelope else {
+            panic!("expected envelope map")
+        };
+        let payload = entries
+            .iter()
+            .find_map(|(key, value)| match key {
+                Value::Text(text) if text == "payload" => Some(value.clone()),
+                _ => None,
+            })
+            .expect("payload");
+        let frame_type = entries
+            .iter()
+            .find_map(|(key, value)| match (key, value) {
+                (Value::Text(key_text), Value::Text(type_text)) if key_text == "type" => {
+                    Some(type_text.clone())
+                }
+                _ => None,
+            })
+            .expect("type");
+
+        let noncanonical = Value::Map(vec![
+            (Value::Text("payload".to_string()), payload),
+            (Value::Text("type".to_string()), Value::Text(frame_type)),
+        ]);
+        let mut noncanonical_raw = Vec::new();
+        into_writer(&noncanonical, &mut noncanonical_raw).expect("encode noncanonical");
+
+        let parsed = parse_frame(&noncanonical_raw).expect("parse noncanonical frame");
+        assert!(matches!(parsed, GossipSyncFrame::Hello(_)));
     }
 
     #[test]

@@ -277,7 +277,12 @@ Relay terminals and startup details should follow the `aethos-relay` README setu
 ## Local gossip sync (direct peer path)
 
 - Gossip sync runs in the background and uses UDP broadcast on port `47655`.
-- The client emits single-page `inventory_summary` frames (MVP0 profile), responds to `missing_request`, and imports `transfer` frames into local chats.
+- A single peer encounter MAY contain multiple SUMMARY/RELAY_INGEST -> REQUEST -> TRANSFER -> RECEIPT rounds until convergence or bounded stop conditions.
+- Clients SHOULD drain within one encounter (instead of waiting for next HELLO cadence) while enforcing round/time/byte/no-progress/timeout budgets.
+- Gossip wire schema remains GossipV1 (`HELLO`, `SUMMARY`, `REQUEST`, `TRANSFER`, `RECEIPT`, `RELAY_INGEST`) with no frame-format changes.
+- Active durable gossip storage uses SQLite (`gossip-object-store.sqlite3`) with indexed selection/pruning and transactional import/record paths.
+- In-memory per-peer encounter state tracks requested/accepted IDs, progress streak, elapsed time/bytes, and explicit stop reason; this state is not persisted.
+- One-time migration: if SQLite store is absent and legacy `gossip-object-store.json` exists, it is imported then renamed to `gossip-object-store.json.bak`.
 - Use LAN/private network segments only for this mode. Inventory metadata is visible to peers that can receive local gossip traffic.
 
 ## GUI + network E2E harness (agent-operable)

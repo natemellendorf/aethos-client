@@ -1,3 +1,4 @@
+pub mod gossip_store_sqlite;
 pub mod gossip_sync;
 pub mod identity_store;
 pub mod logging;

@@ -19,6 +19,8 @@ The GTK implementation remains in `src/main.rs` during migration, but this path 
 - QR share generation + contact QR import flow.
 - Outbound status transitions (sending/sent/failed), retry action, and metadata details.
 - New-contact and unread badges in contact list.
+- LAN gossip encounters now drain across multiple reconciliation rounds in one peer interaction (bounded by round/time/byte/no-progress/timeout budgets).
+- Gossip durable storage now uses SQLite with automatic one-time import from legacy `gossip-object-store.json` to `gossip-object-store.sqlite3`.
 
 ## Run (Dev)
 
