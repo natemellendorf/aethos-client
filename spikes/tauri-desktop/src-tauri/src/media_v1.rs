@@ -55,6 +55,7 @@ const MISSING_RESPONSE_CHUNK_DEDUP_WINDOW_MS: u64 = 8_000;
 const E2E_WIRE_BUCKET_SUSTAINED_BYTES_PER_MIN_DEFAULT: u64 = 64 * 1024 * 1024;
 const E2E_WIRE_BUCKET_BURST_BYTES_DEFAULT: u64 = 64 * 1024 * 1024;
 const E2E_MISSING_RESPONSE_CHUNK_DEDUP_WINDOW_MS_DEFAULT: u64 = 1_500;
+const E2E_MISSING_RESPONSE_CHUNK_CEILING_DEFAULT: usize = 128;
 const E2E_CHUNKS_PER_MINUTE_LIMIT_DEFAULT: usize = 4_000;
 
 #[derive(Debug, Clone)]
@@ -1078,6 +1079,7 @@ pub fn process_incoming_media_message(
                     caption: outbound.caption.clone(),
                 };
                 let mut sent_chunks = 0usize;
+                let chunk_ceiling = missing_response_chunk_ceiling();
                 let dedup_key = format!("{}:{}", sender, msg.transfer_id);
                 for range in msg.ranges {
                     if range.start > range.end {
@@ -1089,7 +1091,7 @@ pub fn process_incoming_media_message(
                     }
                     let mut index = range.start;
                     while index <= range.end {
-                        if sent_chunks >= MISSING_RESPONSE_CHUNK_CEILING {
+                        if sent_chunks >= chunk_ceiling {
                             break;
                         }
                         if index >= outbound.chunk_count {
@@ -1128,7 +1130,7 @@ pub fn process_incoming_media_message(
                     msg.transfer_id,
                     requested_ranges,
                     sent_chunks,
-                    MISSING_RESPONSE_CHUNK_CEILING
+                    chunk_ceiling
                 ));
             } else {
                 log_verbose(&format!(
@@ -2906,6 +2908,18 @@ fn missing_response_chunk_dedup_window_ms() -> u64 {
         200,
         10_000,
     )
+}
+
+fn missing_response_chunk_ceiling() -> usize {
+    if !e2e_enabled() {
+        return MISSING_RESPONSE_CHUNK_CEILING;
+    }
+    env_u64_clamped(
+        "AETHOS_MEDIA_E2E_MISSING_RESPONSE_CHUNK_CEILING",
+        E2E_MISSING_RESPONSE_CHUNK_CEILING_DEFAULT as u64,
+        16,
+        512,
+    ) as usize
 }
 
 fn chunks_per_minute_limit() -> usize {

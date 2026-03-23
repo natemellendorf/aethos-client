@@ -89,7 +89,7 @@ fn with_test_state_dir<T>(state_dir: &Path, f: impl FnOnce() -> T) -> T {
 fn test_state_dir_override() -> Option<PathBuf> {
     #[cfg(test)]
     {
-        return TEST_STATE_DIR_OVERRIDE.with(|slot| slot.borrow().clone());
+        TEST_STATE_DIR_OVERRIDE.with(|slot| slot.borrow().clone())
     }
 
     #[cfg(not(test))]
@@ -1004,7 +1004,10 @@ mod tests {
             let first_ids = eligible_item_ids(1_700_000_000_000u64).expect("first migration run");
             assert!(first_ids.iter().any(|value| value == &item_id));
             let backup_path = backup_path_for(&legacy_path);
-            assert!(backup_path.exists(), "expected legacy backup after migration");
+            assert!(
+                backup_path.exists(),
+                "expected legacy backup after migration"
+            );
 
             with_connection("test_reset_migration_marker", |conn| {
                 conn.execute(
@@ -1066,7 +1069,10 @@ mod tests {
             let ids = eligible_item_ids(1_700_000_000_000u64).expect("migration should run");
             assert!(ids.iter().any(|value| value == &item_id));
             assert!(!legacy_path.exists(), "legacy json should be archived");
-            assert!(backup_path_for(&legacy_path).exists(), "expected backup file");
+            assert!(
+                backup_path_for(&legacy_path).exists(),
+                "expected backup file"
+            );
         });
         reset_runtime_for_tests();
     }
@@ -1082,7 +1088,8 @@ mod tests {
             let legacy_path = state_dir.join(LEGACY_JSON_STORE_FILE_NAME);
             let default_backup_path = backup_path_for(&legacy_path);
             let default_backup_contents = "preexisting backup must be preserved";
-            fs::write(&default_backup_path, default_backup_contents).expect("write existing backup");
+            fs::write(&default_backup_path, default_backup_contents)
+                .expect("write existing backup");
 
             let (payload, item_id) = build_legacy_payload_and_item_id([12u8; 32], "legacy");
             write_legacy_json(&legacy_path, &payload, &item_id);
@@ -1098,9 +1105,7 @@ mod tests {
                 .expect("read state dir")
                 .filter_map(Result::ok)
                 .map(|entry| entry.path())
-                .filter(|path| {
-                    path.to_string_lossy().starts_with(&backup_prefix) && path.is_file()
-                })
+                .filter(|path| path.to_string_lossy().starts_with(&backup_prefix) && path.is_file())
                 .collect::<Vec<_>>();
             assert!(
                 !archived_backup_candidates.is_empty(),
@@ -1126,7 +1131,10 @@ mod tests {
             let ids = eligible_item_ids(1_700_000_000_000u64).expect("migration from backup");
             assert!(ids.iter().any(|value| value == &item_id));
             assert!(!legacy_path.exists(), "json file should remain absent");
-            assert!(backup_path.exists(), "backup source should remain available");
+            assert!(
+                backup_path.exists(),
+                "backup source should remain available"
+            );
         });
         reset_runtime_for_tests();
     }

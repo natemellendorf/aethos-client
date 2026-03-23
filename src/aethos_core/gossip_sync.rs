@@ -27,7 +27,7 @@ pub const BLOOM_FILTER_BYTES: usize = 2048;
 pub const BLOOM_HASH_COUNT: u8 = 4;
 pub const CLOCK_SKEW_TOLERANCE_MS: u64 = 30_000;
 pub const MAX_SUMMARY_PREVIEW_ITEMS: usize = 64;
-const RELAY_INGEST_MAX_ITEMS_DEFAULT: usize = 96;
+const RELAY_INGEST_MAX_ITEMS_DEFAULT: usize = MAX_WANT_ITEMS;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
@@ -159,8 +159,7 @@ pub fn parse_frame(raw: &[u8]) -> Result<GossipSyncFrame, String> {
         })?;
         if canonical.as_slice() != raw {
             return Err(
-                "parse gossip frame cbor: frame is not deterministic canonical CBOR"
-                    .to_string(),
+                "parse gossip frame cbor: frame is not deterministic canonical CBOR".to_string(),
             );
         }
     }

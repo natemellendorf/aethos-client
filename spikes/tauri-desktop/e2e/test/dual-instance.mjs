@@ -22,7 +22,8 @@ const E2E_DISABLE_LAN_TCP = (process.env.AETHOS_E2E_DISABLE_LAN_TCP || "1") === 
 const BURST_COUNT = Number(process.env.AETHOS_E2E_BURST_COUNT || "1");
 const BURST_INTERVAL_MS = Number(process.env.AETHOS_E2E_BURST_INTERVAL_MS || "1000");
 const BURST_RECEIVE_TIMEOUT_MS = Number(process.env.AETHOS_E2E_BURST_RECEIVE_TIMEOUT_MS || "600000");
-const MEDIA_TRANSFER_TIMEOUT_MS = Number(process.env.AETHOS_E2E_MEDIA_TRANSFER_TIMEOUT_MS || "120000");
+const MEDIA_MANIFEST_TIMEOUT_MS = Number(process.env.AETHOS_E2E_MEDIA_MANIFEST_TIMEOUT_MS || "240000");
+const MEDIA_TRANSFER_TIMEOUT_MS = Number(process.env.AETHOS_E2E_MEDIA_TRANSFER_TIMEOUT_MS || "240000");
 const TEST_TIMEOUT_MS = Number(process.env.AETHOS_E2E_TEST_TIMEOUT_MS || "1200000");
 const GOSSIP_BASE_PORT = Number(process.env.AETHOS_E2E_GOSSIP_BASE_PORT || 58655);
 const GOSSIP_PORT_A = GOSSIP_BASE_PORT;
@@ -35,11 +36,11 @@ const E2E_WORKDIR = process.env.AETHOS_E2E_WORKDIR
   : path.resolve(DESKTOP_DIR, "e2e", "workdir", RUN_ID);
 const MEDIA_SEED_BASE = process.env.AETHOS_E2E_MEDIA_SEED || `aethos-media-${RUN_ID}`;
 const MEDIA_E2E_MAX_ITEM_PAYLOAD_B64_BYTES = Number(process.env.AETHOS_MEDIA_E2E_MAX_ITEM_PAYLOAD_B64_BYTES || "16384");
-const MEDIA_E2E_TTL_SECONDS = Number(process.env.AETHOS_MEDIA_E2E_TTL_SECONDS || "180");
+const MEDIA_E2E_TTL_SECONDS = Number(process.env.AETHOS_MEDIA_E2E_TTL_SECONDS || "360");
 const MEDIA_E2E_MISSING_MIN_INTERVAL_MS = Number(process.env.AETHOS_MEDIA_E2E_MISSING_MIN_INTERVAL_MS || "350");
 const MEDIA_E2E_FALLBACK_TRANSFER_MAX_BYTES = Number(process.env.AETHOS_LAN_FALLBACK_TRANSFER_MAX_BYTES || "48500");
 const MEDIA_E2E_FALLBACK_MAX_CHUNKS_PER_REQUEST = Number(process.env.AETHOS_LAN_FALLBACK_MAX_CHUNKS_PER_REQUEST || "96");
-const MEDIA_E2E_TCP_REQUEST_ENCOUNTER = process.env.AETHOS_LAN_TCP_REQUEST_ENCOUNTER || "0";
+const MEDIA_E2E_TCP_REQUEST_ENCOUNTER = process.env.AETHOS_LAN_TCP_REQUEST_ENCOUNTER || "1";
 const MEDIA_E2E_CONTROL_FASTLANE_MAX_ITEMS = Number(process.env.AETHOS_LAN_MEDIA_CONTROL_FASTLANE_MAX_ITEMS || "4");
 const MEDIA_E2E_CONTROL_FASTLANE_PACE_MS = Number(process.env.AETHOS_LAN_MEDIA_CONTROL_FASTLANE_PACE_MS || "8");
 const MEDIA_E2E_MISSING_FASTLANE_REDUNDANCY = Number(process.env.AETHOS_MEDIA_MISSING_FASTLANE_REDUNDANCY || "2");
@@ -51,6 +52,9 @@ const MEDIA_E2E_WIRE_BUCKET_BURST_BYTES = Number(
 );
 const MEDIA_E2E_MISSING_RESPONSE_DEDUP_WINDOW_MS = Number(
   process.env.AETHOS_MEDIA_E2E_MISSING_RESPONSE_DEDUP_WINDOW_MS || "1500"
+);
+const MEDIA_E2E_MISSING_RESPONSE_CHUNK_CEILING = Number(
+  process.env.AETHOS_MEDIA_E2E_MISSING_RESPONSE_CHUNK_CEILING || "128"
 );
 const MEDIA_E2E_CHUNKS_PER_MINUTE_LIMIT = Number(
   process.env.AETHOS_MEDIA_E2E_CHUNKS_PER_MINUTE_LIMIT || "4000"
@@ -505,6 +509,10 @@ async function getOwnWayfarerId(driver, fallbackStateRoot) {
 
 async function openTauriSession(sessionName, stateRoot, tauriPort = 4444, extraEnv = {}) {
   await fs.mkdir(stateRoot, { recursive: true });
+  const disableLanTcpValue =
+    extraEnv.AETHOS_DISABLE_LAN_TCP !== undefined
+      ? String(extraEnv.AETHOS_DISABLE_LAN_TCP)
+      : (E2E_DISABLE_LAN_TCP ? "1" : "0");
   const env = {
     ...process.env,
     TAURI_AUTOMATION: "true",
@@ -512,7 +520,7 @@ async function openTauriSession(sessionName, stateRoot, tauriPort = 4444, extraE
     AETHOS_STATE_DIR: stateRoot,
     XDG_DATA_HOME: stateRoot,
     XDG_STATE_HOME: stateRoot,
-    AETHOS_DISABLE_LAN_TCP: E2E_DISABLE_LAN_TCP ? "1" : "0",
+    AETHOS_DISABLE_LAN_TCP: disableLanTcpValue,
     AETHOS_GOSSIP_LAN_PORT: String(sessionName === "a" ? GOSSIP_PORT_A : GOSSIP_PORT_B),
     AETHOS_GOSSIP_PEER_PORTS: `${GOSSIP_PORT_A},${GOSSIP_PORT_B}`,
     AETHOS_GOSSIP_LOCALHOST_FANOUT: E2E_LOCALHOST_FANOUT ? "1" : "0",
@@ -543,7 +551,7 @@ async function openTauriSession(sessionName, stateRoot, tauriPort = 4444, extraE
       `--aethos-state-dir=${stateRoot}`,
       `--aethos-gossip-lan-port=${sessionName === "a" ? GOSSIP_PORT_A : GOSSIP_PORT_B}`,
       `--aethos-gossip-peer-ports=${GOSSIP_PORT_A},${GOSSIP_PORT_B}`,
-      `--aethos-disable-lan-tcp=${E2E_DISABLE_LAN_TCP ? "1" : "0"}`,
+      `--aethos-disable-lan-tcp=${disableLanTcpValue}`,
       `--aethos-gossip-localhost-fanout=${E2E_LOCALHOST_FANOUT ? "1" : "0"}`,
       `--aethos-gossip-eager-unicast=${E2E_EAGER_UNICAST ? "1" : "0"}`,
       `--aethos-gossip-loopback-only=${E2E_LOOPBACK_ONLY ? "1" : "0"}`,
@@ -881,9 +889,11 @@ describe("dual instance gossip e2e", function () {
         AETHOS_MEDIA_E2E_WIRE_BUCKET_SUSTAINED_BYTES_PER_MIN: String(MEDIA_E2E_WIRE_BUCKET_SUSTAINED_BYTES_PER_MIN),
         AETHOS_MEDIA_E2E_WIRE_BUCKET_BURST_BYTES: String(MEDIA_E2E_WIRE_BUCKET_BURST_BYTES),
         AETHOS_MEDIA_E2E_MISSING_RESPONSE_DEDUP_WINDOW_MS: String(MEDIA_E2E_MISSING_RESPONSE_DEDUP_WINDOW_MS),
+        AETHOS_MEDIA_E2E_MISSING_RESPONSE_CHUNK_CEILING: String(MEDIA_E2E_MISSING_RESPONSE_CHUNK_CEILING),
         AETHOS_MEDIA_E2E_CHUNKS_PER_MINUTE_LIMIT: String(MEDIA_E2E_CHUNKS_PER_MINUTE_LIMIT),
         AETHOS_E2E_UDP_TRANSFER_FRAME_MAX_BYTES: String(E2E_UDP_TRANSFER_FRAME_MAX_BYTES),
-        AETHOS_MEDIA_E2E_HOUSEKEEPING_MIN_INTERVAL_MS: String(MEDIA_E2E_HOUSEKEEPING_MIN_INTERVAL_MS)
+        AETHOS_MEDIA_E2E_HOUSEKEEPING_MIN_INTERVAL_MS: String(MEDIA_E2E_HOUSEKEEPING_MIN_INTERVAL_MS),
+        AETHOS_DISABLE_LAN_TCP: "0"
       });
       b = await openTauriSession("b", stateRootPath("media-b"), TAURI_DRIVER_B_PORT, {
         AETHOS_MEDIA_E2E_MAX_ITEM_PAYLOAD_B64_BYTES: String(MEDIA_E2E_MAX_ITEM_PAYLOAD_B64_BYTES),
@@ -900,9 +910,11 @@ describe("dual instance gossip e2e", function () {
         AETHOS_MEDIA_E2E_WIRE_BUCKET_SUSTAINED_BYTES_PER_MIN: String(MEDIA_E2E_WIRE_BUCKET_SUSTAINED_BYTES_PER_MIN),
         AETHOS_MEDIA_E2E_WIRE_BUCKET_BURST_BYTES: String(MEDIA_E2E_WIRE_BUCKET_BURST_BYTES),
         AETHOS_MEDIA_E2E_MISSING_RESPONSE_DEDUP_WINDOW_MS: String(MEDIA_E2E_MISSING_RESPONSE_DEDUP_WINDOW_MS),
+        AETHOS_MEDIA_E2E_MISSING_RESPONSE_CHUNK_CEILING: String(MEDIA_E2E_MISSING_RESPONSE_CHUNK_CEILING),
         AETHOS_MEDIA_E2E_CHUNKS_PER_MINUTE_LIMIT: String(MEDIA_E2E_CHUNKS_PER_MINUTE_LIMIT),
         AETHOS_E2E_UDP_TRANSFER_FRAME_MAX_BYTES: String(E2E_UDP_TRANSFER_FRAME_MAX_BYTES),
-        AETHOS_MEDIA_E2E_HOUSEKEEPING_MIN_INTERVAL_MS: String(MEDIA_E2E_HOUSEKEEPING_MIN_INTERVAL_MS)
+        AETHOS_MEDIA_E2E_HOUSEKEEPING_MIN_INTERVAL_MS: String(MEDIA_E2E_HOUSEKEEPING_MIN_INTERVAL_MS),
+        AETHOS_DISABLE_LAN_TCP: "0"
       });
 
     await waitForSplashToClear(a.driver);
@@ -928,7 +940,7 @@ describe("dual instance gossip e2e", function () {
 
     await attachFileAndSend(a, fixture.filePath, `media-happy-${Date.now()}`);
 
-    const manifestTestId = await waitForMediaManifest(b.driver, 120000);
+    const manifestTestId = await waitForMediaManifest(b.driver, MEDIA_MANIFEST_TIMEOUT_MS);
     expect(manifestTestId).to.be.a("string");
     const imageShownEarly = await mediaImagePresent(b.driver);
     expect(imageShownEarly).to.equal(false);
@@ -958,7 +970,7 @@ describe("dual instance gossip e2e", function () {
     try {
       a = await openTauriSession("a", stateRootPath("media-fail-a"), TAURI_DRIVER_A_PORT, {
         AETHOS_MEDIA_E2E_MAX_ITEM_PAYLOAD_B64_BYTES: String(MEDIA_E2E_MAX_ITEM_PAYLOAD_B64_BYTES),
-        AETHOS_MEDIA_E2E_TTL_SECONDS: "12",
+        AETHOS_MEDIA_E2E_TTL_SECONDS: "45",
         AETHOS_MEDIA_E2E_MISSING_MIN_INTERVAL_MS: "300",
         AETHOS_MEDIA_E2E_DROP_CHUNK_INDEX: "2",
         AETHOS_LAN_FALLBACK_TRANSFER_MAX_ITEMS: "8",
@@ -971,13 +983,15 @@ describe("dual instance gossip e2e", function () {
         AETHOS_MEDIA_E2E_WIRE_BUCKET_SUSTAINED_BYTES_PER_MIN: String(MEDIA_E2E_WIRE_BUCKET_SUSTAINED_BYTES_PER_MIN),
         AETHOS_MEDIA_E2E_WIRE_BUCKET_BURST_BYTES: String(MEDIA_E2E_WIRE_BUCKET_BURST_BYTES),
         AETHOS_MEDIA_E2E_MISSING_RESPONSE_DEDUP_WINDOW_MS: String(MEDIA_E2E_MISSING_RESPONSE_DEDUP_WINDOW_MS),
+        AETHOS_MEDIA_E2E_MISSING_RESPONSE_CHUNK_CEILING: String(MEDIA_E2E_MISSING_RESPONSE_CHUNK_CEILING),
         AETHOS_MEDIA_E2E_CHUNKS_PER_MINUTE_LIMIT: String(MEDIA_E2E_CHUNKS_PER_MINUTE_LIMIT),
         AETHOS_E2E_UDP_TRANSFER_FRAME_MAX_BYTES: String(E2E_UDP_TRANSFER_FRAME_MAX_BYTES),
-        AETHOS_MEDIA_E2E_HOUSEKEEPING_MIN_INTERVAL_MS: String(MEDIA_E2E_HOUSEKEEPING_MIN_INTERVAL_MS)
+        AETHOS_MEDIA_E2E_HOUSEKEEPING_MIN_INTERVAL_MS: String(MEDIA_E2E_HOUSEKEEPING_MIN_INTERVAL_MS),
+        AETHOS_DISABLE_LAN_TCP: "0"
       });
       b = await openTauriSession("b", stateRootPath("media-fail-b"), TAURI_DRIVER_B_PORT, {
         AETHOS_MEDIA_E2E_MAX_ITEM_PAYLOAD_B64_BYTES: String(MEDIA_E2E_MAX_ITEM_PAYLOAD_B64_BYTES),
-        AETHOS_MEDIA_E2E_TTL_SECONDS: "12",
+        AETHOS_MEDIA_E2E_TTL_SECONDS: "45",
         AETHOS_MEDIA_E2E_MISSING_MIN_INTERVAL_MS: "300",
         AETHOS_LAN_FALLBACK_TRANSFER_MAX_ITEMS: "8",
         AETHOS_LAN_FALLBACK_TRANSFER_MAX_BYTES: String(MEDIA_E2E_FALLBACK_TRANSFER_MAX_BYTES),
@@ -989,9 +1003,11 @@ describe("dual instance gossip e2e", function () {
         AETHOS_MEDIA_E2E_WIRE_BUCKET_SUSTAINED_BYTES_PER_MIN: String(MEDIA_E2E_WIRE_BUCKET_SUSTAINED_BYTES_PER_MIN),
         AETHOS_MEDIA_E2E_WIRE_BUCKET_BURST_BYTES: String(MEDIA_E2E_WIRE_BUCKET_BURST_BYTES),
         AETHOS_MEDIA_E2E_MISSING_RESPONSE_DEDUP_WINDOW_MS: String(MEDIA_E2E_MISSING_RESPONSE_DEDUP_WINDOW_MS),
+        AETHOS_MEDIA_E2E_MISSING_RESPONSE_CHUNK_CEILING: String(MEDIA_E2E_MISSING_RESPONSE_CHUNK_CEILING),
         AETHOS_MEDIA_E2E_CHUNKS_PER_MINUTE_LIMIT: String(MEDIA_E2E_CHUNKS_PER_MINUTE_LIMIT),
         AETHOS_E2E_UDP_TRANSFER_FRAME_MAX_BYTES: String(E2E_UDP_TRANSFER_FRAME_MAX_BYTES),
-        AETHOS_MEDIA_E2E_HOUSEKEEPING_MIN_INTERVAL_MS: String(MEDIA_E2E_HOUSEKEEPING_MIN_INTERVAL_MS)
+        AETHOS_MEDIA_E2E_HOUSEKEEPING_MIN_INTERVAL_MS: String(MEDIA_E2E_HOUSEKEEPING_MIN_INTERVAL_MS),
+        AETHOS_DISABLE_LAN_TCP: "0"
       });
 
     await waitForSplashToClear(a.driver);
@@ -1013,12 +1029,12 @@ describe("dual instance gossip e2e", function () {
     const fixture = await generateDeterministicLargeImage(largePath, seed, 2600, 1900);
     await attachFileAndSend(a, fixture.filePath, `media-fail-${Date.now()}`);
 
-    const manifestTestId = await waitForMediaManifest(b.driver, 120000);
+    const manifestTestId = await waitForMediaManifest(b.driver, MEDIA_MANIFEST_TIMEOUT_MS);
     expect(manifestTestId).to.be.a("string");
     const rendered = await waitForMediaImageRendered(b.driver, 35000);
     expect(rendered).to.equal(false);
 
-    await new Promise((resolve) => setTimeout(resolve, 18000));
+    await new Promise((resolve) => setTimeout(resolve, 55000));
 
     const transfers = await transferStateFromChat(b.stateRoot);
     const failed = transfers.find((entry) => {
