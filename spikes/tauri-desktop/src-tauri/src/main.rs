@@ -2100,13 +2100,12 @@ fn gossip_broadcast_inventory(socket: &UdpSocket) -> Result<(), String> {
     let local_port = gossip_lan_port();
     if let Ok(hello) = build_lan_hello_frame(&identity.wayfarer_id, &node_pubkey) {
         for peer_port in &peer_ports {
-            if *peer_port == local_port {
-                continue;
-            }
             if !gossip_loopback_only_enabled() {
                 let _ = send_gossip_frame(socket, "255.255.255.255", *peer_port, &hello);
             }
-            if gossip_localhost_fanout_enabled() || gossip_loopback_only_enabled() {
+            if (gossip_localhost_fanout_enabled() || gossip_loopback_only_enabled())
+                && *peer_port != local_port
+            {
                 let _ = send_gossip_frame(socket, "127.0.0.1", *peer_port, &hello);
             }
         }
