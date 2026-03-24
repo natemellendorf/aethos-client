@@ -272,6 +272,8 @@ pub fn connect_to_relay_gossipv1_with_auth(
 pub struct EncounterReport {
     pub transferred_items: usize,
     pub pulled_messages: Vec<EncounterMessagePreview>,
+    #[allow(dead_code)]
+    pub remote_closed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -283,6 +285,119 @@ pub struct EncounterMessagePreview {
     pub text: String,
     pub received_at_unix: i64,
     pub manifest_id_hex: Option<String>,
+}
+
+#[allow(dead_code)]
+pub struct RelayPersistentSession {
+    relay_ws: String,
+    lease: RelaySessionLease,
+    socket: RelaySocket,
+    peer_hello: HelloFrame,
+    relay_ingest_trusted: bool,
+    last_heartbeat_at: Instant,
+}
+
+#[allow(dead_code)]
+pub fn open_relay_persistent_session(
+    relay_ws: &str,
+    identity: &LocalIdentitySummary,
+    auth_token: Option<&str>,
+) -> Result<RelayPersistentSession, String> {
+    let lease = RelaySessionLease::acquire(relay_ws, &identity.wayfarer_id, "persistent_encounter")
+        .map_err(|err| format!("relay encounter skipped: {err}"))?;
+    let mut socket = match open_relay_socket(relay_ws, auth_token) {
+        Ok(socket) => {
+            lease.transition("connected", "socket_connected");
+            socket
+        }
+        Err(err) => {
+            lease.transition("closing", "connect_failed");
+            return Err(err);
+        }
+    };
+    lease.transition("hello_sent", "hello_dispatch");
+    let peer_hello = match complete_hello_handshake(&mut socket, identity) {
+        Ok(peer_hello) => {
+            lease.transition("active", "hello_validated");
+            peer_hello
+        }
+        Err(err) => {
+            lease.transition("closing", "hello_failed");
+            graceful_close_socket(
+                &mut socket,
+                relay_ws,
+                lease.attempt_id,
+                "hello_failed",
+                "open_relay_persistent_session",
+            );
+            return Err(err);
+        }
+    };
+
+    log_verbose(&format!(
+        "relay_session_opened: relay_ws={} attempt_id={} peer_node={} mode=persistent",
+        relay_ws, lease.attempt_id, peer_hello.node_id
+    ));
+
+    Ok(RelayPersistentSession {
+        relay_ws: relay_ws.to_string(),
+        lease,
+        socket,
+        peer_hello,
+        relay_ingest_trusted: auth_token.is_some(),
+        last_heartbeat_at: Instant::now(),
+    })
+}
+
+#[allow(dead_code)]
+pub fn run_relay_round_on_persistent_session(
+    session: &mut RelayPersistentSession,
+    identity: &LocalIdentitySummary,
+    trace_item_id: Option<&str>,
+    encounter_window: Duration,
+) -> Result<EncounterReport, String> {
+    run_relay_round_on_socket(
+        &mut session.socket,
+        &session.relay_ws,
+        identity,
+        &session.peer_hello,
+        session.relay_ingest_trusted,
+        trace_item_id,
+        encounter_window,
+    )
+}
+
+#[allow(dead_code)]
+pub fn maybe_send_relay_heartbeat(session: &mut RelayPersistentSession) -> Result<bool, String> {
+    if session.last_heartbeat_at.elapsed() < Duration::from_secs(20) {
+        return Ok(false);
+    }
+    session
+        .socket
+        .send(Message::Ping(Vec::new()))
+        .map_err(|err| format!("relay heartbeat ping failed: {err}"))?;
+    session.last_heartbeat_at = Instant::now();
+    log_verbose(&format!(
+        "relay_session_heartbeat_sent: relay_ws={} attempt_id={}",
+        session.relay_ws, session.lease.attempt_id
+    ));
+    Ok(true)
+}
+
+#[allow(dead_code)]
+pub fn close_relay_persistent_session(mut session: RelayPersistentSession, reason: &str) {
+    session.lease.transition("closing", "persistent_close");
+    graceful_close_socket(
+        &mut session.socket,
+        &session.relay_ws,
+        session.lease.attempt_id,
+        reason,
+        "close_relay_persistent_session",
+    );
+    log_verbose(&format!(
+        "relay_session_closed: relay_ws={} attempt_id={} reason={} mode=persistent",
+        session.relay_ws, session.lease.attempt_id, reason
+    ));
 }
 
 pub fn run_relay_encounter_gossipv1(
@@ -349,22 +464,64 @@ pub fn run_relay_encounter_gossipv1_for_duration(
         relay_ws, peer_hello.node_id, peer_hello.max_want, peer_hello.max_transfer
     ));
 
+    let report = match run_relay_round_on_socket(
+        &mut socket,
+        relay_ws,
+        identity,
+        &peer_hello,
+        auth_token.is_some(),
+        trace_item_id,
+        encounter_window,
+    ) {
+        Ok(report) => report,
+        Err(err) => {
+            lease.transition("closing", "read_failed");
+            graceful_close_socket(
+                &mut socket,
+                relay_ws,
+                lease.attempt_id,
+                "read_failed",
+                "run_relay_encounter_gossipv1",
+            );
+            return Err(err);
+        }
+    };
+
+    lease.transition("closing", "encounter_complete");
+    graceful_close_socket(
+        &mut socket,
+        relay_ws,
+        lease.attempt_id,
+        "encounter_complete",
+        "run_relay_encounter_gossipv1",
+    );
+    Ok(report)
+}
+
+fn run_relay_round_on_socket(
+    socket: &mut RelaySocket,
+    relay_ws: &str,
+    identity: &LocalIdentitySummary,
+    peer_hello: &HelloFrame,
+    relay_ingest_trusted: bool,
+    trace_item_id: Option<&str>,
+    encounter_window: Duration,
+) -> Result<EncounterReport, String> {
     log_verbose(&format!(
         "relay_encounter_post_hello_send_summary: relay_ws={}",
         relay_ws
     ));
-    send_binary_frame(&mut socket, &build_summary_frame(now_unix_ms())?)?;
+    send_binary_frame(socket, &build_summary_frame(now_unix_ms())?)?;
     log_verbose(&format!(
         "relay_encounter_post_hello_send_relay_ingest: relay_ws={}",
         relay_ws
     ));
-    send_binary_frame(&mut socket, &build_relay_ingest_frame(now_unix_ms())?)?;
+    send_binary_frame(socket, &build_relay_ingest_frame(now_unix_ms())?)?;
 
     let mut transferred_items = 0usize;
     let mut pulled_messages = Vec::new();
     let mut latest_summary: Option<crate::aethos_core::gossip_sync::SummaryFrame> = None;
     let mut relay_ingest_candidates = Vec::<String>::new();
-    let relay_ingest_trusted = auth_token.is_some();
     let deadline = Instant::now() + encounter_window.max(Duration::from_millis(250));
     let started_at = Instant::now();
     let mut recv_frame_count = 0usize;
@@ -373,9 +530,11 @@ pub fn run_relay_encounter_gossipv1_for_duration(
     let mut saw_request = false;
     let mut saw_relay_ingest = false;
     let mut saw_receipt = false;
+    let mut no_progress_streak = 0usize;
+    let mut remote_closed = false;
 
     while Instant::now() <= deadline {
-        let frame = match read_binary_frame(&mut socket) {
+        let frame = match read_binary_frame(socket) {
             Ok(frame) => frame,
             Err(err) if is_nonfatal_read_timeout(&err) => {
                 log_verbose(&format!(
@@ -392,6 +551,17 @@ pub fn run_relay_encounter_gossipv1_for_duration(
                 break;
             }
             Err(err) => {
+                if is_nonfatal_remote_close(&err) {
+                    remote_closed = true;
+                    log_verbose(&format!(
+                        "relay_encounter_loop_remote_close: relay_ws={} elapsed_ms={} recv_frames={} error={}",
+                        relay_ws,
+                        started_at.elapsed().as_millis(),
+                        recv_frame_count,
+                        err
+                    ));
+                    break;
+                }
                 log_verbose(&format!(
                     "relay_encounter_loop_read_failed: relay_ws={} elapsed_ms={} recv_frames={} error={}",
                     relay_ws,
@@ -399,18 +569,11 @@ pub fn run_relay_encounter_gossipv1_for_duration(
                     recv_frame_count,
                     err
                 ));
-                lease.transition("closing", "read_failed");
-                graceful_close_socket(
-                    &mut socket,
-                    relay_ws,
-                    lease.attempt_id,
-                    "read_failed",
-                    "run_relay_encounter_gossipv1",
-                );
                 return Err(err);
             }
         };
         recv_frame_count = recv_frame_count.saturating_add(1);
+        let mut made_progress = false;
 
         match frame {
             GossipSyncFrame::Summary(summary) => {
@@ -427,8 +590,9 @@ pub fn run_relay_encounter_gossipv1_for_duration(
                     peer_hello.max_want as usize,
                     &relay_ingest_candidates,
                 )?;
+                made_progress = !want.is_empty();
                 send_binary_frame(
-                    &mut socket,
+                    socket,
                     &build_request_frame(want, peer_hello.max_want as usize)?,
                 )?;
             }
@@ -447,6 +611,7 @@ pub fn run_relay_encounter_gossipv1_for_duration(
                     relay_ws,
                     item_ids.len()
                 ));
+
                 if !relay_ingest_trusted {
                     log_verbose(&format!(
                         "relay_encounter_ignore_untrusted_relay_ingest: relay_ws={relay_ws}"
@@ -467,8 +632,9 @@ pub fn run_relay_encounter_gossipv1_for_duration(
                         peer_hello.max_want as usize,
                         &relay_ingest_candidates,
                     )?;
+                    made_progress = !want.is_empty();
                     send_binary_frame(
-                        &mut socket,
+                        socket,
                         &build_request_frame(want, peer_hello.max_want as usize)?,
                     )?;
                 }
@@ -500,8 +666,9 @@ pub fn run_relay_encounter_gossipv1_for_duration(
                         .any(|object| object.item_id.as_str() == item_id)
                 });
                 transferred_items += objects.len();
+                made_progress = !objects.is_empty();
                 send_binary_frame(
-                    &mut socket,
+                    socket,
                     &GossipSyncFrame::Transfer(crate::aethos_core::gossip_sync::TransferFrame {
                         objects,
                     }),
@@ -529,10 +696,11 @@ pub fn run_relay_encounter_gossipv1_for_duration(
                     &transfer.objects,
                     now_unix_ms(),
                 )?;
+                made_progress = !imported.accepted_item_ids.is_empty();
 
                 let received = imported.accepted_item_ids.clone();
                 send_binary_frame(
-                    &mut socket,
+                    socket,
                     &GossipSyncFrame::Receipt(crate::aethos_core::gossip_sync::ReceiptFrame {
                         received,
                     }),
@@ -567,6 +735,7 @@ pub fn run_relay_encounter_gossipv1_for_duration(
             }
             GossipSyncFrame::Receipt(receipt) => {
                 saw_receipt = true;
+                made_progress = !receipt.received.is_empty();
                 log_verbose(&format!(
                     "relay_encounter_recv_receipt: relay_ws={} received_items={}",
                     relay_ws,
@@ -578,6 +747,19 @@ pub fn run_relay_encounter_gossipv1_for_duration(
                     "relay_encounter_recv_hello_midstream: relay_ws={} peer_node={}",
                     relay_ws, peer.node_id
                 ));
+            }
+        }
+
+        if made_progress {
+            no_progress_streak = 0;
+        } else {
+            no_progress_streak = no_progress_streak.saturating_add(1);
+            if should_stop_for_no_progress(no_progress_streak) {
+                log_verbose(&format!(
+                    "relay_encounter_converged: relay_ws={} reason=no_progress_streak rounds={} recv_frames={}",
+                    relay_ws, no_progress_streak, recv_frame_count
+                ));
+                break;
             }
         }
     }
@@ -595,18 +777,16 @@ pub fn run_relay_encounter_gossipv1_for_duration(
         saw_receipt,
         started_at.elapsed().as_millis()
     ));
-    lease.transition("closing", "encounter_complete");
-    graceful_close_socket(
-        &mut socket,
-        relay_ws,
-        lease.attempt_id,
-        "encounter_complete",
-        "run_relay_encounter_gossipv1",
-    );
+
     Ok(EncounterReport {
         transferred_items,
         pulled_messages,
+        remote_closed,
     })
+}
+
+fn should_stop_for_no_progress(streak: usize) -> bool {
+    streak >= 2
 }
 
 fn is_nonfatal_read_timeout(err: &str) -> bool {
@@ -615,6 +795,14 @@ fn is_nonfatal_read_timeout(err: &str) -> bool {
         || lower.contains("timed out")
         || lower.contains("resource temporarily unavailable")
         || lower.contains("os error 11")
+}
+
+fn is_nonfatal_remote_close(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("connection reset without closing handshake")
+        || lower.contains("close 1005")
+        || lower.contains("connection reset by peer")
+        || lower.contains("broken pipe")
 }
 
 fn open_relay_socket(relay_ws: &str, auth_token: Option<&str>) -> Result<RelaySocket, String> {
@@ -848,6 +1036,38 @@ fn relay_frame_type(frame: &GossipSyncFrame) -> &'static str {
         GossipSyncFrame::Transfer(_) => "TRANSFER",
         GossipSyncFrame::Receipt(_) => "RECEIPT",
         GossipSyncFrame::RelayIngest(_) => "RELAY_INGEST",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_nonfatal_remote_close, should_stop_for_no_progress};
+
+    #[test]
+    fn nonfatal_remote_close_patterns_match_expected_errors() {
+        assert!(is_nonfatal_remote_close(
+            "websocket read failed: WebSocket protocol error: Connection reset without closing handshake"
+        ));
+        assert!(is_nonfatal_remote_close(
+            "websocket read failed: websocket: close 1005 (no status)"
+        ));
+        assert!(is_nonfatal_remote_close(
+            "io error: Connection reset by peer (os error 104)"
+        ));
+        assert!(is_nonfatal_remote_close(
+            "write failed: Broken pipe (os error 32)"
+        ));
+        assert!(!is_nonfatal_remote_close(
+            "websocket read failed: utf8 decode error"
+        ));
+    }
+
+    #[test]
+    fn no_progress_stop_cap_matches_encounter_policy() {
+        assert!(!should_stop_for_no_progress(0));
+        assert!(!should_stop_for_no_progress(1));
+        assert!(should_stop_for_no_progress(2));
+        assert!(should_stop_for_no_progress(3));
     }
 }
 

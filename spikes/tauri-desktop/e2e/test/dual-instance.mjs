@@ -175,6 +175,18 @@ async function waitForIncomingPrefixCount(stateRoot, prefix, expectedCount, time
   }, timeoutMs, 1000);
 }
 
+async function waitForLogPattern(filePath, pattern, timeoutMs = 120000) {
+  const rx = pattern instanceof RegExp ? pattern : new RegExp(String(pattern));
+  return waitFor(async () => {
+    try {
+      const tail = await readLogTail(filePath, 120000);
+      return rx.test(tail) ? true : false;
+    } catch {
+      return false;
+    }
+  }, timeoutMs, 500);
+}
+
 async function clickSyncInbox(driver) {
   const clicked = await waitFor(async () => {
     try {
@@ -509,10 +521,55 @@ async function getOwnWayfarerId(driver, fallbackStateRoot) {
 
 async function openTauriSession(sessionName, stateRoot, tauriPort = 4444, extraEnv = {}) {
   await fs.mkdir(stateRoot, { recursive: true });
+  const relayEndpointOverride = String(
+    extraEnv.AETHOS_E2E_RELAY_ENDPOINT || RELAY_ENDPOINT || ""
+  ).trim();
+  if (relayEndpointOverride) {
+    const settingsPath = path.join(stateRoot, "settings.json");
+    const seedSettings = {
+      relaySyncEnabled: true,
+      gossipSyncEnabled: true,
+      verboseLoggingEnabled: true,
+      relayEndpoints: [relayEndpointOverride],
+      messageTtlSeconds: 3600,
+      enterToSend: true
+    };
+    await fs.writeFile(settingsPath, `${JSON.stringify(seedSettings, null, 2)}\n`, "utf8");
+  }
+
   const disableLanTcpValue =
     extraEnv.AETHOS_DISABLE_LAN_TCP !== undefined
       ? String(extraEnv.AETHOS_DISABLE_LAN_TCP)
       : (E2E_DISABLE_LAN_TCP ? "1" : "0");
+  const gossipLanPortValue =
+    extraEnv.AETHOS_GOSSIP_LAN_PORT !== undefined
+      ? String(extraEnv.AETHOS_GOSSIP_LAN_PORT)
+      : String(sessionName === "a" ? GOSSIP_PORT_A : GOSSIP_PORT_B);
+  const gossipPeerPortsValue =
+    extraEnv.AETHOS_GOSSIP_PEER_PORTS !== undefined
+      ? String(extraEnv.AETHOS_GOSSIP_PEER_PORTS)
+      : `${GOSSIP_PORT_A},${GOSSIP_PORT_B}`;
+  const localhostFanoutValue =
+    extraEnv.AETHOS_GOSSIP_LOCALHOST_FANOUT !== undefined
+      ? String(extraEnv.AETHOS_GOSSIP_LOCALHOST_FANOUT)
+      : (E2E_LOCALHOST_FANOUT ? "1" : "0");
+  const eagerUnicastValue =
+    extraEnv.AETHOS_GOSSIP_EAGER_UNICAST !== undefined
+      ? String(extraEnv.AETHOS_GOSSIP_EAGER_UNICAST)
+      : (E2E_EAGER_UNICAST ? "1" : "0");
+  const loopbackOnlyValue =
+    extraEnv.AETHOS_GOSSIP_LOOPBACK_ONLY !== undefined
+      ? String(extraEnv.AETHOS_GOSSIP_LOOPBACK_ONLY)
+      : (E2E_LOOPBACK_ONLY ? "1" : "0");
+  const relayDisabledValue =
+    extraEnv.AETHOS_E2E_DISABLE_RELAY !== undefined
+      ? String(extraEnv.AETHOS_E2E_DISABLE_RELAY)
+      : (E2E_DISABLE_RELAY ? "1" : "0");
+  const forceGossipValue =
+    extraEnv.AETHOS_E2E_FORCE_GOSSIP !== undefined
+      ? String(extraEnv.AETHOS_E2E_FORCE_GOSSIP)
+      : (process.env.AETHOS_E2E_FORCE_GOSSIP || "1");
+
   const env = {
     ...process.env,
     TAURI_AUTOMATION: "true",
@@ -521,20 +578,20 @@ async function openTauriSession(sessionName, stateRoot, tauriPort = 4444, extraE
     XDG_DATA_HOME: stateRoot,
     XDG_STATE_HOME: stateRoot,
     AETHOS_DISABLE_LAN_TCP: disableLanTcpValue,
-    AETHOS_GOSSIP_LAN_PORT: String(sessionName === "a" ? GOSSIP_PORT_A : GOSSIP_PORT_B),
-    AETHOS_GOSSIP_PEER_PORTS: `${GOSSIP_PORT_A},${GOSSIP_PORT_B}`,
-    AETHOS_GOSSIP_LOCALHOST_FANOUT: E2E_LOCALHOST_FANOUT ? "1" : "0",
-    AETHOS_GOSSIP_EAGER_UNICAST: E2E_EAGER_UNICAST ? "1" : "0",
-    AETHOS_GOSSIP_LOOPBACK_ONLY: E2E_LOOPBACK_ONLY ? "1" : "0",
+    AETHOS_GOSSIP_LAN_PORT: gossipLanPortValue,
+    AETHOS_GOSSIP_PEER_PORTS: gossipPeerPortsValue,
+    AETHOS_GOSSIP_LOCALHOST_FANOUT: localhostFanoutValue,
+    AETHOS_GOSSIP_EAGER_UNICAST: eagerUnicastValue,
+    AETHOS_GOSSIP_LOOPBACK_ONLY: loopbackOnlyValue,
     AETHOS_STRUCTURED_LOGS: process.env.AETHOS_STRUCTURED_LOGS || "1",
     AETHOS_E2E_RUN_ID: RUN_ID,
     AETHOS_E2E: "1",
     AETHOS_E2E_TEST_CASE_ID: TEST_CASE_ID,
     AETHOS_E2E_SCENARIO: SCENARIO,
     AETHOS_E2E_NODE_LABEL: sessionName === "a" ? "wayfarer-1" : "wayfarer-2",
-    AETHOS_E2E_DISABLE_RELAY: E2E_DISABLE_RELAY ? "1" : "0",
+    AETHOS_E2E_DISABLE_RELAY: relayDisabledValue,
     AETHOS_E2E_FORCE_VERBOSE: process.env.AETHOS_E2E_FORCE_VERBOSE || "1",
-    AETHOS_E2E_FORCE_GOSSIP: process.env.AETHOS_E2E_FORCE_GOSSIP || "1",
+    AETHOS_E2E_FORCE_GOSSIP: forceGossipValue,
     AETHOS_E2E_INSTANCE: sessionName,
     ...extraEnv
   };
@@ -549,15 +606,15 @@ async function openTauriSession(sessionName, stateRoot, tauriPort = 4444, extraE
     application: TAURI_BIN,
     args: [
       `--aethos-state-dir=${stateRoot}`,
-      `--aethos-gossip-lan-port=${sessionName === "a" ? GOSSIP_PORT_A : GOSSIP_PORT_B}`,
-      `--aethos-gossip-peer-ports=${GOSSIP_PORT_A},${GOSSIP_PORT_B}`,
+      `--aethos-gossip-lan-port=${gossipLanPortValue}`,
+      `--aethos-gossip-peer-ports=${gossipPeerPortsValue}`,
       `--aethos-disable-lan-tcp=${disableLanTcpValue}`,
-      `--aethos-gossip-localhost-fanout=${E2E_LOCALHOST_FANOUT ? "1" : "0"}`,
-      `--aethos-gossip-eager-unicast=${E2E_EAGER_UNICAST ? "1" : "0"}`,
-      `--aethos-gossip-loopback-only=${E2E_LOOPBACK_ONLY ? "1" : "0"}`,
-      `--aethos-e2e-disable-relay=${E2E_DISABLE_RELAY ? "1" : "0"}`,
+      `--aethos-gossip-localhost-fanout=${localhostFanoutValue}`,
+      `--aethos-gossip-eager-unicast=${eagerUnicastValue}`,
+      `--aethos-gossip-loopback-only=${loopbackOnlyValue}`,
+      `--aethos-e2e-disable-relay=${relayDisabledValue}`,
       "--aethos-e2e-force-verbose=1",
-      "--aethos-e2e-force-gossip=1",
+      `--aethos-e2e-force-gossip=${forceGossipValue}`,
       `--aethos-lan-fallback-transfer-max-items=${String(extraEnv.AETHOS_LAN_FALLBACK_TRANSFER_MAX_ITEMS || "2")}`,
       `--aethos-lan-fallback-transfer-max-bytes=${String(extraEnv.AETHOS_LAN_FALLBACK_TRANSFER_MAX_BYTES || "1024")}`,
       `--aethos-media-e2e-max-item-payload-b64-bytes=${String(extraEnv.AETHOS_MEDIA_E2E_MAX_ITEM_PAYLOAD_B64_BYTES || "")}`,
@@ -862,6 +919,76 @@ describe("dual instance gossip e2e", function () {
         wayfarer_2: logPathTextB
       }
       });
+    } finally {
+      await closeSession(a);
+      await closeSession(b);
+    }
+  });
+
+  it("sends message via relay when LAN peer path is isolated", async function () {
+    this.timeout(TEST_TIMEOUT_MS);
+
+    if (!String(RELAY_ENDPOINT || "").trim()) {
+      this.skip();
+      return;
+    }
+
+    const relayOnlyPortA = GOSSIP_BASE_PORT + 200;
+    const relayOnlyPortB = GOSSIP_BASE_PORT + 201;
+
+    let a;
+    let b;
+    try {
+      a = await openTauriSession("a", stateRootPath("relay-only-a"), TAURI_DRIVER_A_PORT, {
+        AETHOS_E2E_RELAY_ENDPOINT: RELAY_ENDPOINT,
+        AETHOS_E2E_DISABLE_RELAY: "0",
+        AETHOS_E2E_FORCE_GOSSIP: "1",
+        AETHOS_DISABLE_LAN_TCP: "1",
+        AETHOS_GOSSIP_LAN_PORT: String(relayOnlyPortA),
+        AETHOS_GOSSIP_PEER_PORTS: String(relayOnlyPortA),
+        AETHOS_GOSSIP_LOCALHOST_FANOUT: "0",
+        AETHOS_GOSSIP_EAGER_UNICAST: "0",
+        AETHOS_GOSSIP_LOOPBACK_ONLY: "1"
+      });
+      b = await openTauriSession("b", stateRootPath("relay-only-b"), TAURI_DRIVER_B_PORT, {
+        AETHOS_E2E_RELAY_ENDPOINT: RELAY_ENDPOINT,
+        AETHOS_E2E_DISABLE_RELAY: "0",
+        AETHOS_E2E_FORCE_GOSSIP: "1",
+        AETHOS_DISABLE_LAN_TCP: "1",
+        AETHOS_GOSSIP_LAN_PORT: String(relayOnlyPortB),
+        AETHOS_GOSSIP_PEER_PORTS: String(relayOnlyPortB),
+        AETHOS_GOSSIP_LOCALHOST_FANOUT: "0",
+        AETHOS_GOSSIP_EAGER_UNICAST: "0",
+        AETHOS_GOSSIP_LOOPBACK_ONLY: "1"
+      });
+
+      await waitForSplashToClear(a.driver);
+      await waitForSplashToClear(b.driver);
+
+      const idA = await readIdentityWayfarerId(a.stateRoot);
+      const idB = await readIdentityWayfarerId(b.stateRoot);
+      expect(idA).to.not.equal(idB);
+
+      await openContactsAndAdd(a.driver, idB, "Peer B");
+      await openContactsAndAdd(b.driver, idA, "Peer A");
+      await clickContactInChats(a.driver, idB);
+      await clickContactInChats(b.driver, idA);
+
+      const text = `relay-only-${Date.now()}`;
+      await sendChatMessage(a.driver, text);
+
+      await clickSyncInbox(a.driver);
+      await clickSyncInbox(b.driver);
+
+      const inboundState = await waitForIncomingMessageInState(b.stateRoot, text);
+      expect(Boolean(inboundState?.found)).to.equal(true);
+
+      const relayTransferSeen = await waitForLogPattern(
+        b.logPath,
+        /relay_encounter_recv_transfer:|relay_worker_sync_success:/,
+        180000
+      );
+      expect(Boolean(relayTransferSeen)).to.equal(true);
     } finally {
       await closeSession(a);
       await closeSession(b);

@@ -63,8 +63,10 @@ use crate::aethos_core::protocol::{
     is_valid_wayfarer_id,
 };
 use crate::relay::client::{
-    connect_to_relay_gossipv1_with_auth, normalize_http_endpoint, relay_session_snapshot,
-    run_relay_encounter_gossipv1, run_relay_encounter_gossipv1_for_duration, to_ws_endpoint,
+    close_relay_persistent_session, connect_to_relay_gossipv1_with_auth,
+    maybe_send_relay_heartbeat, normalize_http_endpoint, open_relay_persistent_session,
+    relay_session_snapshot, run_relay_encounter_gossipv1, run_relay_round_on_persistent_session,
+    to_ws_endpoint, RelayPersistentSession,
 };
 use media_v1::{
     drain_pending_media_control_unicast as media_drain_pending_media_control_unicast,
@@ -82,6 +84,7 @@ const CHAT_SNAPSHOT_EVENT: &str = "chat_snapshot";
 const SOUND_EVENT: &str = "sound_event";
 const MAX_INLINE_ATTACHMENT_BYTES: u64 = 2 * 1024 * 1024;
 const LAN_TCP_CAPABILITY: &str = "lan_tcp_transfer_v1";
+const RELAY_PERIODIC_SYNC_INTERVAL_SECS: u64 = 15;
 const LAN_TCP_FAILURE_COOLDOWN_SECS: u64 = 45;
 const LAN_FALLBACK_TRANSFER_MAX_ITEMS: u32 = 2;
 const LAN_FALLBACK_TRANSFER_MAX_BYTES: u64 = 1024;
@@ -1712,6 +1715,8 @@ fn start_relay_worker_if_needed() {
         let mut relay_ws_endpoints: Vec<String> = Vec::new();
         let mut relay_failures: Vec<u32> = Vec::new();
         let mut relay_next_attempt_at: Vec<Instant> = Vec::new();
+        let mut relay_sessions: Vec<Option<RelayPersistentSession>> = Vec::new();
+        let mut next_periodic_sync_at = Instant::now();
         let mut rr_cursor = 0usize;
         let mut known_sync_epoch = runtime.sync_epoch.load(Ordering::SeqCst);
 
@@ -1730,6 +1735,9 @@ fn start_relay_worker_if_needed() {
             };
 
             if !settings.relay_sync_enabled {
+                for session in relay_sessions.drain(..).flatten() {
+                    close_relay_persistent_session(session, "relay_disabled");
+                }
                 set_relay_worker_status("disabled");
                 let _ = relay_worker_wait_for_command(&rx, Duration::from_millis(800));
                 continue;
@@ -1743,12 +1751,18 @@ fn start_relay_worker_if_needed() {
                 .collect::<Vec<_>>();
 
             if endpoints.is_empty() {
+                for session in relay_sessions.drain(..).flatten() {
+                    close_relay_persistent_session(session, "no_relays_configured");
+                }
                 set_relay_worker_status("no_relays_configured");
                 let _ = relay_worker_wait_for_command(&rx, Duration::from_millis(800));
                 continue;
             }
 
             if endpoints != relay_http_endpoints {
+                for session in relay_sessions.drain(..).flatten() {
+                    close_relay_persistent_session(session, "endpoint_reload");
+                }
                 relay_http_endpoints = endpoints.clone();
                 relay_ws_endpoints = endpoints
                     .into_iter()
@@ -1756,6 +1770,7 @@ fn start_relay_worker_if_needed() {
                     .collect();
                 relay_failures = vec![0; relay_ws_endpoints.len()];
                 relay_next_attempt_at = vec![Instant::now(); relay_ws_endpoints.len()];
+                relay_sessions = (0..relay_ws_endpoints.len()).map(|_| None).collect();
                 rr_cursor = 0;
                 known_sync_epoch = runtime.sync_epoch.fetch_add(1, Ordering::SeqCst);
                 log_verbose("relay_worker_endpoints_reloaded");
@@ -1784,7 +1799,29 @@ fn start_relay_worker_if_needed() {
                         known_sync_epoch = runtime.sync_epoch.load(Ordering::SeqCst);
                         reason
                     }
-                    None => "periodic",
+                    None => {
+                        if Instant::now() < next_periodic_sync_at {
+                            for (idx, maybe_session) in relay_sessions.iter_mut().enumerate() {
+                                if let Some(session) = maybe_session.as_mut() {
+                                    if let Err(err) = maybe_send_relay_heartbeat(session) {
+                                        log_info(&format!(
+                                            "relay_worker_idle_heartbeat_failed: slot={} relay_ws={} error={}",
+                                            idx,
+                                            relay_ws_endpoints
+                                                .get(idx)
+                                                .cloned()
+                                                .unwrap_or_else(|| "unknown".to_string()),
+                                            err
+                                        ));
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        next_periodic_sync_at =
+                            Instant::now() + Duration::from_secs(RELAY_PERIODIC_SYNC_INTERVAL_SECS);
+                        "periodic"
+                    }
                 }
             };
 
@@ -1816,13 +1853,64 @@ fn start_relay_worker_if_needed() {
                 relay_slot, relay_ws, sync_trigger
             ));
 
-            match run_relay_encounter_gossipv1_for_duration(
-                &relay_ws,
-                &identity,
-                auth.as_deref(),
-                None,
-                Duration::from_secs(45),
-            ) {
+            if relay_sessions.get(relay_slot).and_then(|slot| slot.as_ref()).is_none() {
+                match open_relay_persistent_session(&relay_ws, &identity, auth.as_deref()) {
+                    Ok(session) => {
+                        relay_sessions[relay_slot] = Some(session);
+                    }
+                    Err(err) => {
+                        relay_failures[relay_slot] = relay_failures[relay_slot].saturating_add(1);
+                        let backoff_secs =
+                            2_u64.saturating_pow(relay_failures[relay_slot].saturating_sub(1).min(6));
+                        relay_next_attempt_at[relay_slot] =
+                            Instant::now() + Duration::from_secs(backoff_secs.min(60));
+                        set_relay_worker_status(&format!(
+                            "disconnected slot={} relay={} error={}",
+                            relay_slot, relay_ws, err
+                        ));
+                        log_info(&format!(
+                            "relay_worker_connect_failed: slot={} relay_ws={} error={} backoff_s={}",
+                            relay_slot,
+                            relay_ws,
+                            err,
+                            backoff_secs.min(60)
+                        ));
+                        continue;
+                    }
+                }
+            } else {
+                log_verbose(&format!(
+                    "relay_worker_session_reused: slot={} relay_ws={}",
+                    relay_slot, relay_ws
+                ));
+            }
+
+            if let Some(session) = relay_sessions.get_mut(relay_slot).and_then(Option::as_mut) {
+                if let Err(err) = maybe_send_relay_heartbeat(session) {
+                    log_info(&format!(
+                        "relay_worker_heartbeat_failed: slot={} relay_ws={} error={}",
+                        relay_slot, relay_ws, err
+                    ));
+                    let old = relay_sessions[relay_slot].take();
+                    if let Some(session) = old {
+                        close_relay_persistent_session(session, "heartbeat_failed");
+                    }
+                    relay_failures[relay_slot] = relay_failures[relay_slot].saturating_add(1);
+                    relay_next_attempt_at[relay_slot] = Instant::now() + Duration::from_secs(2);
+                    continue;
+                }
+            }
+
+            let round_result = if let Some(session) = relay_sessions
+                .get_mut(relay_slot)
+                .and_then(Option::as_mut)
+            {
+                run_relay_round_on_persistent_session(session, &identity, None, Duration::from_secs(45))
+            } else {
+                Err("relay persistent session unavailable".to_string())
+            };
+
+            match round_result {
                 Ok(report) => {
                     relay_failures[relay_slot] = 0;
                     relay_next_attempt_at[relay_slot] = Instant::now();
@@ -1844,8 +1932,22 @@ fn start_relay_worker_if_needed() {
                         "relay_worker_sync_success: slot={} relay_ws={} transfers={} pulled={}",
                         relay_slot, relay_ws, report.transferred_items, pulled
                     ));
+                    if report.remote_closed {
+                        if let Some(session) = relay_sessions[relay_slot].take() {
+                            close_relay_persistent_session(session, "remote_closed");
+                        }
+                        next_periodic_sync_at =
+                            Instant::now() + Duration::from_secs(RELAY_PERIODIC_SYNC_INTERVAL_SECS);
+                        log_verbose(&format!(
+                            "relay_worker_session_reconnect_needed: slot={} relay_ws={} reason=remote_closed",
+                            relay_slot, relay_ws
+                        ));
+                    }
                 }
                 Err(err) => {
+                    if let Some(session) = relay_sessions[relay_slot].take() {
+                        close_relay_persistent_session(session, "hard_error");
+                    }
                     relay_failures[relay_slot] = relay_failures[relay_slot].saturating_add(1);
                     let backoff_secs =
                         2_u64.saturating_pow(relay_failures[relay_slot].saturating_sub(1).min(6));
