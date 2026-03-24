@@ -44,8 +44,9 @@ use crate::aethos_core::gossip_sync::{
     build_hello_frame as build_gossip_hello_frame,
     build_relay_ingest_frame as build_gossip_relay_ingest_frame,
     build_request_frame as build_gossip_request_frame,
-    build_summary_frame as build_gossip_summary_frame, has_item as gossip_has_item,
-    import_transfer_items, parse_frame as parse_gossip_frame,
+    build_summary_frame as build_gossip_summary_frame,
+    import_transfer_items, missing_item_ids as gossip_missing_item_ids,
+    parse_frame as parse_gossip_frame,
     select_request_item_ids_from_summary_with_candidates as gossip_select_request_item_ids_from_summary,
     serialize_frame as serialize_gossip_frame, transfer_items_for_request as gossip_transfer_items,
     GossipSyncFrame, ReceiptFrame, GOSSIP_LAN_PORT, MAX_FRAME_BYTES, MAX_TRANSFER_BYTES,
@@ -2349,12 +2350,22 @@ fn handle_gossip_frame(
                 source,
                 ingest.item_ids.len()
             ));
+            let missing_from_store = match gossip_missing_item_ids(&ingest.item_ids) {
+                Ok(values) => values,
+                Err(err) => {
+                    log_verbose(&format!(
+                        "gossip_recv_relay_ingest_missing_lookup_failed: from={} error={}",
+                        source, err
+                    ));
+                    Vec::new()
+                }
+            };
             let mut missing_item_ids = ingest
                 .item_ids
                 .into_iter()
                 .filter(|item_id| {
                     !interaction.encounter.requested_item_ids.contains(item_id)
-                        && gossip_has_item(item_id).map(|have| !have).unwrap_or(false)
+                        && missing_from_store.iter().any(|missing| missing == item_id)
                 })
                 .collect::<Vec<_>>();
             missing_item_ids.sort();
@@ -2881,12 +2892,22 @@ fn run_gossip_tcp_encounter_on_stream(
                 ));
             }
             GossipSyncFrame::RelayIngest(ingest) => {
+                let missing_from_store = match gossip_missing_item_ids(&ingest.item_ids) {
+                    Ok(values) => values,
+                    Err(err) => {
+                        log_verbose(&format!(
+                            "gossip_tcp_relay_ingest_missing_lookup_failed: peer={} error={}",
+                            encounter.peer_identity, err
+                        ));
+                        Vec::new()
+                    }
+                };
                 let mut missing_item_ids = ingest
                     .item_ids
                     .into_iter()
                     .filter(|item_id| {
                         !encounter.requested_item_ids.contains(item_id)
-                            && gossip_has_item(item_id).map(|have| !have).unwrap_or(false)
+                            && missing_from_store.iter().any(|missing| missing == item_id)
                     })
                     .collect::<Vec<_>>();
                 missing_item_ids.sort();
