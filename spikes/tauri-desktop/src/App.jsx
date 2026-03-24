@@ -196,6 +196,30 @@ function mediaProgressPercent(media) {
   return Math.max(0, Math.min(100, Math.round((got / total) * 100)));
 }
 
+function outgoingMediaProgressPercent(message) {
+  const state = String(message?.outboundState || "").trim().toLowerCase();
+  if (state === "sent" || message?.deliveredAt) return 100;
+  if (state === "sending") return 12;
+  if (message?.outboundState && typeof message.outboundState === "object" && message.outboundState.failed?.error) {
+    return 100;
+  }
+  if (message?.lastSyncError) return 100;
+  return 12;
+}
+
+function mediaProgressText(message) {
+  const status = mediaStatus(message?.media);
+  if (status === "complete") return "Transfer complete";
+  if (status === "failed") {
+    return `Transfer failed${message?.media?.error ? `: ${message.media.error}` : ""}`;
+  }
+  if (message?.direction === "Outgoing") {
+    const outbound = formatOutgoingStatus(message);
+    return outbound ? `Send ${outbound.toLowerCase()}` : "Queued for delivery";
+  }
+  return `Receiving ${mediaProgressPercent(message?.media)}% (${message?.media?.receivedChunks || 0}/${message?.media?.chunkCount || 0} chunks)`;
+}
+
 function parseSemverLike(value = "") {
   const clean = String(value).trim().replace(/^v/i, "");
   const [major = "0", minor = "0", patch = "0"] = clean.split(".");
@@ -1226,16 +1250,12 @@ export default function App() {
                           <p className="truncate font-semibold">{m.media.fileName || m.attachment?.fileName || "image"}</p>
                           <p className="text-cyan-100/80">{formatBytes(m.media.totalBytes || 0)} · {m.media.mimeType || "image"}</p>
                           <p className="text-cyan-100/80" data-testid={`media-progress-${m.media.transferId || m.msgId}`}>
-                            {mediaStatus(m.media) === "complete"
-                              ? "Transfer complete"
-                              : mediaStatus(m.media) === "failed"
-                                ? `Transfer failed${m.media.error ? `: ${m.media.error}` : ""}`
-                                : `Receiving ${mediaProgressPercent(m.media)}% (${m.media.receivedChunks || 0}/${m.media.chunkCount || 0} chunks)`}
+                            {mediaProgressText(m)}
                           </p>
                           <div className="mt-1 h-1.5 w-full overflow-hidden rounded bg-slate-800/80">
                             <div
                               className={cn("h-full transition-all duration-300", mediaStatus(m.media) === "failed" ? "bg-red-500" : "bg-cyan-400")}
-                              style={{ width: `${mediaProgressPercent(m.media)}%` }}
+                              style={{ width: `${m.direction === "Outgoing" ? outgoingMediaProgressPercent(m) : mediaProgressPercent(m.media)}%` }}
                             />
                           </div>
 

@@ -5,7 +5,8 @@
   "scripts": {
     "preflight": "node scripts/preflight.mjs",
     "doctor": "node scripts/doctor.mjs",
-    "test": "npm run preflight && npm run doctor && mocha --timeout 1200000 \"test/**/*.mjs\""
+    "test": "npm run preflight && npm run doctor && mocha --timeout 1200000 \"test/**/*.mjs\"",
+    "send:wayfarer-media": "npm run preflight && npm run doctor && node scripts/send-wayfarer-media.mjs"
   },
   "dependencies": {
     "chai": "^5.2.1",

@@ -2875,6 +2875,14 @@ fn rate_limit_outbound(
 }
 
 fn wire_bucket_sustained_bytes_per_min() -> f64 {
+    if std::env::var("AETHOS_MEDIA_WIRE_BUCKET_SUSTAINED_BYTES_PER_MIN").is_ok() {
+        return env_u64_clamped(
+            "AETHOS_MEDIA_WIRE_BUCKET_SUSTAINED_BYTES_PER_MIN",
+            WIRE_BUCKET_SUSTAINED_BYTES_PER_MIN as u64,
+            1 * 1024 * 1024,
+            512 * 1024 * 1024,
+        ) as f64;
+    }
     if !e2e_enabled() {
         return WIRE_BUCKET_SUSTAINED_BYTES_PER_MIN;
     }
@@ -2887,6 +2895,14 @@ fn wire_bucket_sustained_bytes_per_min() -> f64 {
 }
 
 fn wire_bucket_burst_bytes() -> f64 {
+    if std::env::var("AETHOS_MEDIA_WIRE_BUCKET_BURST_BYTES").is_ok() {
+        return env_u64_clamped(
+            "AETHOS_MEDIA_WIRE_BUCKET_BURST_BYTES",
+            WIRE_BUCKET_BURST_BYTES as u64,
+            2 * 1024 * 1024,
+            512 * 1024 * 1024,
+        ) as f64;
+    }
     if !e2e_enabled() {
         return WIRE_BUCKET_BURST_BYTES;
     }
