@@ -6,6 +6,7 @@ use std::sync::{Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
+use sha2::{Digest, Sha256};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{connect, Message};
 use url::Url;
@@ -24,8 +25,11 @@ type RelaySocket = tungstenite::WebSocket<MaybeTlsStream<TcpStream>>;
 static RUSTLS_PROVIDER_INIT: Once = Once::new();
 static RELAY_SESSION_REGISTRY: OnceLock<Mutex<HashMap<String, ActiveRelaySession>>> =
     OnceLock::new();
+static RELAY_INGEST_WINDOW_REGISTRY: OnceLock<Mutex<HashMap<String, RelayIngestWindowState>>> =
+    OnceLock::new();
 static RELAY_ATTEMPT_COUNTER: AtomicU64 = AtomicU64::new(1);
 const RELAY_INGEST_PROCESS_MAX_ITEMS: usize = 1024;
+const UNIX_DAY_MS: u64 = 86_400_000;
 
 #[derive(Debug, Clone)]
 struct ActiveRelaySession {
@@ -33,6 +37,23 @@ struct ActiveRelaySession {
     trigger: &'static str,
     state: &'static str,
     since: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct RelayIngestWindowState {
+    day: u64,
+    round: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RelayIngestItemSelection {
+    processed_item_ids: Vec<String>,
+    input_item_ids: usize,
+    unique_item_ids: usize,
+    deduped_item_ids: usize,
+    truncated_item_ids: usize,
+    window_offset: usize,
+    window_round: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -146,6 +167,10 @@ impl Drop for RelaySessionLease {
 
 fn relay_session_registry() -> &'static Mutex<HashMap<String, ActiveRelaySession>> {
     RELAY_SESSION_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn relay_ingest_window_registry() -> &'static Mutex<HashMap<String, RelayIngestWindowState>> {
+    RELAY_INGEST_WINDOW_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn relay_session_key(relay_ws: &str, wayfarer_id: &str) -> String {
@@ -624,20 +649,40 @@ fn run_relay_round_on_socket(
                     continue;
                 }
 
-                let (capped_item_ids, truncated_items) = cap_relay_ingest_item_ids(item_ids);
-                if truncated_items > 0 {
+                let now_ms = now_unix_ms();
+                let (candidates, selection) = relay_ingest_candidates_with_lookup(
+                    item_ids,
+                    relay_ws,
+                    &identity.wayfarer_id,
+                    now_ms,
+                    missing_item_ids,
+                );
+
+                if selection.truncated_item_ids > 0 {
                     log_verbose(&format!(
-                        "relay_encounter_relay_ingest_truncated: relay_ws={} relay_ingest_item_ids_truncated={} relay_ingest_item_ids_processed={} relay_ingest_item_ids_cap={}",
+                        "relay_encounter_relay_ingest_truncated: relay_ws={} relay_ingest_item_ids_truncated={} relay_ingest_item_ids_processed={} relay_ingest_item_ids_cap={} relay_ingest_item_ids_unique={} relay_ingest_item_ids_deduped={} relay_ingest_window_offset={} relay_ingest_window_round={}",
                         relay_ws,
-                        truncated_items,
-                        capped_item_ids.len(),
-                        RELAY_INGEST_PROCESS_MAX_ITEMS
+                        selection.truncated_item_ids,
+                        selection.processed_item_ids.len(),
+                        RELAY_INGEST_PROCESS_MAX_ITEMS,
+                        selection.unique_item_ids,
+                        selection.deduped_item_ids,
+                        selection.window_offset,
+                        selection.window_round
                     ));
                 }
 
-                relay_ingest_candidates = missing_item_ids(&capped_item_ids)?;
-                relay_ingest_candidates.sort();
-                relay_ingest_candidates.dedup();
+                if selection.deduped_item_ids > 0 {
+                    log_verbose(&format!(
+                        "relay_encounter_relay_ingest_deduped: relay_ws={} relay_ingest_item_ids_raw={} relay_ingest_item_ids_unique={} relay_ingest_item_ids_deduped={}",
+                        relay_ws,
+                        selection.input_item_ids,
+                        selection.unique_item_ids,
+                        selection.deduped_item_ids
+                    ));
+                }
+
+                relay_ingest_candidates = candidates;
 
                 if let Some(summary) = latest_summary.as_ref() {
                     let want = select_request_item_ids_from_summary_with_candidates(
@@ -802,13 +847,139 @@ fn should_stop_for_no_progress(streak: usize) -> bool {
     streak >= 2
 }
 
-fn cap_relay_ingest_item_ids(mut item_ids: Vec<String>) -> (Vec<String>, usize) {
-    if item_ids.len() <= RELAY_INGEST_PROCESS_MAX_ITEMS {
-        return (item_ids, 0);
+fn relay_ingest_candidates_with_lookup<F>(
+    item_ids: Vec<String>,
+    relay_ws: &str,
+    wayfarer_id: &str,
+    now_ms: u64,
+    lookup_missing: F,
+) -> (Vec<String>, RelayIngestItemSelection)
+where
+    F: Fn(&[String]) -> Result<Vec<String>, String>,
+{
+    let selection =
+        select_relay_ingest_item_ids_for_processing(item_ids, relay_ws, wayfarer_id, now_ms);
+    let mut candidates = match lookup_missing(&selection.processed_item_ids) {
+        Ok(candidates) => candidates,
+        Err(err) => {
+            log_verbose(&format!(
+                "relay_encounter_relay_ingest_lookup_failed: relay_ws={} relay_ingest_item_ids_processed={} action=skip error={}",
+                relay_ws,
+                selection.processed_item_ids.len(),
+                err
+            ));
+            Vec::new()
+        }
+    };
+    candidates.sort();
+    candidates.dedup();
+    (candidates, selection)
+}
+
+fn select_relay_ingest_item_ids_for_processing(
+    item_ids: Vec<String>,
+    relay_ws: &str,
+    wayfarer_id: &str,
+    now_ms: u64,
+) -> RelayIngestItemSelection {
+    let input_item_ids = item_ids.len();
+    let mut unique_sorted_item_ids = item_ids;
+    unique_sorted_item_ids.sort();
+    unique_sorted_item_ids.dedup();
+    let unique_item_ids = unique_sorted_item_ids.len();
+    let deduped_item_ids = input_item_ids.saturating_sub(unique_item_ids);
+
+    if unique_item_ids <= RELAY_INGEST_PROCESS_MAX_ITEMS {
+        return RelayIngestItemSelection {
+            processed_item_ids: unique_sorted_item_ids,
+            input_item_ids,
+            unique_item_ids,
+            deduped_item_ids,
+            truncated_item_ids: 0,
+            window_offset: 0,
+            window_round: 0,
+        };
     }
-    let truncated_items = item_ids.len() - RELAY_INGEST_PROCESS_MAX_ITEMS;
-    item_ids.truncate(RELAY_INGEST_PROCESS_MAX_ITEMS);
-    (item_ids, truncated_items)
+
+    let round = next_relay_ingest_window_round(relay_ws, wayfarer_id, now_ms);
+    let day = unix_day(now_ms);
+    let seed_offset = relay_ingest_seed_offset(relay_ws, wayfarer_id, day, unique_item_ids);
+    let round_stride = RELAY_INGEST_PROCESS_MAX_ITEMS % unique_item_ids;
+    let round_offset = ((round % unique_item_ids as u64) as usize * round_stride) % unique_item_ids;
+    let window_offset = (seed_offset + round_offset) % unique_item_ids;
+    let processed_item_ids = select_relay_ingest_window_with_wraparound(
+        &unique_sorted_item_ids,
+        RELAY_INGEST_PROCESS_MAX_ITEMS,
+        window_offset,
+    );
+
+    RelayIngestItemSelection {
+        processed_item_ids,
+        input_item_ids,
+        unique_item_ids,
+        deduped_item_ids,
+        truncated_item_ids: unique_item_ids - RELAY_INGEST_PROCESS_MAX_ITEMS,
+        window_offset,
+        window_round: round,
+    }
+}
+
+fn select_relay_ingest_window_with_wraparound(
+    sorted_unique_item_ids: &[String],
+    max_items: usize,
+    window_offset: usize,
+) -> Vec<String> {
+    if sorted_unique_item_ids.len() <= max_items {
+        return sorted_unique_item_ids.to_vec();
+    }
+    (0..max_items)
+        .map(|idx| {
+            let selected_idx = (window_offset + idx) % sorted_unique_item_ids.len();
+            sorted_unique_item_ids[selected_idx].clone()
+        })
+        .collect()
+}
+
+fn next_relay_ingest_window_round(relay_ws: &str, wayfarer_id: &str, now_ms: u64) -> u64 {
+    let key = relay_session_key(relay_ws, wayfarer_id);
+    let day = unix_day(now_ms);
+    let Ok(mut registry) = relay_ingest_window_registry().lock() else {
+        return 0;
+    };
+
+    let state = registry
+        .entry(key)
+        .or_insert(RelayIngestWindowState { day, round: 0 });
+    if state.day != day {
+        state.day = day;
+        state.round = 0;
+    }
+
+    let round = state.round;
+    state.round = state.round.saturating_add(1);
+    round
+}
+
+fn relay_ingest_seed_offset(relay_ws: &str, wayfarer_id: &str, day: u64, modulo: usize) -> usize {
+    if modulo == 0 {
+        return 0;
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(relay_ws.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(wayfarer_id.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(day.to_be_bytes());
+    let digest = hasher.finalize();
+
+    let mut seed_bytes = [0u8; 8];
+    seed_bytes.copy_from_slice(&digest[..8]);
+    (u64::from_be_bytes(seed_bytes) as usize) % modulo
+}
+
+fn unix_day(now_ms: u64) -> u64 {
+    now_ms / UNIX_DAY_MS
 }
 
 fn is_relay_ingest_allowed(relay_ws: &str) -> bool {
@@ -1076,8 +1247,9 @@ fn relay_frame_type(frame: &GossipSyncFrame) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        cap_relay_ingest_item_ids, is_nonfatal_remote_close, is_relay_ingest_allowed,
-        should_stop_for_no_progress, RELAY_INGEST_PROCESS_MAX_ITEMS,
+        is_nonfatal_remote_close, is_relay_ingest_allowed, relay_ingest_candidates_with_lookup,
+        select_relay_ingest_item_ids_for_processing, should_stop_for_no_progress,
+        RELAY_INGEST_PROCESS_MAX_ITEMS,
     };
 
     #[test]
@@ -1121,9 +1293,17 @@ mod tests {
             .map(|idx| format!("{:064x}", idx as u64))
             .collect::<Vec<_>>();
 
-        let (processed, truncated_items) = cap_relay_ingest_item_ids(item_ids);
-        assert_eq!(processed.len(), RELAY_INGEST_PROCESS_MAX_ITEMS);
-        assert_eq!(truncated_items, 7);
+        let selection = select_relay_ingest_item_ids_for_processing(
+            item_ids,
+            "wss://relay.example/ws",
+            "wayfarer-cap",
+            1_700_000_000_000,
+        );
+        assert_eq!(
+            selection.processed_item_ids.len(),
+            RELAY_INGEST_PROCESS_MAX_ITEMS
+        );
+        assert_eq!(selection.truncated_item_ids, 7);
     }
 
     #[test]
@@ -1132,9 +1312,89 @@ mod tests {
             .map(|idx| format!("{:064x}", idx as u64))
             .collect::<Vec<_>>();
 
-        let (processed, truncated_items) = cap_relay_ingest_item_ids(item_ids.clone());
-        assert_eq!(processed, item_ids);
-        assert_eq!(truncated_items, 0);
+        let selection = select_relay_ingest_item_ids_for_processing(
+            item_ids.clone(),
+            "wss://relay.example/ws",
+            "wayfarer-small",
+            1_700_000_000_000,
+        );
+        assert_eq!(selection.processed_item_ids, item_ids);
+        assert_eq!(selection.truncated_item_ids, 0);
+    }
+
+    #[test]
+    fn relay_ingest_item_cap_applies_after_dedup_and_sort() {
+        let unique = (0..RELAY_INGEST_PROCESS_MAX_ITEMS)
+            .map(|idx| format!("{:064x}", idx as u64))
+            .collect::<Vec<_>>();
+
+        let mut item_ids = unique.clone();
+        item_ids.extend(unique.iter().take(64).cloned());
+        item_ids.reverse();
+
+        let selection = select_relay_ingest_item_ids_for_processing(
+            item_ids,
+            "wss://relay.example/ws",
+            "wayfarer-dedup",
+            1_700_000_000_000,
+        );
+
+        assert_eq!(
+            selection.processed_item_ids.len(),
+            RELAY_INGEST_PROCESS_MAX_ITEMS
+        );
+        assert_eq!(selection.unique_item_ids, RELAY_INGEST_PROCESS_MAX_ITEMS);
+        assert_eq!(selection.truncated_item_ids, 0);
+        assert_eq!(selection.processed_item_ids, unique);
+    }
+
+    #[test]
+    fn relay_ingest_window_rotates_across_rounds() {
+        let item_ids = (0..(RELAY_INGEST_PROCESS_MAX_ITEMS + 11))
+            .map(|idx| format!("{:064x}", idx as u64))
+            .collect::<Vec<_>>();
+
+        let first = select_relay_ingest_item_ids_for_processing(
+            item_ids.clone(),
+            "wss://relay-window.example/ws",
+            "wayfarer-window",
+            1_700_000_000_000,
+        );
+        let second = select_relay_ingest_item_ids_for_processing(
+            item_ids,
+            "wss://relay-window.example/ws",
+            "wayfarer-window",
+            1_700_000_000_000,
+        );
+
+        assert_eq!(
+            first.processed_item_ids.len(),
+            RELAY_INGEST_PROCESS_MAX_ITEMS
+        );
+        assert_eq!(
+            second.processed_item_ids.len(),
+            RELAY_INGEST_PROCESS_MAX_ITEMS
+        );
+        assert_ne!(first.processed_item_ids, second.processed_item_ids);
+        assert_ne!(first.window_offset, second.window_offset);
+    }
+
+    #[test]
+    fn relay_ingest_lookup_failure_falls_back_without_abort() {
+        let item_ids = (0..16)
+            .map(|idx| format!("{:064x}", idx as u64))
+            .collect::<Vec<_>>();
+
+        let (candidates, selection) = relay_ingest_candidates_with_lookup(
+            item_ids,
+            "wss://relay.example/ws",
+            "wayfarer-lookup-fail",
+            1_700_000_000_000,
+            |_| Err("db unavailable".to_string()),
+        );
+
+        assert!(candidates.is_empty());
+        assert_eq!(selection.processed_item_ids.len(), 16);
     }
 }
 
