@@ -357,8 +357,17 @@ pub fn build_request_frame(
     Ok(frame)
 }
 
-pub fn has_item(item_id: &str) -> Result<bool, String> {
-    gossip_store_sqlite::has_item(item_id)
+pub fn missing_item_ids(item_ids: &[String]) -> Result<Vec<String>, String> {
+    if item_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let existing = gossip_store_sqlite::get_existing_items_for_ids(item_ids)?;
+    Ok(item_ids
+        .iter()
+        .filter(|item_id| !existing.contains_key(*item_id))
+        .cloned()
+        .collect())
 }
 
 pub fn eligible_item_ids(now_ms: u64) -> Result<Vec<String>, String> {

@@ -12,7 +12,7 @@ use url::Url;
 
 use crate::aethos_core::gossip_sync::{
     build_hello_frame, build_relay_ingest_frame, build_request_frame, build_summary_frame,
-    has_item, import_transfer_items, parse_frame,
+    import_transfer_items, missing_item_ids, parse_frame,
     select_request_item_ids_from_summary_with_candidates, serialize_frame,
     transfer_items_for_request, GossipSyncFrame, HelloFrame, RelayIngestFrame,
 };
@@ -25,6 +25,7 @@ static RUSTLS_PROVIDER_INIT: Once = Once::new();
 static RELAY_SESSION_REGISTRY: OnceLock<Mutex<HashMap<String, ActiveRelaySession>>> =
     OnceLock::new();
 static RELAY_ATTEMPT_COUNTER: AtomicU64 = AtomicU64::new(1);
+const RELAY_INGEST_PROCESS_MAX_ITEMS: usize = 1024;
 
 #[derive(Debug, Clone)]
 struct ActiveRelaySession {
@@ -293,7 +294,7 @@ pub struct RelayPersistentSession {
     lease: RelaySessionLease,
     socket: RelaySocket,
     peer_hello: HelloFrame,
-    relay_ingest_trusted: bool,
+    relay_ingest_allowed: bool,
     last_heartbeat_at: Instant,
 }
 
@@ -344,7 +345,7 @@ pub fn open_relay_persistent_session(
         lease,
         socket,
         peer_hello,
-        relay_ingest_trusted: should_trust_relay_ingest(relay_ws),
+        relay_ingest_allowed: is_relay_ingest_allowed(relay_ws),
         last_heartbeat_at: Instant::now(),
     })
 }
@@ -361,7 +362,7 @@ pub fn run_relay_round_on_persistent_session(
         &session.relay_ws,
         identity,
         &session.peer_hello,
-        session.relay_ingest_trusted,
+        session.relay_ingest_allowed,
         trace_item_id,
         encounter_window,
     )
@@ -424,12 +425,15 @@ pub fn run_relay_encounter_gossipv1_for_duration(
 ) -> Result<EncounterReport, String> {
     let lease = RelaySessionLease::acquire(relay_ws, &identity.wayfarer_id, "encounter")
         .map_err(|err| format!("relay encounter skipped: {err}"))?;
+    let relay_ingest_secure_transport = is_relay_ingest_secure_transport(relay_ws);
+    let relay_ingest_allowed = is_relay_ingest_allowed(relay_ws);
     log_verbose(&format!(
-        "relay_encounter_open: relay_ws={} wayfarer={} auth={} relay_ingest_trusted={} trace_item_id={}",
+        "relay_encounter_open: relay_ws={} wayfarer={} auth={} relay_ingest_allowed={} relay_ingest_secure_transport={} trace_item_id={}",
         relay_ws,
         identity.wayfarer_id,
         auth_token.is_some(),
-        should_trust_relay_ingest(relay_ws),
+        relay_ingest_allowed,
+        relay_ingest_secure_transport,
         trace_item_id.unwrap_or("none")
     ));
     let mut socket = match open_relay_socket(relay_ws, auth_token) {
@@ -470,7 +474,7 @@ pub fn run_relay_encounter_gossipv1_for_duration(
         relay_ws,
         identity,
         &peer_hello,
-        should_trust_relay_ingest(relay_ws),
+        relay_ingest_allowed,
         trace_item_id,
         encounter_window,
     ) {
@@ -504,7 +508,7 @@ fn run_relay_round_on_socket(
     relay_ws: &str,
     identity: &LocalIdentitySummary,
     peer_hello: &HelloFrame,
-    relay_ingest_trusted: bool,
+    relay_ingest_allowed: bool,
     trace_item_id: Option<&str>,
     encounter_window: Duration,
 ) -> Result<EncounterReport, String> {
@@ -613,17 +617,25 @@ fn run_relay_round_on_socket(
                     item_ids.len()
                 ));
 
-                if !relay_ingest_trusted {
+                if !relay_ingest_allowed {
                     log_verbose(&format!(
-                        "relay_encounter_ignore_untrusted_relay_ingest: relay_ws={relay_ws}"
+                        "relay_encounter_ignore_relay_ingest_insecure_transport: relay_ws={relay_ws}"
                     ));
                     continue;
                 }
 
-                relay_ingest_candidates = item_ids
-                    .into_iter()
-                    .filter(|item_id| has_item(item_id).map(|have| !have).unwrap_or(false))
-                    .collect::<Vec<_>>();
+                let (capped_item_ids, truncated_items) = cap_relay_ingest_item_ids(item_ids);
+                if truncated_items > 0 {
+                    log_verbose(&format!(
+                        "relay_encounter_relay_ingest_truncated: relay_ws={} relay_ingest_item_ids_truncated={} relay_ingest_item_ids_processed={} relay_ingest_item_ids_cap={}",
+                        relay_ws,
+                        truncated_items,
+                        capped_item_ids.len(),
+                        RELAY_INGEST_PROCESS_MAX_ITEMS
+                    ));
+                }
+
+                relay_ingest_candidates = missing_item_ids(&capped_item_ids)?;
                 relay_ingest_candidates.sort();
                 relay_ingest_candidates.dedup();
 
@@ -790,9 +802,22 @@ fn should_stop_for_no_progress(streak: usize) -> bool {
     streak >= 2
 }
 
-fn should_trust_relay_ingest(relay_ws: &str) -> bool {
-    // TODO: replace this transport-level trust stub with explicit relay bearer-token
-    // validation once relay auth is implemented end-to-end.
+fn cap_relay_ingest_item_ids(mut item_ids: Vec<String>) -> (Vec<String>, usize) {
+    if item_ids.len() <= RELAY_INGEST_PROCESS_MAX_ITEMS {
+        return (item_ids, 0);
+    }
+    let truncated_items = item_ids.len() - RELAY_INGEST_PROCESS_MAX_ITEMS;
+    item_ids.truncate(RELAY_INGEST_PROCESS_MAX_ITEMS);
+    (item_ids, truncated_items)
+}
+
+fn is_relay_ingest_allowed(relay_ws: &str) -> bool {
+    // Policy stub: RELAY_INGEST hints are only accepted over secure websocket transport.
+    // No relay allowlist or bearer-token authenticity checks are implemented here.
+    is_relay_ingest_secure_transport(relay_ws)
+}
+
+fn is_relay_ingest_secure_transport(relay_ws: &str) -> bool {
     Url::parse(relay_ws)
         .map(|url| url.scheme() == "wss")
         .unwrap_or(false)
@@ -1050,7 +1075,10 @@ fn relay_frame_type(frame: &GossipSyncFrame) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_nonfatal_remote_close, should_stop_for_no_progress, should_trust_relay_ingest};
+    use super::{
+        cap_relay_ingest_item_ids, is_nonfatal_remote_close, is_relay_ingest_allowed,
+        should_stop_for_no_progress, RELAY_INGEST_PROCESS_MAX_ITEMS,
+    };
 
     #[test]
     fn nonfatal_remote_close_patterns_match_expected_errors() {
@@ -1080,11 +1108,33 @@ mod tests {
     }
 
     #[test]
-    fn relay_ingest_trust_stub_only_allows_secure_websocket_scheme() {
-        assert!(should_trust_relay_ingest("wss://relay.example/ws"));
-        assert!(!should_trust_relay_ingest("ws://relay.example/ws"));
-        assert!(!should_trust_relay_ingest("https://relay.example/ws"));
-        assert!(!should_trust_relay_ingest("not-a-url"));
+    fn relay_ingest_policy_only_allows_secure_websocket_scheme() {
+        assert!(is_relay_ingest_allowed("wss://relay.example/ws"));
+        assert!(!is_relay_ingest_allowed("ws://relay.example/ws"));
+        assert!(!is_relay_ingest_allowed("https://relay.example/ws"));
+        assert!(!is_relay_ingest_allowed("not-a-url"));
+    }
+
+    #[test]
+    fn relay_ingest_item_cap_truncates_large_frames() {
+        let item_ids = (0..(RELAY_INGEST_PROCESS_MAX_ITEMS + 7))
+            .map(|idx| format!("{:064x}", idx as u64))
+            .collect::<Vec<_>>();
+
+        let (processed, truncated_items) = cap_relay_ingest_item_ids(item_ids);
+        assert_eq!(processed.len(), RELAY_INGEST_PROCESS_MAX_ITEMS);
+        assert_eq!(truncated_items, 7);
+    }
+
+    #[test]
+    fn relay_ingest_item_cap_keeps_small_frames_intact() {
+        let item_ids = (0..8)
+            .map(|idx| format!("{:064x}", idx as u64))
+            .collect::<Vec<_>>();
+
+        let (processed, truncated_items) = cap_relay_ingest_item_ids(item_ids.clone());
+        assert_eq!(processed, item_ids);
+        assert_eq!(truncated_items, 0);
     }
 }
 

@@ -18,6 +18,7 @@ const LEGACY_JSON_STORE_FILE_NAME: &str = "gossip-object-store.json";
 const BUSY_TIMEOUT_MS: u64 = 5_000;
 const CLOCK_SKEW_TOLERANCE_MS: u64 = 30_000;
 const MIGRATION_META_KEY: &str = "legacy_json_to_sqlite_migrated_v1";
+const SQLITE_MAX_VARIABLES: usize = 999;
 
 #[derive(Debug, Clone)]
 pub struct StoredItemRecord {
@@ -354,6 +355,7 @@ fn unique_backup_store_path(legacy_path: &Path) -> PathBuf {
     }
 }
 
+#[cfg(test)]
 pub fn has_item(item_id: &str) -> Result<bool, String> {
     with_connection("has_item", |conn| {
         let exists: Option<i64> = conn
@@ -585,20 +587,23 @@ pub fn get_existing_items_for_ids(
     with_connection("existing_items_for_ids", |conn| {
         let started = Instant::now();
         let mut out = HashMap::new();
-        let mut stmt = conn
-            .prepare(
+
+        for chunk in item_ids.chunks(SQLITE_MAX_VARIABLES) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
                 "
                     SELECT item_id, envelope_b64, expiry_unix_ms, hop_count, recorded_at_unix_ms
                     FROM gossip_items
-                    WHERE item_id = ?1
-                    LIMIT 1
-                ",
-            )
-            .map_err(|err| format!("sqlite existing-items prepare failed: {err}"))?;
-
-        for item_id in item_ids {
-            let row = stmt
-                .query_row(params![item_id], |row| {
+                    WHERE item_id IN ({placeholders})
+                "
+            );
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|err| format!("sqlite existing-items prepare failed: {err}"))?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
                     Ok(StoredItemRecord {
                         item_id: row.get(0)?,
                         envelope_b64: row.get(1)?,
@@ -607,10 +612,12 @@ pub fn get_existing_items_for_ids(
                         recorded_at_unix_ms: row.get::<_, i64>(4)? as u64,
                     })
                 })
-                .optional()
                 .map_err(|err| format!("sqlite existing-items query failed: {err}"))?;
-            if let Some(row) = row {
-                out.insert(item_id.clone(), row);
+
+            for row in rows {
+                let record =
+                    row.map_err(|err| format!("sqlite existing-items row decode failed: {err}"))?;
+                out.insert(record.item_id.clone(), record);
             }
         }
 

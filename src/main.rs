@@ -3174,7 +3174,7 @@ fn start_background_gossip_sync(
                         }
                         GossipSyncFrame::RelayIngest(_) => {
                             append_local_log(&format!(
-                                "gossip_relay_ingest_ignored_untrusted from={source}"
+                                "gossip_relay_ingest_ignored_insecure_transport from={source}"
                             ));
                         }
                         GossipSyncFrame::Request(req) => {
