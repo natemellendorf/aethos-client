@@ -329,6 +329,8 @@ pub fn bytes_to_hex_lower(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::aethos_core::vectors::load_envelope_vectors;
+
     use super::{
         build_envelope_payload_b64_from_utf8, bytes_to_hex_lower, decode_envelope_payload_b64,
         encode_cbor_value_deterministic, parse_envelope_cbor,
@@ -336,7 +338,6 @@ mod tests {
     use base64::Engine;
     use ciborium::value::Value;
     use ed25519_dalek::SigningKey;
-    use serde::Deserialize;
     use sha2::{Digest, Sha256};
 
     const VECTOR_TO_WAYFARER_ID: &str =
@@ -465,36 +466,9 @@ mod tests {
             .contains("invalid envelope signature"));
     }
 
-    #[derive(Debug, Deserialize)]
-    struct EnvelopeVectorSet {
-        vectors: Vec<EnvelopeVector>,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct EnvelopeVector {
-        payload_b64: String,
-        item_id_hex: String,
-        canonical_envelope_cbor_hex: String,
-        expected_decoded: ExpectedDecoded,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct ExpectedDecoded {
-        to_wayfarer_id: String,
-        manifest_id: String,
-        body_utf8_preview: String,
-    }
-
     #[test]
     fn cross_client_vectors_decode_and_verify() {
-        let vectors_raw = std::fs::read_to_string(format!(
-            "{}/test-data/gossip-v1/envelope_vectors.json",
-            env!("CARGO_MANIFEST_DIR")
-        ))
-        .expect("read vector file");
-        let vector_set: EnvelopeVectorSet =
-            serde_json::from_str(&vectors_raw).expect("parse vector json");
-        assert!(!vector_set.vectors.is_empty());
+        let vector_set = load_envelope_vectors();
 
         for vector in vector_set.vectors {
             let envelope_raw = base64::engine::general_purpose::URL_SAFE_NO_PAD

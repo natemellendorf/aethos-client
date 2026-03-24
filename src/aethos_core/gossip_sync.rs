@@ -914,9 +914,10 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::aethos_core::vectors::load_envelope_vectors;
+
     use super::*;
     use base64::Engine;
-    use serde::Deserialize;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Mutex, OnceLock};
 
@@ -1165,43 +1166,21 @@ mod tests {
         assert!(matches!(parsed, GossipSyncFrame::Hello(_)));
     }
 
-    #[derive(Debug, Deserialize)]
-    struct EnvelopeVectorSet {
-        vectors: Vec<EnvelopeVector>,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct EnvelopeVector {
-        payload_b64: String,
-        item_id_hex: String,
-        expected_decoded: ExpectedDecoded,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct ExpectedDecoded {
-        to_wayfarer_id: String,
-        body_utf8_preview: String,
-    }
-
     #[test]
     fn cross_client_vectors_import_into_rust_gossip_store() {
         let _lock = test_env_lock().lock().expect("lock test env");
         let temp_dir = unique_test_state_dir("aethos-gossip-import-cross-client-vectors");
-        let _env_guard = EnvVarGuard::set("XDG_STATE_HOME", &temp_dir);
+        let _xdg_state_home_guard = EnvVarGuard::set("XDG_STATE_HOME", &temp_dir);
+        let _aethos_state_dir_guard = EnvVarGuard::clear("AETHOS_STATE_DIR");
 
-        let vectors_raw = std::fs::read_to_string(format!(
-            "{}/test-data/gossip-v1/envelope_vectors.json",
-            env!("CARGO_MANIFEST_DIR")
-        ))
-        .expect("read vector file");
-        let vector_set: EnvelopeVectorSet =
-            serde_json::from_str(&vectors_raw).expect("parse vector json");
+        let vector_set = load_envelope_vectors();
 
         for vector in vector_set.vectors {
+            let now_ms = now_unix_ms();
             let transfer = TransferObject {
                 item_id: vector.item_id_hex.clone(),
                 envelope_b64: vector.payload_b64,
-                expiry_unix_ms: now_unix_ms() + 60_000,
+                expiry_unix_ms: now_ms + 60_000,
                 hop_count: 1,
             };
 
@@ -1210,7 +1189,7 @@ mod tests {
                 Some("127.0.0.1:47655"),
                 Some(&item(0x44)),
                 &[transfer],
-                now_unix_ms(),
+                now_ms,
             )
             .expect("import vector transfer");
 
