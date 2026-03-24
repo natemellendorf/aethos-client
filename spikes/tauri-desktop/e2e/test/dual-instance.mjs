@@ -125,6 +125,30 @@ async function waitForIncomingMessageInState(stateRoot, expectedText) {
   }, 120000, 700);
 }
 
+async function waitForOutgoingMessageInState(stateRoot, expectedText) {
+  const chatPath = path.join(stateRoot, "chat-history.json");
+  return waitFor(async () => {
+    try {
+      const chat = await readJsonFile(chatPath);
+      const threads = Object.values(chat?.threads || {});
+      for (const thread of threads) {
+        for (const msg of thread || []) {
+          if (msg?.direction === "Outgoing" && String(msg?.text || "") === expectedText) {
+            return {
+              found: true,
+              msgId: msg?.msgId || "",
+              threadKey: Object.keys(chat?.threads || {}).find((key) => (chat.threads[key] || []).some((m) => m?.msgId === msg?.msgId)) || ""
+            };
+          }
+        }
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }, 120000, 700);
+}
+
 async function incomingMessagesByPrefix(stateRoot, prefix) {
   const chatPath = path.join(stateRoot, "chat-history.json");
   const chat = await readJsonFile(chatPath);
@@ -989,6 +1013,48 @@ describe("dual instance gossip e2e", function () {
         180000
       );
       expect(Boolean(relayTransferSeen)).to.equal(true);
+    } finally {
+      await closeSession(a);
+      await closeSession(b);
+    }
+  });
+
+  it("auto-responds /pong when a peer sends /ping", async function () {
+    this.timeout(TEST_TIMEOUT_MS);
+
+    let a;
+    let b;
+    try {
+      a = await openTauriSession("a", stateRootPath("ping-a"), TAURI_DRIVER_A_PORT);
+      b = await openTauriSession("b", stateRootPath("ping-b"), TAURI_DRIVER_B_PORT);
+
+      await waitForSplashToClear(a.driver);
+      await waitForSplashToClear(b.driver);
+
+      const idA = await readIdentityWayfarerId(a.stateRoot);
+      const idB = await readIdentityWayfarerId(b.stateRoot);
+      expect(idA).to.not.equal(idB);
+
+      await openContactsAndAdd(a.driver, idB, "Peer B");
+      await openContactsAndAdd(b.driver, idA, "Peer A");
+      await clickContactInChats(a.driver, idB);
+      await clickContactInChats(b.driver, idA);
+
+      await sendChatMessage(a.driver, "/ping");
+      await clickSyncInbox(a.driver);
+      await clickSyncInbox(b.driver);
+
+      const pingInboundOnB = await waitForIncomingMessageInState(b.stateRoot, "/ping");
+      expect(Boolean(pingInboundOnB?.found)).to.equal(true);
+
+      const pongOutboundOnB = await waitForOutgoingMessageInState(b.stateRoot, "/pong");
+      expect(Boolean(pongOutboundOnB?.found)).to.equal(true);
+
+      await clickSyncInbox(a.driver);
+      await clickSyncInbox(b.driver);
+
+      const pongInboundOnA = await waitForIncomingMessageInState(a.stateRoot, "/pong");
+      expect(Boolean(pongInboundOnA?.found)).to.equal(true);
     } finally {
       await closeSession(a);
       await closeSession(b);
