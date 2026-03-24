@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -27,6 +27,7 @@ static RELAY_SESSION_REGISTRY: OnceLock<Mutex<HashMap<String, ActiveRelaySession
     OnceLock::new();
 static RELAY_INGEST_WINDOW_REGISTRY: OnceLock<Mutex<HashMap<String, RelayIngestWindowState>>> =
     OnceLock::new();
+static RELAY_INGEST_WINDOW_LOCK_POISON_LOGGED: AtomicBool = AtomicBool::new(false);
 static RELAY_ATTEMPT_COUNTER: AtomicU64 = AtomicU64::new(1);
 const RELAY_INGEST_PROCESS_MAX_ITEMS: usize = 1024;
 const UNIX_DAY_MS: u64 = 86_400_000;
@@ -650,7 +651,7 @@ fn run_relay_round_on_socket(
                 }
 
                 let now_ms = now_unix_ms();
-                let (candidates, selection) = relay_ingest_candidates_with_lookup(
+                let (next_candidates, selection) = relay_ingest_candidates_with_lookup(
                     item_ids,
                     relay_ws,
                     &identity.wayfarer_id,
@@ -682,7 +683,9 @@ fn run_relay_round_on_socket(
                     ));
                 }
 
-                relay_ingest_candidates = candidates;
+                if let Some(candidates) = next_candidates {
+                    relay_ingest_candidates = candidates;
+                }
 
                 if let Some(summary) = latest_summary.as_ref() {
                     let want = select_request_item_ids_from_summary_with_candidates(
@@ -853,7 +856,7 @@ fn relay_ingest_candidates_with_lookup<F>(
     wayfarer_id: &str,
     now_ms: u64,
     lookup_missing: F,
-) -> (Vec<String>, RelayIngestItemSelection)
+) -> (Option<Vec<String>>, RelayIngestItemSelection)
 where
     F: Fn(&[String]) -> Result<Vec<String>, String>,
 {
@@ -862,18 +865,21 @@ where
     let mut candidates = match lookup_missing(&selection.processed_item_ids) {
         Ok(candidates) => candidates,
         Err(err) => {
+            // Rationale: preserve the previous relay_ingest_candidates on transient DB failures
+            // so relay rounds continue with last-known-good state instead of collapsing to
+            // an empty request set.
             log_verbose(&format!(
-                "relay_encounter_relay_ingest_lookup_failed: relay_ws={} relay_ingest_item_ids_processed={} action=skip error={}",
+                "relay_encounter_relay_ingest_lookup_failed: relay_ws={} relay_ingest_item_ids_processed={} action=preserve_previous_candidates error={}",
                 relay_ws,
                 selection.processed_item_ids.len(),
                 err
             ));
-            Vec::new()
+            return (None, selection);
         }
     };
     candidates.sort();
     candidates.dedup();
-    (candidates, selection)
+    (Some(candidates), selection)
 }
 
 fn select_relay_ingest_item_ids_for_processing(
@@ -904,8 +910,9 @@ fn select_relay_ingest_item_ids_for_processing(
     let round = next_relay_ingest_window_round(relay_ws, wayfarer_id, now_ms);
     let day = unix_day(now_ms);
     let seed_offset = relay_ingest_seed_offset(relay_ws, wayfarer_id, day, unique_item_ids);
-    let round_stride = RELAY_INGEST_PROCESS_MAX_ITEMS % unique_item_ids;
-    let round_offset = ((round % unique_item_ids as u64) as usize * round_stride) % unique_item_ids;
+    let round_index = (round % unique_item_ids as u64) as usize;
+    let round_stride = RELAY_INGEST_PROCESS_MAX_ITEMS;
+    let round_offset = (round_index * round_stride) % unique_item_ids;
     let window_offset = (seed_offset + round_offset) % unique_item_ids;
     let processed_item_ids = select_relay_ingest_window_with_wraparound(
         &unique_sorted_item_ids,
@@ -943,9 +950,29 @@ fn select_relay_ingest_window_with_wraparound(
 fn next_relay_ingest_window_round(relay_ws: &str, wayfarer_id: &str, now_ms: u64) -> u64 {
     let key = relay_session_key(relay_ws, wayfarer_id);
     let day = unix_day(now_ms);
-    let Ok(mut registry) = relay_ingest_window_registry().lock() else {
-        return 0;
+    let mut registry = match relay_ingest_window_registry().lock() {
+        Ok(registry) => registry,
+        Err(poison) => {
+            if !RELAY_INGEST_WINDOW_LOCK_POISON_LOGGED.swap(true, AtomicOrdering::Relaxed) {
+                log_verbose(
+                    "relay_ingest_window_registry_lock_poisoned: action=recover_with_inner",
+                );
+            }
+            poison.into_inner()
+        }
     };
+
+    let prior_len = registry.len();
+    registry.retain(|_, state| state.day == day);
+    let pruned_entries = prior_len.saturating_sub(registry.len());
+    if pruned_entries > 0 {
+        log_verbose(&format!(
+            "relay_ingest_window_registry_pruned: removed_entries={} remaining_entries={} day={}",
+            pruned_entries,
+            registry.len(),
+            day
+        ));
+    }
 
     let state = registry
         .entry(key)
@@ -1380,7 +1407,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_ingest_lookup_failure_falls_back_without_abort() {
+    fn relay_ingest_lookup_failure_preserves_previous_candidates_without_abort() {
         let item_ids = (0..16)
             .map(|idx| format!("{:064x}", idx as u64))
             .collect::<Vec<_>>();
@@ -1393,7 +1420,7 @@ mod tests {
             |_| Err("db unavailable".to_string()),
         );
 
-        assert!(candidates.is_empty());
+        assert!(candidates.is_none());
         assert_eq!(selection.processed_item_ids.len(), 16);
     }
 }
