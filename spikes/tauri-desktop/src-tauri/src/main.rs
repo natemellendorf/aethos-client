@@ -3418,6 +3418,7 @@ fn merge_pulled_messages(
         .unwrap_or(3600);
     let identity = ensure_local_identity().ok();
     let author_signing_seed = load_local_signing_key_seed().ok();
+    let mut auto_pong_targets = BTreeSet::new();
 
     for pulled in pulled_messages {
         if let (Some(identity), Some(seed)) = (identity.as_ref(), author_signing_seed.as_ref()) {
@@ -3506,13 +3507,94 @@ fn merge_pulled_messages(
         });
         sort_thread_messages(thread);
 
+        if is_ping_only_chat_payload(&pulled.text) && is_valid_wayfarer_id(&sender_label) {
+            auto_pong_targets.insert(sender_label.clone());
+        }
+
         if chat.selected_contact.is_none() {
             chat.selected_contact = Some(sender_label.clone());
             mark_contact_seen(chat, &sender_label);
         }
     }
 
+    for target in auto_pong_targets {
+        if let Err(err) = queue_auto_pong_message(chat, &target) {
+            log_info(&format!(
+                "auto_pong_queue_failed: to={} error={}",
+                target, err
+            ));
+        }
+    }
+
     normalize_chat_state(chat);
+}
+
+fn queue_auto_pong_message(chat: &mut PersistedChatState, wayfarer_id: &str) -> Result<(), String> {
+    if !is_valid_wayfarer_id(wayfarer_id) {
+        return Ok(());
+    }
+
+    let now_ms = now_unix_ms();
+    let now_secs = now_unix_secs();
+    let settings = load_app_settings()?;
+    let author_signing_seed = load_local_signing_key_seed()?;
+    let _ = maybe_queue_capabilities_for_peer(
+        wayfarer_id,
+        &author_signing_seed,
+        settings.message_ttl_seconds,
+    );
+
+    let body = "/pong";
+    let expiry_ms = now_ms.saturating_add(settings.message_ttl_seconds.saturating_mul(1000));
+    let local_id = format!("local-auto-{}-{:08x}", now_ms, rand::random::<u32>());
+    let outbound_payload = build_outbound_chat_payload(body, &local_id, now_ms, None);
+    let payload =
+        build_envelope_payload_b64_from_utf8(wayfarer_id, &outbound_payload, &author_signing_seed)?;
+    let decoded = decode_envelope_payload_b64(&payload)?;
+    let item_id = gossip_record_local_payload(&payload, expiry_ms)?;
+
+    if let Some(runtime) = GOSSIP_RUNTIME.get() {
+        runtime.force_announce.store(true, Ordering::SeqCst);
+        set_gossip_event("announce queued");
+    }
+
+    mark_contact_seen(chat, wayfarer_id);
+    let thread = chat.threads.entry(wayfarer_id.to_string()).or_default();
+    thread.push(ChatMessage {
+        msg_id: local_id.clone(),
+        text: body.to_string(),
+        timestamp: format_timestamp_from_unix(now_secs),
+        created_at_unix: now_secs,
+        created_at_unix_ms: now_ms,
+        direction: ChatDirection::Outgoing,
+        seen: true,
+        manifest_id_hex: Some(decoded.manifest_id_hex),
+        delivered_at: None,
+        outbound_state: Some(OutboundState::Sending),
+        expires_at_unix_ms: Some(expiry_ms),
+        last_sync_attempt_unix_ms: Some(now_ms),
+        last_sync_error: None,
+        attachment: None,
+        media: None,
+    });
+    mark_outgoing_message(chat, wayfarer_id, &local_id, &item_id, None);
+
+    let relay_http = settings
+        .relay_endpoints
+        .first()
+        .cloned()
+        .map(|endpoint| normalize_http_endpoint(&endpoint));
+    let relay_enabled = settings.relay_sync_enabled && relay_http.is_some();
+    if relay_enabled {
+        request_relay_sync("auto_pong");
+    }
+
+    log_info(&format!(
+        "auto_pong_queued: to={} item_id={} ttl_s={}",
+        wayfarer_id, item_id, settings.message_ttl_seconds
+    ));
+
+    Ok(())
 }
 
 fn resolve_contact_id_for_preview(
@@ -3628,6 +3710,17 @@ fn extract_chat_text_if_json(input: &str) -> String {
     }
 
     input.to_string()
+}
+
+fn is_ping_only_chat_payload(input: &str) -> bool {
+    if is_media_wire_message(input) {
+        return false;
+    }
+    if extract_attachment_if_json(input).is_some() {
+        return false;
+    }
+
+    extract_chat_text_if_json(input).trim() == "/ping"
 }
 
 fn extract_sent_at_unix_ms_if_json(input: &str) -> Option<u64> {
@@ -4615,6 +4708,30 @@ mod tests {
     fn outbound_chat_payload_keeps_emoji_text() {
         let payload = build_outbound_chat_payload("hello 🌬️🚀", "local-emoji", 42, None);
         assert_eq!(extract_chat_text_if_json(&payload), "hello 🌬️🚀");
+    }
+
+    #[test]
+    fn ping_only_payload_is_detected_for_auto_pong() {
+        let payload = build_outbound_chat_payload("/ping", "local-ping", 42, None);
+        assert!(is_ping_only_chat_payload(&payload));
+    }
+
+    #[test]
+    fn ping_with_attachment_does_not_trigger_auto_pong() {
+        let attachment = ChatAttachment {
+            file_name: "note.txt".to_string(),
+            mime_type: "text/plain".to_string(),
+            size_bytes: 4,
+            content_b64: Some(base64::engine::general_purpose::STANDARD.encode("test")),
+        };
+        let payload = build_outbound_chat_payload("/ping", "local-ping", 42, Some(&attachment));
+        assert!(!is_ping_only_chat_payload(&payload));
+    }
+
+    #[test]
+    fn non_ping_payload_does_not_trigger_auto_pong() {
+        let payload = build_outbound_chat_payload("hello", "local-hello", 42, None);
+        assert!(!is_ping_only_chat_payload(&payload));
     }
 
     #[test]
