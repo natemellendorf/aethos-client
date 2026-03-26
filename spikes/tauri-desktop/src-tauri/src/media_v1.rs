@@ -27,7 +27,9 @@ const MEDIA_MISSING_TYPE: &str = "aethos.media.missing.v1";
 
 const MAX_ITEM_PAYLOAD_B64_BYTES_DEFAULT: usize = 64 * 1024;
 const MAX_OBJECT_BYTES: u64 = 128 * 1024 * 1024;
+#[allow(dead_code)] // Reserved for pending inbound spool quota enforcement wiring.
 const SPOOL_GLOBAL_PARTIAL_BYTES: u64 = 1024 * 1024 * 1024;
+#[allow(dead_code)] // Reserved for pending inbound spool quota enforcement wiring.
 const SPOOL_PER_PEER_PARTIAL_BYTES: u64 = 256 * 1024 * 1024;
 const ORPHAN_PER_PEER_BYTES: u64 = 16 * 1024 * 1024;
 const ORPHAN_GLOBAL_BYTES: u64 = 128 * 1024 * 1024;
@@ -47,14 +49,20 @@ const WIRE_BUCKET_SUSTAINED_BYTES_PER_MIN: f64 = (8 * 1024 * 1024) as f64;
 const WIRE_BUCKET_BURST_BYTES: f64 = (16 * 1024 * 1024) as f64;
 const MANIFESTS_PER_HOUR_LIMIT: usize = 30;
 const CHUNKS_PER_MINUTE_LIMIT: usize = 1200;
+#[allow(dead_code)] // Reserved for pending corrupt-chunk abort handling wiring.
 const CORRUPT_CHUNK_ABORT_STRIKES: u8 = 3;
+#[allow(dead_code)] // Reserved for pending initial outbound media send burst wiring.
 const INITIAL_OUTBOUND_CHUNK_CEILING: usize = 16;
+#[allow(dead_code)] // Reserved for pending missing-response fastlane wiring.
 const MISSING_RESPONSE_CHUNK_CEILING: usize = 64;
 const MEDIA_CONTROL_FASTLANE_QUEUE_MAX: usize = 512;
+#[allow(dead_code)] // Reserved for pending missing-response fastlane dedup wiring.
 const MISSING_RESPONSE_CHUNK_DEDUP_WINDOW_MS: u64 = 8_000;
 const E2E_WIRE_BUCKET_SUSTAINED_BYTES_PER_MIN_DEFAULT: u64 = 64 * 1024 * 1024;
 const E2E_WIRE_BUCKET_BURST_BYTES_DEFAULT: u64 = 64 * 1024 * 1024;
+#[allow(dead_code)] // Reserved for pending E2E missing-response fastlane tuning.
 const E2E_MISSING_RESPONSE_CHUNK_DEDUP_WINDOW_MS_DEFAULT: u64 = 1_500;
+#[allow(dead_code)] // Reserved for pending E2E missing-response fastlane tuning.
 const E2E_MISSING_RESPONSE_CHUNK_CEILING_DEFAULT: usize = 128;
 const E2E_CHUNKS_PER_MINUTE_LIMIT_DEFAULT: usize = 4_000;
 
@@ -84,6 +92,7 @@ pub struct CompletedMediaPathPayload {
     pub size_bytes: u64,
 }
 
+#[allow(dead_code)] // Reserved for pending outbound media send API wiring.
 #[derive(Debug, Clone)]
 pub struct OutboundMediaSendResult {
     pub item_id: String,
@@ -96,6 +105,7 @@ pub struct OutboundMediaSendResult {
     pub expires_at_unix_ms: u64,
 }
 
+#[allow(dead_code)] // Reserved for pending incoming media message pipeline wiring.
 #[derive(Debug, Clone)]
 pub enum MediaMessageProcess {
     NotMedia,
@@ -103,6 +113,7 @@ pub enum MediaMessageProcess {
     HandledManifest,
 }
 
+#[allow(dead_code)] // Reserved for pending media capability handshake wiring.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MediaCapabilitiesMessage {
@@ -113,6 +124,7 @@ struct MediaCapabilitiesMessage {
     sent_at_unix_ms: u64,
 }
 
+#[allow(dead_code)] // Reserved for pending media manifest ingest/send wiring.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MediaManifestMessage {
@@ -204,6 +216,7 @@ struct IncomingTransferState {
     completed_unix_ms: Option<u64>,
 }
 
+#[allow(dead_code)] // Reserved for pending outbound media resend state wiring.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OutboundTransferState {
@@ -274,6 +287,7 @@ struct OrphanPeerUsage {
     meta_files: u64,
 }
 
+#[allow(dead_code)] // Reserved for pending media wire message dispatch wiring.
 #[derive(Debug, Clone)]
 enum ParsedMediaMessage {
     Capabilities(MediaCapabilitiesMessage),
@@ -468,6 +482,7 @@ fn negotiated_payload_b64_limit_for_sender(sender_wayfarer_id: &str) -> usize {
     local.min(peer.max_item_payload_b64_bytes as usize)
 }
 
+#[allow(dead_code)] // Reserved for pending missing-request interval gate wiring.
 fn missing_request_tracker() -> &'static Mutex<HashMap<String, u64>> {
     static TRACKER: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
     TRACKER.get_or_init(|| Mutex::new(HashMap::new()))
@@ -478,11 +493,13 @@ fn missing_request_cursor_tracker() -> &'static Mutex<HashMap<String, u32>> {
     TRACKER.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[allow(dead_code)] // Reserved for pending missing-response dedup tracker wiring.
 fn missing_response_chunk_tracker() -> &'static Mutex<HashMap<String, HashMap<u32, u64>>> {
     static TRACKER: OnceLock<Mutex<HashMap<String, HashMap<u32, u64>>>> = OnceLock::new();
     TRACKER.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[allow(dead_code)] // Reserved for pending missing-response fastlane dedup wiring.
 fn missing_response_chunk_recently_sent(key: &str, chunk_index: u32, now_ms: u64) -> bool {
     let Ok(mut tracker) = missing_response_chunk_tracker().lock() else {
         return false;
@@ -499,6 +516,7 @@ fn missing_response_chunk_recently_sent(key: &str, chunk_index: u32, now_ms: u64
         .unwrap_or(false)
 }
 
+#[allow(dead_code)] // Reserved for pending missing-response fastlane dedup wiring.
 fn note_missing_response_chunk_sent(key: &str, chunk_index: u32, now_ms: u64) {
     let Ok(mut tracker) = missing_response_chunk_tracker().lock() else {
         return;
@@ -509,6 +527,7 @@ fn note_missing_response_chunk_sent(key: &str, chunk_index: u32, now_ms: u64) {
         .insert(chunk_index, now_ms);
 }
 
+#[allow(dead_code)] // Reserved for pending composer-side media candidate filtering.
 pub fn is_media_candidate_attachment(attachment: &ChatAttachment) -> bool {
     let mime = attachment.mime_type.trim().to_ascii_lowercase();
     mime.starts_with("image/")
@@ -531,6 +550,7 @@ pub fn is_media_wire_message(input: &str) -> bool {
     )
 }
 
+#[allow(dead_code)] // Reserved for pending outbound media capability handshake wiring.
 pub fn maybe_queue_capabilities_for_peer(
     peer_wayfarer_id: &str,
     author_signing_seed: &[u8; 32],
@@ -558,6 +578,7 @@ pub fn maybe_queue_capabilities_for_peer(
     Ok(())
 }
 
+#[allow(dead_code)] // Reserved for pending outbound media capability gate wiring.
 pub fn peer_supports_media_v1(peer_wayfarer_id: &str) -> Result<bool, String> {
     let cache = load_capabilities_cache()?;
     Ok(cache
@@ -567,6 +588,7 @@ pub fn peer_supports_media_v1(peer_wayfarer_id: &str) -> Result<bool, String> {
         .unwrap_or(false))
 }
 
+#[allow(dead_code)] // Reserved for pending outbound media manifest/chunk publish wiring.
 pub fn send_media_manifest_and_chunks(
     to_wayfarer_id: &str,
     caption: &str,
@@ -711,6 +733,7 @@ pub fn send_media_manifest_and_chunks(
     })
 }
 
+#[allow(dead_code)] // Reserved for pending inbound media message dispatch wiring.
 pub fn process_incoming_media_message(
     pulled: &EncounterMessagePreview,
     chat: &mut PersistedChatState,
@@ -1335,6 +1358,7 @@ pub fn pulse_missing_requests_for_receiving_transfers(
     Ok(sent)
 }
 
+#[allow(dead_code)] // Reserved for pending inbound media wire message dispatch wiring.
 fn parse_media_message(input: &str) -> Result<Option<ParsedMediaMessage>, String> {
     let value = match serde_json::from_str::<serde_json::Value>(input) {
         Ok(value) => value,
@@ -1369,6 +1393,7 @@ fn parse_media_message(input: &str) -> Result<Option<ParsedMediaMessage>, String
     Ok(Some(parsed))
 }
 
+#[allow(dead_code)] // Reserved for pending media manifest ingest/send validation wiring.
 fn validate_manifest(manifest: &MediaManifestMessage) -> Result<(), String> {
     if !is_valid_sha256_hex(&manifest.object_sha256_hex) {
         return Err("manifest objectSha256Hex must be lowercase hex64".to_string());
@@ -1430,6 +1455,7 @@ fn choose_chunk_payload_bytes(
     Err("unable to fit media chunk within maxItemPayloadB64Bytes".to_string())
 }
 
+#[allow(dead_code)] // Reserved for pending initial outbound chunk publish wiring.
 #[allow(clippy::too_many_arguments)]
 fn record_chunk_by_index(
     manifest: &MediaManifestMessage,
@@ -1462,6 +1488,7 @@ fn record_chunk_by_index(
     )
 }
 
+#[allow(dead_code)] // Reserved for pending initial outbound chunk publish wiring.
 #[allow(clippy::too_many_arguments)]
 fn record_chunk_message(
     manifest: &MediaManifestMessage,
@@ -1491,6 +1518,7 @@ fn record_chunk_message(
     Ok(item_id)
 }
 
+#[allow(dead_code)] // Reserved for pending missing-response fastlane wiring.
 #[allow(clippy::too_many_arguments)]
 fn queue_chunk_message_fastlane(
     manifest: &MediaManifestMessage,
@@ -1525,6 +1553,7 @@ fn queue_chunk_message_fastlane(
     Ok(item_id)
 }
 
+#[allow(dead_code)] // Reserved for pending outbound chunk envelope publish wiring.
 fn build_chunk_envelope_payload(
     manifest: &MediaManifestMessage,
     chunk_index: u32,
@@ -1569,6 +1598,7 @@ fn build_chunk_envelope_payload(
     Ok(payload)
 }
 
+#[allow(dead_code)] // Reserved for pending missing-response chunk replay wiring.
 fn read_chunk_bytes_from_file(
     file: &mut fs::File,
     manifest: &MediaManifestMessage,
@@ -1596,6 +1626,7 @@ fn read_chunk_bytes_from_file(
     Ok(chunk)
 }
 
+#[allow(dead_code)] // Reserved for pending outbound transfer persistence wiring.
 fn persist_outbound_state(
     manifest: &MediaManifestMessage,
     recipient_wayfarer_id: &str,
@@ -1673,6 +1704,7 @@ fn load_incoming_state(
     Ok(None)
 }
 
+#[allow(dead_code)] // Reserved for pending outbound transfer replay wiring.
 fn load_outbound_state(transfer_id: &str) -> Result<Option<OutboundTransferState>, String> {
     let path = outbound_state_path(transfer_id);
     if !path.exists() {
@@ -1952,6 +1984,7 @@ fn save_spool_usage_cache(cache: &SpoolUsageCache) -> Result<(), String> {
     write_json_file_atomic(&spool_usage_cache_path(), cache)
 }
 
+#[allow(dead_code)] // Reserved for pending inbound spool accounting on chunk ingest.
 fn apply_spool_usage_increase(sender_wayfarer_id: &str, delta_bytes: u64) -> Result<(), String> {
     if delta_bytes == 0 {
         return Ok(());
@@ -2148,6 +2181,7 @@ fn finalize_completed_transfer(transfer: &mut IncomingTransferState) -> Result<(
     Ok(())
 }
 
+#[allow(dead_code)] // Reserved for pending corrupt-chunk strike threshold wiring.
 fn strike_or_abort_corrupt_chunk(
     transfer: &mut IncomingTransferState,
     chunk_index: u32,
@@ -2206,6 +2240,7 @@ fn mark_transfer_failed(
     persist_incoming_state(&state)
 }
 
+#[allow(dead_code)] // Reserved for pending compact chat media status updates.
 fn update_chat_media_state(
     chat: &mut PersistedChatState,
     sender_wayfarer_id: &str,
@@ -2216,6 +2251,7 @@ fn update_chat_media_state(
     update_chat_media_progress(chat, sender_wayfarer_id, transfer_id, 0, 0, status, error);
 }
 
+#[allow(dead_code)] // Reserved for pending inbound transfer progress updates.
 fn update_chat_media_progress(
     chat: &mut PersistedChatState,
     sender_wayfarer_id: &str,
@@ -2243,6 +2279,7 @@ fn update_chat_media_progress(
     }
 }
 
+#[allow(dead_code)] // Reserved for pending manifest-to-chat projection wiring.
 fn upsert_manifest_chat_message(
     chat: &mut PersistedChatState,
     pulled: &EncounterMessagePreview,
@@ -2457,6 +2494,7 @@ fn compute_missing_ranges(transfer: &IncomingTransferState) -> Result<Vec<ChunkR
     Ok(ranges)
 }
 
+#[allow(dead_code)] // Reserved for pending missing-request interval suppression wiring.
 fn missing_request_interval_ok(sender_wayfarer_id: &str, transfer_id: &str, now_ms: u64) -> bool {
     let key = format!("{sender_wayfarer_id}:{transfer_id}");
     let min_interval = media_limits().missing_min_interval_ms;
@@ -2471,6 +2509,7 @@ fn missing_request_interval_ok(sender_wayfarer_id: &str, transfer_id: &str, now_
     true
 }
 
+#[allow(dead_code)] // Reserved for pending inbound spool quota enforcement wiring.
 fn ensure_spool_quota(sender_wayfarer_id: &str, incoming_chunk_bytes: u64) -> Result<(), String> {
     let cache = load_or_reconcile_spool_usage_cache()?;
     let peer_partial = cache
@@ -2957,6 +2996,7 @@ fn wire_bucket_burst_bytes() -> f64 {
     ) as f64
 }
 
+#[allow(dead_code)] // Reserved for pending missing-response dedup e2e tuning wiring.
 fn missing_response_chunk_dedup_window_ms() -> u64 {
     if !e2e_enabled() {
         return MISSING_RESPONSE_CHUNK_DEDUP_WINDOW_MS;
@@ -2969,6 +3009,7 @@ fn missing_response_chunk_dedup_window_ms() -> u64 {
     )
 }
 
+#[allow(dead_code)] // Reserved for pending missing-response chunk ceiling e2e tuning wiring.
 fn missing_response_chunk_ceiling() -> usize {
     if !e2e_enabled() {
         return MISSING_RESPONSE_CHUNK_CEILING;
@@ -3018,6 +3059,7 @@ fn media_limits() -> MediaLimits {
     }
 }
 
+#[allow(dead_code)] // Reserved for pending media e2e TTL override send wiring.
 fn e2e_ttl_override_ms(default_expiry_ms: u64, now_ms: u64) -> u64 {
     if !e2e_enabled() {
         return default_expiry_ms;
@@ -3031,6 +3073,7 @@ fn e2e_ttl_override_ms(default_expiry_ms: u64, now_ms: u64) -> u64 {
     now_ms.saturating_add(ttl_seconds.saturating_mul(1000))
 }
 
+#[allow(dead_code)] // Reserved for pending media e2e drop-chunk fault injection wiring.
 fn e2e_drop_chunk_index() -> Option<u32> {
     if !e2e_enabled() {
         return None;
@@ -3063,6 +3106,7 @@ fn expected_chunk_len(transfer: &IncomingTransferState, chunk_index: u32) -> Res
     Ok(total.saturating_sub(consumed))
 }
 
+#[allow(dead_code)] // Reserved for pending outbound chunk slicing wiring.
 fn chunk_bounds(
     total_bytes: u64,
     chunk_payload_bytes: u32,
@@ -3078,6 +3122,7 @@ fn chunk_bounds(
     Ok((start, end))
 }
 
+#[allow(dead_code)] // Reserved for pending chunk-count invariant calculations.
 fn ceil_div_u64(n: u64, d: u64) -> u64 {
     if d == 0 {
         return 0;
@@ -3152,6 +3197,7 @@ fn is_valid_sha256_hex(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
+#[allow(dead_code)] // Reserved for pending inbound chunk persistence wiring.
 fn write_chunk_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -3173,6 +3219,7 @@ fn load_capabilities_cache() -> Result<CapabilitiesCache, String> {
     read_json_file(&path)
 }
 
+#[allow(dead_code)] // Reserved for pending media capabilities cache write-through wiring.
 fn save_capabilities_cache(cache: &CapabilitiesCache) -> Result<(), String> {
     write_json_file_atomic(&capabilities_cache_path(), cache)
 }
@@ -3322,14 +3369,17 @@ fn incoming_chunk_path(sender_wayfarer_id: &str, transfer_id: &str, chunk_index:
         .join(format!("{chunk_index}.bin"))
 }
 
+#[allow(dead_code)] // Reserved for pending outbound transfer persistence wiring.
 fn outbound_transfer_dir(transfer_id: &str) -> PathBuf {
     media_base_dir().join("outbound").join(transfer_id)
 }
 
+#[allow(dead_code)] // Reserved for pending outbound transfer persistence wiring.
 fn outbound_state_path(transfer_id: &str) -> PathBuf {
     outbound_transfer_dir(transfer_id).join("state.json")
 }
 
+#[allow(dead_code)] // Reserved for pending outbound transfer persistence wiring.
 fn outbound_source_path(transfer_id: &str) -> PathBuf {
     outbound_transfer_dir(transfer_id).join("source.bin")
 }
