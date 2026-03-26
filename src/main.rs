@@ -2835,38 +2835,40 @@ fn attach_session_poller(rx: Receiver<SessionStatus>, ui: SessionPollerUi) {
                     let is_seen_on_insert =
                         state.selected_contact.as_deref() == Some(sender_label.as_str());
 
-                    let thread = state.threads.entry(sender_label.clone()).or_default();
+                    {
+                        let thread = state.threads.entry(sender_label.clone()).or_default();
 
-                    let already_present = thread.iter().any(|existing| {
-                        existing.msg_id == pulled.msg_id
-                            || (pulled.manifest_id_hex.is_some()
-                                && existing.manifest_id_hex == pulled.manifest_id_hex)
-                    });
+                        let already_present = thread.iter().any(|existing| {
+                            existing.msg_id == pulled.msg_id
+                                || (pulled.manifest_id_hex.is_some()
+                                    && existing.manifest_id_hex == pulled.manifest_id_hex)
+                        });
 
-                    if already_present {
-                        shared_log_verbose(&format!(
-                            "thread_incoming_skip_duplicate: from={} msg_id={} manifest={}",
-                            sender_label,
-                            pulled.msg_id,
-                            pulled.manifest_id_hex.as_deref().unwrap_or("none")
-                        ));
-                        continue;
+                        if already_present {
+                            shared_log_verbose(&format!(
+                                "thread_incoming_skip_duplicate: from={} msg_id={} manifest={}",
+                                sender_label,
+                                pulled.msg_id,
+                                pulled.manifest_id_hex.as_deref().unwrap_or("none")
+                            ));
+                            continue;
+                        }
+
+                        thread.push(ChatMessage {
+                            msg_id: pulled.msg_id.clone(),
+                            text: pulled.text.clone(),
+                            timestamp: format_timestamp_from_unix(pulled.received_at),
+                            created_at_unix: pulled.received_at,
+                            direction: ChatDirection::Incoming,
+                            seen: is_seen_on_insert,
+                            manifest_id_hex: pulled.manifest_id_hex.clone(),
+                            delivered_at: None,
+                            outbound_state: None,
+                            expires_at_unix_ms: None,
+                            last_sync_attempt_unix_ms: None,
+                            last_sync_error: None,
+                        });
                     }
-
-                    thread.push(ChatMessage {
-                        msg_id: pulled.msg_id.clone(),
-                        text: pulled.text.clone(),
-                        timestamp: format_timestamp_from_unix(pulled.received_at),
-                        created_at_unix: pulled.received_at,
-                        direction: ChatDirection::Incoming,
-                        seen: is_seen_on_insert,
-                        manifest_id_hex: pulled.manifest_id_hex.clone(),
-                        delivered_at: None,
-                        outbound_state: None,
-                        expires_at_unix_ms: None,
-                        last_sync_attempt_unix_ms: None,
-                        last_sync_error: None,
-                    });
                     shared_log_verbose(&format!(
                         "thread_incoming_insert: from={} msg_id={} manifest={}",
                         sender_label,
@@ -2895,6 +2897,48 @@ fn attach_session_poller(rx: Receiver<SessionStatus>, ui: SessionPollerUi) {
                     if state.selected_contact.is_none() {
                         state.selected_contact = Some(sender_label.clone());
                         mark_contact_seen(&mut state, &sender_label);
+                    }
+
+                    if is_ping_only_chat_payload(&pulled.text)
+                        && is_valid_wayfarer_id(&sender_label)
+                    {
+                        let ttl_seconds = clamp_message_ttl_seconds(
+                            load_app_settings().unwrap_or_default().message_ttl_seconds,
+                        );
+                        if let Some(thread) = state.threads.get_mut(&sender_label) {
+                            if thread_has_recent_auto_pong(thread) {
+                                continue;
+                            }
+                            match queue_auto_pong_message(&sender_label, ttl_seconds) {
+                                Ok((item_id, expiry_unix_ms)) => {
+                                    let now = now_unix_secs();
+                                    thread.push(ChatMessage {
+                                        msg_id: item_id.clone(),
+                                        text: "/pong".to_string(),
+                                        timestamp: format_timestamp_from_unix(now),
+                                        created_at_unix: now,
+                                        direction: ChatDirection::Outgoing,
+                                        seen: true,
+                                        manifest_id_hex: None,
+                                        delivered_at: None,
+                                        outbound_state: Some(OutboundState::Sending),
+                                        expires_at_unix_ms: Some(expiry_unix_ms),
+                                        last_sync_attempt_unix_ms: Some(now_unix_ms()),
+                                        last_sync_error: None,
+                                    });
+                                    shared_log_verbose(&format!(
+                                        "auto_pong_queued: to={} item_id={} ttl_seconds={}",
+                                        sender_label, item_id, ttl_seconds
+                                    ));
+                                }
+                                Err(err) => {
+                                    append_local_log(&format!(
+                                        "auto_pong_queue_failed: to={} error={}",
+                                        sender_label, err
+                                    ));
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -3404,6 +3448,35 @@ fn extract_chat_text_if_json(input: &str) -> String {
     }
 
     input.to_string()
+}
+
+fn is_ping_only_chat_payload(input: &str) -> bool {
+    extract_chat_text_if_json(input).trim() == "/ping"
+}
+
+fn thread_has_recent_auto_pong(thread: &[ChatMessage]) -> bool {
+    let now = now_unix_secs();
+    thread.iter().rev().any(|message| {
+        matches!(message.direction, ChatDirection::Outgoing)
+            && message.text.trim() == "/pong"
+            && message.created_at_unix >= now.saturating_sub(30)
+    })
+}
+
+fn queue_auto_pong_message(
+    to_wayfarer_id: &str,
+    ttl_seconds: u64,
+) -> Result<(String, u64), String> {
+    if !is_valid_wayfarer_id(to_wayfarer_id) {
+        return Err("invalid wayfarer_id for auto pong".to_string());
+    }
+    let author_signing_seed = load_local_signing_key_seed()?;
+    let payload_b64 =
+        build_envelope_payload_b64_from_utf8(to_wayfarer_id, "/pong", &author_signing_seed)?;
+    let now_ms = now_unix_ms();
+    let expiry_unix_ms = now_ms.saturating_add(ttl_seconds.saturating_mul(1000));
+    let item_id = gossip_record_local_payload(&payload_b64, expiry_unix_ms)?;
+    Ok((item_id, expiry_unix_ms))
 }
 
 fn display_sender_label(pulled: &PulledMessagePreview) -> String {
@@ -5114,7 +5187,10 @@ fn apply_styles() {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_wayfarer_id_from_text, update_relay_sync_setting, AppSettings};
+    use super::{
+        extract_wayfarer_id_from_text, is_ping_only_chat_payload, update_relay_sync_setting,
+        AppSettings,
+    };
     use crate::aethos_core::gossip_sync::{GossipSyncFrame, RelayIngestFrame};
     use base64::Engine;
     use std::cell::RefCell;
@@ -5189,6 +5265,14 @@ mod tests {
             extract_wayfarer_id_from_text(&format!("scan={id}&source=camera")),
             Some(id)
         );
+    }
+
+    #[test]
+    fn ping_only_payload_is_detected() {
+        assert!(is_ping_only_chat_payload("/ping"));
+        assert!(is_ping_only_chat_payload(" {\"text\":\"/ping\" } "));
+        assert!(!is_ping_only_chat_payload("/ping now"));
+        assert!(!is_ping_only_chat_payload("/pong"));
     }
 
     #[test]
