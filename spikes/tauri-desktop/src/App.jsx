@@ -304,10 +304,23 @@ export default function App() {
   const seenIncomingMessageIdsRef = useRef(new Set());
   const hasHydratedIncomingRef = useRef(false);
 
-  const entries = useMemo(
-    () => Object.entries(contacts).sort((a, b) => (a[1] || "").localeCompare(b[1] || "", undefined, { sensitivity: "base" })),
-    [contacts]
-  );
+  const entries = useMemo(() => {
+    const latestThreadActivityMs = (contactId) => {
+      const thread = chat.threads?.[contactId] || [];
+      if (!thread.length) return 0;
+      return thread.reduce((latest, message) => Math.max(latest, Number(messageUnixMs(message) || 0)), 0);
+    };
+
+    return Object.entries(contacts).sort((a, b) => {
+      const aActivity = latestThreadActivityMs(a[0]);
+      const bActivity = latestThreadActivityMs(b[0]);
+      if (aActivity !== bActivity) return bActivity - aActivity;
+
+      const aliasOrder = (a[1] || "").localeCompare(b[1] || "", undefined, { sensitivity: "base" });
+      if (aliasOrder !== 0) return aliasOrder;
+      return a[0].localeCompare(b[0]);
+    });
+  }, [contacts, chat.threads]);
 
   const selectedContactId = chat.selectedContact;
   const selectedThread = useMemo(() => {
@@ -320,6 +333,19 @@ export default function App() {
       return String(left.msgId || "").localeCompare(String(right.msgId || ""));
     });
   }, [chat.threads, selectedContactId]);
+
+  const hasThreadAttention = useMemo(() => {
+    const newContacts = new Set(chat.newContacts || []);
+    for (const [contactId, thread] of Object.entries(chat.threads || {})) {
+      if (newContacts.has(contactId)) return true;
+      if ((thread || []).some((message) => message.direction === "Incoming" && !message.seen)) {
+        return true;
+      }
+    }
+    return false;
+  }, [chat.newContacts, chat.threads]);
+
+  const chatsTabNeedsAttention = tab !== "chats" && hasThreadAttention;
 
   const mediaDebugRows = useMemo(() => {
     const rows = [];
@@ -1194,7 +1220,13 @@ export default function App() {
             {TABS.map((t) => {
               const Icon = t.icon;
               return (
-                <Button key={t.id} data-testid={`tab-${t.id}`} variant={tab === t.id ? "default" : "ghost"} className="h-9 gap-1.5 px-3" onClick={() => setTab(t.id)}>
+                <Button
+                  key={t.id}
+                  data-testid={`tab-${t.id}`}
+                  variant={tab === t.id ? "default" : "ghost"}
+                  className={cn("h-9 gap-1.5 px-3", t.id === "chats" && chatsTabNeedsAttention ? "tab-pill-alert" : "")}
+                  onClick={() => setTab(t.id)}
+                >
                   <Icon className="h-4 w-4" />
                   {t.label}
                 </Button>

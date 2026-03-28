@@ -465,6 +465,24 @@ body {
   animation: chat-thread-halo 2.2s ease-in-out infinite;
 }
 
+.tab-pill-alert {
+  position: relative;
+  border-color: rgba(130, 223, 255, 0.5) !important;
+  box-shadow: 0 0 0 0 rgba(96, 220, 255, 0.28), 0 8px 20px rgba(21, 83, 143, 0.24);
+  animation: tab-pill-glow 2.2s ease-in-out infinite;
+}
+
+.tab-pill-alert::after {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  pointer-events: none;
+  background: radial-gradient(88% 100% at 12% 52%, rgba(118, 239, 255, 0.18), rgba(118, 239, 255, 0));
+  opacity: 0.5;
+  animation: chat-thread-halo 2.2s ease-in-out infinite;
+}
+
 .message-bubble {
   position: relative;
   border: 1px solid transparent;
@@ -579,9 +597,26 @@ body {
   }
 }
 
+@keyframes tab-pill-glow {
+  0% {
+    transform: translateY(0);
+    box-shadow: 0 0 0 0 rgba(96, 220, 255, 0.2), 0 8px 20px rgba(21, 83, 143, 0.22);
+  }
+  50% {
+    transform: translateY(-1px);
+    box-shadow: 0 0 0 4px rgba(96, 220, 255, 0.08), 0 11px 24px rgba(26, 98, 166, 0.3);
+  }
+  100% {
+    transform: translateY(0);
+    box-shadow: 0 0 0 0 rgba(96, 220, 255, 0.02), 0 8px 20px rgba(21, 83, 143, 0.2);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .chat-thread-row-alert,
-  .chat-thread-row-alert::after {
+  .chat-thread-row-alert::after,
+  .tab-pill-alert,
+  .tab-pill-alert::after {
     animation: none;
   }
 }
