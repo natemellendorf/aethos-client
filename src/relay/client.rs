@@ -1074,6 +1074,7 @@ fn is_nonfatal_remote_close(err: &str) -> bool {
         || lower.contains("close 1005")
         || lower.contains("connection reset by peer")
         || lower.contains("broken pipe")
+        || lower.contains("remote close frame received")
 }
 
 fn open_relay_socket(relay_ws: &str, auth_token: Option<&str>) -> Result<RelaySocket, String> {
@@ -1166,6 +1167,14 @@ fn read_binary_frame(socket: &mut RelaySocket) -> Result<GossipSyncFrame, String
             let _ = socket.send(Message::Pong(payload));
             Err("WouldBlock".to_string())
         }
+        Ok(Message::Pong(_)) => Err("WouldBlock".to_string()),
+        Ok(Message::Close(frame)) => Err(format!(
+            "remote close frame received: {}",
+            frame
+                .as_ref()
+                .map(|f| format!("code={} reason={}", u16::from(f.code), f.reason))
+                .unwrap_or_else(|| "code=unknown reason=none".to_string())
+        )),
         Ok(Message::Text(text)) => {
             let mut cursor = std::io::Cursor::new(text.as_bytes());
             let mut raw = Vec::new();
@@ -1331,6 +1340,9 @@ mod tests {
         ));
         assert!(is_nonfatal_remote_close(
             "write failed: Broken pipe (os error 32)"
+        ));
+        assert!(is_nonfatal_remote_close(
+            "remote close frame received: code=1000 reason=idle"
         ));
         assert!(!is_nonfatal_remote_close(
             "websocket read failed: utf8 decode error"
