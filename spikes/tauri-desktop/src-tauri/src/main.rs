@@ -70,6 +70,7 @@ use crate::aethos_core::protocol::{
 use crate::relay::client::{
     close_relay_persistent_session, connect_to_relay_gossipv1_with_auth,
     maybe_send_relay_heartbeat, normalize_http_endpoint, open_relay_persistent_session,
+    poll_relay_inbound_on_persistent_session,
     relay_session_snapshot, run_relay_encounter_gossipv1, run_relay_round_on_persistent_session,
     to_ws_endpoint, RelayPersistentSession,
 };
@@ -90,7 +91,8 @@ const CHAT_SNAPSHOT_EVENT: &str = "chat_snapshot";
 const SOUND_EVENT: &str = "sound_event";
 const MAX_INLINE_ATTACHMENT_BYTES: u64 = 2 * 1024 * 1024;
 const LAN_TCP_CAPABILITY: &str = "lan_tcp_transfer_v1";
-const RELAY_PERIODIC_SYNC_INTERVAL_SECS: u64 = 15;
+const RELAY_PERIODIC_SYNC_INTERVAL_SECS: u64 = 120;
+const RELAY_INBOUND_POLL_WINDOW_MS: u64 = 120;
 const LAN_TCP_FAILURE_COOLDOWN_SECS: u64 = 45;
 const LAN_FALLBACK_TRANSFER_MAX_ITEMS: u32 = 2;
 const LAN_FALLBACK_TRANSFER_MAX_BYTES: u64 = 1024;
@@ -1838,20 +1840,92 @@ fn start_relay_worker_if_needed() {
                     }
                     None => {
                         if Instant::now() < next_periodic_sync_at {
-                            for (idx, maybe_session) in relay_sessions.iter_mut().enumerate() {
-                                if let Some(session) = maybe_session.as_mut() {
+                            let mut saw_inbound_activity = false;
+                            for idx in 0..relay_sessions.len() {
+                                let relay_ws = relay_ws_endpoints
+                                    .get(idx)
+                                    .cloned()
+                                    .unwrap_or_else(|| "unknown".to_string());
+                                let mut close_reason: Option<&str> = None;
+
+                                if let Some(session) = relay_sessions[idx].as_mut() {
                                     if let Err(err) = maybe_send_relay_heartbeat(session) {
                                         log_info(&format!(
                                             "relay_worker_idle_heartbeat_failed: slot={} relay_ws={} error={}",
-                                            idx,
-                                            relay_ws_endpoints
-                                                .get(idx)
-                                                .cloned()
-                                                .unwrap_or_else(|| "unknown".to_string()),
-                                            err
+                                            idx, relay_ws, err
                                         ));
+                                        relay_failures[idx] = relay_failures[idx].saturating_add(1);
+                                        relay_next_attempt_at[idx] =
+                                            Instant::now() + Duration::from_secs(2);
+                                        close_reason = Some("idle_heartbeat_failed");
+                                    } else {
+                                        match poll_relay_inbound_on_persistent_session(
+                                            session,
+                                            &identity,
+                                            None,
+                                            Duration::from_millis(RELAY_INBOUND_POLL_WINDOW_MS),
+                                        ) {
+                                            Ok(report) => {
+                                                relay_failures[idx] = 0;
+                                                relay_next_attempt_at[idx] = Instant::now();
+                                                let pulled = report.pulled_messages.len();
+                                                let transferred = report.transferred_items;
+                                                if pulled > 0 {
+                                                    if let Err(err) = apply_relay_pulled_messages(
+                                                        report.pulled_messages,
+                                                        "relay_worker_inbound_poll",
+                                                    ) {
+                                                        log_info(&format!(
+                                                            "relay_worker_apply_pulled_messages_failed: slot={} relay_ws={} error={}",
+                                                            idx, relay_ws, err
+                                                        ));
+                                                    }
+                                                }
+
+                                                if transferred > 0 || pulled > 0 {
+                                                    saw_inbound_activity = true;
+                                                    set_relay_worker_status(&format!(
+                                                        "active slot={} relay={} transfers={} pulled={}",
+                                                        idx, relay_ws, transferred, pulled
+                                                    ));
+                                                    log_verbose(&format!(
+                                                        "relay_worker_inbound_nudge_processed: slot={} relay_ws={} transfers={} pulled={}",
+                                                        idx, relay_ws, transferred, pulled
+                                                    ));
+                                                }
+
+                                                if report.remote_closed {
+                                                    close_reason = Some("remote_closed");
+                                                    log_verbose(&format!(
+                                                        "relay_worker_session_reconnect_needed: slot={} relay_ws={} reason=remote_closed",
+                                                        idx, relay_ws
+                                                    ));
+                                                }
+                                            }
+                                            Err(err) => {
+                                                log_info(&format!(
+                                                    "relay_worker_inbound_poll_failed: slot={} relay_ws={} error={}",
+                                                    idx, relay_ws, err
+                                                ));
+                                                relay_failures[idx] =
+                                                    relay_failures[idx].saturating_add(1);
+                                                relay_next_attempt_at[idx] =
+                                                    Instant::now() + Duration::from_secs(2);
+                                                close_reason = Some("inbound_poll_failed");
+                                            }
+                                        }
                                     }
                                 }
+
+                                if let Some(reason) = close_reason {
+                                    if let Some(session) = relay_sessions[idx].take() {
+                                        close_relay_persistent_session(session, reason);
+                                    }
+                                }
+                            }
+                            if saw_inbound_activity {
+                                next_periodic_sync_at =
+                                    Instant::now() + Duration::from_secs(RELAY_PERIODIC_SYNC_INTERVAL_SECS);
                             }
                             continue;
                         }

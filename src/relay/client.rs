@@ -394,6 +394,26 @@ pub fn run_relay_round_on_persistent_session(
         session.relay_ingest_allowed,
         trace_item_id,
         encounter_window,
+        true,
+    )
+}
+
+#[allow(dead_code)]
+pub fn poll_relay_inbound_on_persistent_session(
+    session: &mut RelayPersistentSession,
+    identity: &LocalIdentitySummary,
+    trace_item_id: Option<&str>,
+    encounter_window: Duration,
+) -> Result<EncounterReport, String> {
+    run_relay_round_on_socket(
+        &mut session.socket,
+        &session.relay_ws,
+        identity,
+        &session.peer_hello,
+        session.relay_ingest_allowed,
+        trace_item_id,
+        encounter_window,
+        false,
     )
 }
 
@@ -506,6 +526,7 @@ pub fn run_relay_encounter_gossipv1_for_duration(
         relay_ingest_allowed,
         trace_item_id,
         encounter_window,
+        true,
     ) {
         Ok(report) => report,
         Err(err) => {
@@ -532,6 +553,7 @@ pub fn run_relay_encounter_gossipv1_for_duration(
     Ok(report)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_relay_round_on_socket(
     socket: &mut RelaySocket,
     relay_ws: &str,
@@ -540,17 +562,20 @@ fn run_relay_round_on_socket(
     relay_ingest_allowed: bool,
     trace_item_id: Option<&str>,
     encounter_window: Duration,
+    send_initial_inventory: bool,
 ) -> Result<EncounterReport, String> {
-    log_verbose(&format!(
-        "relay_encounter_post_hello_send_summary: relay_ws={}",
-        relay_ws
-    ));
-    send_binary_frame(socket, &build_summary_frame(now_unix_ms())?)?;
-    log_verbose(&format!(
-        "relay_encounter_post_hello_send_relay_ingest: relay_ws={}",
-        relay_ws
-    ));
-    send_binary_frame(socket, &build_relay_ingest_frame(now_unix_ms())?)?;
+    if send_initial_inventory {
+        log_verbose(&format!(
+            "relay_encounter_post_hello_send_summary: relay_ws={}",
+            relay_ws
+        ));
+        send_binary_frame(socket, &build_summary_frame(now_unix_ms())?)?;
+        log_verbose(&format!(
+            "relay_encounter_post_hello_send_relay_ingest: relay_ws={}",
+            relay_ws
+        ));
+        send_binary_frame(socket, &build_relay_ingest_frame(now_unix_ms())?)?;
+    }
 
     let mut transferred_items = 0usize;
     let mut pulled_messages = Vec::new();
