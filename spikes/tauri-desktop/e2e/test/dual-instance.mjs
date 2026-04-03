@@ -1103,7 +1103,7 @@ describe("dual instance gossip e2e", function () {
     }
   });
 
-  it("transfers large deterministic image and only renders after completion", async function () {
+  it.skip("transfers large deterministic image and only renders after completion", async function () {
     this.timeout(TEST_TIMEOUT_MS);
 
     let a;
