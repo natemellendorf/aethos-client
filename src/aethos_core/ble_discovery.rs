@@ -20,6 +20,11 @@ pub struct BleDiscoveryGate {
     last_seen_by_peer: HashMap<String, u64>,
 }
 
+pub struct GatePollResult {
+    pub ready: Vec<DiscoverySignal>,
+    pub deduped_count: usize,
+}
+
 impl BleDiscoveryGate {
     pub fn new(dedupe_window: Duration) -> Self {
         Self {
@@ -28,12 +33,22 @@ impl BleDiscoveryGate {
         }
     }
 
+    #[allow(dead_code)]
     pub fn poll_ready(
         &mut self,
         source: &mut dyn BleDiscoverySource,
         now_unix_ms: u64,
     ) -> Vec<DiscoverySignal> {
+        self.poll_ready_with_stats(source, now_unix_ms).ready
+    }
+
+    pub fn poll_ready_with_stats(
+        &mut self,
+        source: &mut dyn BleDiscoverySource,
+        now_unix_ms: u64,
+    ) -> GatePollResult {
         let mut out = Vec::new();
+        let mut deduped_count = 0;
         for signal in source.poll_signals(now_unix_ms) {
             let allow = self
                 .last_seen_by_peer
@@ -47,9 +62,14 @@ impl BleDiscoveryGate {
                 self.last_seen_by_peer
                     .insert(signal.peer_hint.clone(), signal.observed_at_unix_ms);
                 out.push(signal);
+            } else {
+                deduped_count += 1;
             }
         }
-        out
+        GatePollResult {
+            ready: out,
+            deduped_count,
+        }
     }
 }
 
@@ -265,6 +285,44 @@ mod tests {
         let second = gate.poll_ready(&mut source, 9000);
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].observed_at_unix_ms, 9000);
+    }
+
+    #[test]
+    fn gate_reports_deduped_counts_for_visibility_layers() {
+        struct InlineSource {
+            signals: Vec<DiscoverySignal>,
+        }
+        impl BleDiscoverySource for InlineSource {
+            fn poll_signals(&mut self, _now_unix_ms: u64) -> Vec<DiscoverySignal> {
+                std::mem::take(&mut self.signals)
+            }
+        }
+
+        let mut gate = BleDiscoveryGate::new(Duration::from_secs(5));
+        gate.last_seen_by_peer.insert("peer-a".to_string(), 10_000);
+        let mut source = InlineSource {
+            signals: vec![
+                DiscoverySignal {
+                    peer_hint: "peer-a".to_string(),
+                    observed_at_unix_ms: 12_000,
+                    rssi: Some(-55),
+                    bearer_type: "ble",
+                    source: "test",
+                },
+                DiscoverySignal {
+                    peer_hint: "peer-b".to_string(),
+                    observed_at_unix_ms: 12_000,
+                    rssi: Some(-57),
+                    bearer_type: "ble",
+                    source: "test",
+                },
+            ],
+        };
+
+        let result = gate.poll_ready_with_stats(&mut source, 12_000);
+        assert_eq!(result.deduped_count, 1);
+        assert_eq!(result.ready.len(), 1);
+        assert_eq!(result.ready[0].peer_hint, "peer-b");
     }
 
     #[test]
