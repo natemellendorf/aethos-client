@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   BellRing,
+  Bluetooth,
   CheckCircle2,
   ContactRound,
   MessageCircle,
@@ -37,6 +38,10 @@ const emptyRelay = { chipText: "Relays: idle", chipState: "idle", primaryStatus:
 const emptyGossip = { enabled: false, running: false, lastActivityMs: 0, lastEvent: "unknown" };
 const emptyEncounterActivity = {
   bleDiscoveryStatus: "Checking BLE discovery status...",
+  bleDiscoveryEnabled: true,
+  bleAdvertisementsDetectedRecently: false,
+  recentBleRejectionsCount: 0,
+  lastBleRejectionReason: null,
   lastBleSightingUnixMs: null,
   recentBleSightingsCount: 0,
   lastBleTriggeredEncounterUnixMs: null,
@@ -62,6 +67,7 @@ const DEFAULT_RELAY_ENDPOINT = "wss://aethos-relay.network";
 const DONATE_CRYPTO_ADDRESS = "0x114227a8B460E462f408F138a929660531790ee3";
 const DONATE_PAYPAL_URL = "https://www.paypal.com/donate/?hosted_button_id=TPTTR6TRKBYKS";
 const MEDIA_PREVIEW_GATE_BYTES = 5 * 1024 * 1024;
+const BLE_ICON_PULSE_WINDOW_MS = 20 * 1000;
 
 function tinyId(id = "") {
   if (!id) return "-";
@@ -694,12 +700,14 @@ export default function App() {
   useEffect(() => {
     const timer = setInterval(async () => {
       try {
-        const [gossip, relay] = await Promise.all([
+        const [gossip, relay, encounter] = await Promise.all([
           invoke("gossip_status"),
-          invoke("relay_health_status")
+          invoke("relay_health_status"),
+          invoke("encounter_activity_snapshot")
         ]);
         setGossipStatus(gossip);
         setRelayHealth(relay);
+        setEncounterActivity(encounter);
         if (gossip.lastActivityMs > 0 || relay.chipState === "ok" || relay.chipState === "warn") {
           setNetworkPulseTs(Date.now());
         }
@@ -1124,6 +1132,7 @@ export default function App() {
       ...settings,
       relaySyncEnabled: form.get("relay_sync_enabled") === "on",
       gossipSyncEnabled: form.get("gossip_sync_enabled") === "on",
+      bleDiscoveryEnabled: form.get("ble_discovery_enabled") === "on",
       verboseLoggingEnabled: form.get("verbose_logging_enabled") === "on",
       enterToSend: form.get("enter_to_send") === "on",
       messageTtlSeconds: Number(form.get("message_ttl_seconds") || settings.messageTtlSeconds),
@@ -1183,6 +1192,11 @@ export default function App() {
   const networkActive = Date.now() - networkPulseTs < 2200;
   const relayOnline = relayHealth.chipState === "ok" || relayHealth.chipState === "warn";
   const gossipOnline = gossipStatus.enabled && gossipStatus.running;
+  const bleEnabled = settings?.bleDiscoveryEnabled !== false;
+  const bleLastSightingMs = Number(encounterActivity.lastBleSightingUnixMs || 0);
+  const bleSightingDetectedRecently = bleEnabled && bleLastSightingMs > 0 && Date.now() - bleLastSightingMs <= BLE_ICON_PULSE_WINDOW_MS;
+  const bleRecentRejections = Number(encounterActivity.recentBleRejectionsCount || 0);
+  const bleLastRejectionReason = String(encounterActivity.lastBleRejectionReason || "").trim();
   const filteredLogLines = useMemo(() => {
     const lines = (logTail.content || "").split("\n");
     const needles = LOG_FILTERS[logFilter] || [];
@@ -1294,6 +1308,30 @@ export default function App() {
               <span className={cn("tab-status-dot", gossipOnline ? "is-online" : "is-offline")} title="LAN gossip status">
                 <BellRing className="h-3.5 w-3.5" />
               </span>
+              <span
+                className={cn(
+                  "tab-status-dot",
+                  bleEnabled ? "is-online" : "is-offline",
+                  bleSightingDetectedRecently ? "is-ble-detected" : ""
+                )}
+                title={
+                  bleEnabled
+                    ? bleSightingDetectedRecently
+                      ? "BLE discovery: nearby Aethos advertisements detected"
+                      : "BLE discovery enabled"
+                    : "BLE discovery disabled"
+                }
+              >
+                <Bluetooth className="h-3.5 w-3.5" />
+              </span>
+              {bleEnabled && bleRecentRejections > 0 ? (
+                <span
+                  className="ble-rejection-chip"
+                  title={bleLastRejectionReason || `BLE rejected observations in recent window: ${bleRecentRejections}`}
+                >
+                  BLE rejects: {bleRecentRejections}
+                </span>
+              ) : null}
             </div>
           </div>
         </div>
@@ -1653,6 +1691,7 @@ export default function App() {
                 <form className="space-y-2" onSubmit={saveSettings}>
                   <label className="flex items-center gap-2 text-sm"><input data-testid="settings-relay-sync" type="checkbox" name="relay_sync_enabled" defaultChecked={settings.relaySyncEnabled} /> Enable relay sync</label>
                   <label className="flex items-center gap-2 text-sm"><input data-testid="settings-gossip-sync" type="checkbox" name="gossip_sync_enabled" defaultChecked={settings.gossipSyncEnabled} /> Enable LAN gossip sync</label>
+                  <label className="flex items-center gap-2 text-sm"><input data-testid="settings-ble-discovery" type="checkbox" name="ble_discovery_enabled" defaultChecked={settings.bleDiscoveryEnabled !== false} /> Enable BLE discovery</label>
                   <label className="flex items-center gap-2 text-sm"><input data-testid="settings-verbose-logging" type="checkbox" name="verbose_logging_enabled" defaultChecked={settings.verboseLoggingEnabled} /> Enable verbose logging</label>
                   <label className="flex items-center gap-2 text-sm"><input data-testid="settings-enter-to-send" type="checkbox" name="enter_to_send" defaultChecked={settings.enterToSend !== false} /> Enter sends message (Shift+Enter newline)</label>
                   <Input name="message_ttl_seconds" type="number" defaultValue={settings.messageTtlSeconds} />
@@ -1729,6 +1768,15 @@ export default function App() {
               </CardHeader>
               <CardContent className="space-y-2 p-3 pt-1 text-sm text-muted-foreground">
                 <p data-testid="encounter-ble-status">{encounterActivity.bleDiscoveryStatus}</p>
+                <p>
+                  BLE setting: <span className="text-foreground">{encounterActivity.bleDiscoveryEnabled === false ? "disabled" : "enabled"}</span>
+                </p>
+                <p>
+                  Recent BLE rejects (10m): <span className="text-foreground">{encounterActivity.recentBleRejectionsCount || 0}</span>
+                  {encounterActivity.lastBleRejectionReason ? (
+                    <span className="text-muted-foreground"> · latest: {encounterActivity.lastBleRejectionReason}</span>
+                  ) : null}
+                </p>
                 <p>
                   Last BLE sighting: <span className="text-foreground">{formatActivityTime(encounterActivity.lastBleSightingUnixMs)}</span>
                 </p>

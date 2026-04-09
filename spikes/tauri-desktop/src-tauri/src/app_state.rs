@@ -17,10 +17,15 @@ const DEFAULT_MESSAGE_TTL_SECONDS: u64 = 3600;
 const MIN_MESSAGE_TTL_SECONDS: u64 = 60;
 const MAX_MESSAGE_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 const DEFAULT_ENTER_TO_SEND: bool = true;
+const DEFAULT_BLE_DISCOVERY_ENABLED: bool = true;
 pub const ENCOUNTER_ACTIVITY_RING_CAPACITY: usize = 80;
 
 fn default_enter_to_send() -> bool {
     DEFAULT_ENTER_TO_SEND
+}
+
+fn default_ble_discovery_enabled() -> bool {
+    DEFAULT_BLE_DISCOVERY_ENABLED
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -156,6 +161,9 @@ pub struct AppSettings {
     #[serde(alias = "enter_to_send")]
     #[serde(default = "default_enter_to_send")]
     pub enter_to_send: bool,
+    #[serde(alias = "ble_discovery_enabled")]
+    #[serde(default = "default_ble_discovery_enabled")]
+    pub ble_discovery_enabled: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,6 +171,7 @@ pub struct AppSettings {
 pub enum EncounterActivityCode {
     BleDiscoveryObserved,
     BleDiscoveryDeduped,
+    BleDiscoveryRejected,
     EncounterStarted,
     TransferPathSelected,
     TransferStarted,
@@ -240,6 +249,7 @@ impl Default for AppSettings {
             relay_endpoints: vec![DEFAULT_RELAY_ENDPOINT.to_string()],
             message_ttl_seconds: DEFAULT_MESSAGE_TTL_SECONDS,
             enter_to_send: DEFAULT_ENTER_TO_SEND,
+            ble_discovery_enabled: DEFAULT_BLE_DISCOVERY_ENABLED,
         }
     }
 }

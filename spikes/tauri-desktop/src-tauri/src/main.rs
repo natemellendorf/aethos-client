@@ -526,6 +526,7 @@ fn ensure_udp_peer_interaction<'a>(
 
 struct GossipRuntime {
     enabled: AtomicBool,
+    ble_discovery_enabled: AtomicBool,
     running: AtomicBool,
     last_activity_ms: AtomicU64,
     force_announce: AtomicBool,
@@ -533,9 +534,10 @@ struct GossipRuntime {
 }
 
 impl GossipRuntime {
-    fn new(initial_enabled: bool) -> Self {
+    fn new(initial_enabled: bool, initial_ble_discovery_enabled: bool) -> Self {
         Self {
             enabled: AtomicBool::new(initial_enabled),
+            ble_discovery_enabled: AtomicBool::new(initial_ble_discovery_enabled),
             running: AtomicBool::new(false),
             last_activity_ms: AtomicU64::new(0),
             force_announce: AtomicBool::new(initial_enabled),
@@ -577,6 +579,10 @@ struct EncounterActivityViewEvent {
 #[serde(rename_all = "camelCase")]
 struct EncounterActivitySnapshot {
     ble_discovery_status: String,
+    ble_discovery_enabled: bool,
+    ble_advertisements_detected_recently: bool,
+    recent_ble_rejections_count: usize,
+    last_ble_rejection_reason: Option<String>,
     last_ble_sighting_unix_ms: Option<u64>,
     recent_ble_sightings_count: usize,
     last_ble_triggered_encounter_unix_ms: Option<u64>,
@@ -993,8 +999,9 @@ fn bootstrap_state() -> Result<BootstrapState, String> {
             simulated_ble.len()
         ));
     }
-    start_gossip_worker_if_needed(settings.gossip_sync_enabled);
+    start_gossip_worker_if_needed(settings.gossip_sync_enabled, settings.ble_discovery_enabled);
     set_gossip_enabled(settings.gossip_sync_enabled);
+    set_ble_discovery_enabled(settings.ble_discovery_enabled);
     start_relay_worker_if_needed();
     if settings.relay_sync_enabled {
         request_relay_sync("bootstrap_state");
@@ -1038,8 +1045,9 @@ fn reset_wayfarer_id() -> Result<IdentityView, String> {
 fn update_settings(settings: AppSettings) -> Result<AppSettings, String> {
     let saved = save_app_settings(&settings)?;
     set_verbose_logging_enabled(saved.verbose_logging_enabled);
-    start_gossip_worker_if_needed(saved.gossip_sync_enabled);
+    start_gossip_worker_if_needed(saved.gossip_sync_enabled, saved.ble_discovery_enabled);
     set_gossip_enabled(saved.gossip_sync_enabled);
+    set_ble_discovery_enabled(saved.ble_discovery_enabled);
     request_relay_sync("settings_updated");
     Ok(saved)
 }
@@ -1069,6 +1077,7 @@ fn encounter_activity_snapshot() -> Result<EncounterActivitySnapshot, String> {
     Ok(build_encounter_activity_snapshot(
         &state.events,
         settings.gossip_sync_enabled,
+        settings.ble_discovery_enabled,
         now_unix_ms(),
         ble_discovery_env_disabled(),
     ))
@@ -1077,11 +1086,14 @@ fn encounter_activity_snapshot() -> Result<EncounterActivitySnapshot, String> {
 fn build_encounter_activity_snapshot(
     events: &[EncounterActivityEvent],
     gossip_sync_enabled: bool,
+    ble_discovery_enabled: bool,
     now_ms: u64,
     ble_env_disabled: bool,
 ) -> EncounterActivitySnapshot {
     let ble_discovery_status = if ble_env_disabled {
         "BLE discovery inactive (disabled by environment)".to_string()
+    } else if !ble_discovery_enabled {
+        "BLE discovery disabled in app settings".to_string()
     } else if gossip_sync_enabled {
         "BLE discovery active".to_string()
     } else {
@@ -1101,6 +1113,22 @@ fn build_encounter_activity_snapshot(
                 && now_ms.saturating_sub(event.at_unix_ms) <= RECENT_BLE_SIGHTINGS_WINDOW_MS
         })
         .count();
+
+    let ble_advertisements_detected_recently = recent_ble_sightings_count > 0;
+
+    let recent_ble_rejections_count = events
+        .iter()
+        .filter(|event| {
+            event.code == EncounterActivityCode::BleDiscoveryRejected
+                && now_ms.saturating_sub(event.at_unix_ms) <= RECENT_BLE_SIGHTINGS_WINDOW_MS
+        })
+        .count();
+
+    let last_ble_rejection_reason = events
+        .iter()
+        .rev()
+        .find(|event| event.code == EncounterActivityCode::BleDiscoveryRejected)
+        .map(|event| event.message.clone());
 
     let last_ble_triggered_encounter_unix_ms = events
         .iter()
@@ -1164,6 +1192,10 @@ fn build_encounter_activity_snapshot(
 
     EncounterActivitySnapshot {
         ble_discovery_status,
+        ble_discovery_enabled,
+        ble_advertisements_detected_recently,
+        recent_ble_rejections_count,
+        last_ble_rejection_reason,
         last_ble_sighting_unix_ms,
         recent_ble_sightings_count,
         last_ble_triggered_encounter_unix_ms,
@@ -2170,12 +2202,12 @@ fn run_relay_diagnostics_blocking(
     Ok(reports)
 }
 
-fn gossip_runtime(initial_enabled: bool) -> &'static GossipRuntime {
-    GOSSIP_RUNTIME.get_or_init(|| GossipRuntime::new(initial_enabled))
+fn gossip_runtime(initial_enabled: bool, initial_ble_discovery_enabled: bool) -> &'static GossipRuntime {
+    GOSSIP_RUNTIME.get_or_init(|| GossipRuntime::new(initial_enabled, initial_ble_discovery_enabled))
 }
 
 fn set_gossip_enabled(enabled: bool) {
-    let runtime = gossip_runtime(enabled);
+    let runtime = gossip_runtime(enabled, true);
     runtime.enabled.store(enabled, Ordering::SeqCst);
     if enabled {
         runtime.force_announce.store(true, Ordering::SeqCst);
@@ -2183,6 +2215,13 @@ fn set_gossip_enabled(enabled: bool) {
     } else {
         set_gossip_event("disabled");
     }
+}
+
+fn set_ble_discovery_enabled(enabled: bool) {
+    let runtime = gossip_runtime(false, enabled);
+    runtime
+        .ble_discovery_enabled
+        .store(enabled, Ordering::SeqCst);
 }
 
 fn set_gossip_event(event: &str) {
@@ -2194,7 +2233,7 @@ fn set_gossip_event(event: &str) {
 }
 
 fn current_gossip_status() -> GossipStatus {
-    let runtime = gossip_runtime(false);
+    let runtime = gossip_runtime(false, true);
     let last_event = runtime
         .last_event
         .lock()
@@ -2663,14 +2702,14 @@ fn apply_relay_pulled_messages(
     Ok(pulled_count)
 }
 
-fn start_gossip_worker_if_needed(initial_enabled: bool) {
-    let runtime = gossip_runtime(initial_enabled);
+fn start_gossip_worker_if_needed(initial_enabled: bool, initial_ble_discovery_enabled: bool) {
+    let runtime = gossip_runtime(initial_enabled, initial_ble_discovery_enabled);
     if runtime.running.swap(true, Ordering::SeqCst) {
         return;
     }
 
     thread::spawn(|| {
-        let runtime = gossip_runtime(false);
+        let runtime = gossip_runtime(false, true);
         let socket = match bind_gossip_socket() {
             Ok(socket) => socket,
             Err(err) => {
@@ -2851,6 +2890,9 @@ fn process_ble_discovery_signals(
     encounters: &mut HashMap<String, EncounterManager>,
     runtime: &GossipRuntime,
 ) {
+    if !runtime.ble_discovery_enabled.load(Ordering::SeqCst) {
+        return;
+    }
     let identity = match ensure_local_identity() {
         Ok(identity) => identity,
         Err(err) => {
@@ -2860,6 +2902,41 @@ fn process_ble_discovery_signals(
     };
     let now_ms = now_unix_ms();
     let gate_result = gate.poll_ready_with_stats(adapter, now_ms);
+    for rejected in &gate_result.rejected {
+        log_verbose(&format!(
+            "ble_observation_rejected reason_code={} reason_label=\"{}\" source={} detail=\"{}\"",
+            rejected.reason_code, rejected.reason_label, rejected.source, rejected.detail
+        ));
+    }
+    if !gate_result.rejected.is_empty() {
+        let first = &gate_result.rejected[0];
+        let summary = if gate_result.rejected.len() == 1 {
+            format!(
+                "BLE advertisement rejected: {} ({})",
+                first.reason_label, first.source
+            )
+        } else {
+            format!(
+                "{} BLE advertisements rejected; latest {} ({})",
+                gate_result.rejected.len(),
+                first.reason_label,
+                first.source
+            )
+        };
+        encounter_activity_record(
+            EncounterActivityCode::BleDiscoveryRejected,
+            summary,
+            Some("ble-discovery"),
+            None,
+            now_ms,
+        );
+    }
+    if !gate_result.ready.is_empty() {
+        log_verbose(&format!(
+            "ble_observation_accepted count={} source=canonical_ble_identity_v1",
+            gate_result.ready.len()
+        ));
+    }
     if gate_result.deduped_count > 0 {
         encounter_activity_record(
             EncounterActivityCode::BleDiscoveryDeduped,
@@ -5528,8 +5605,12 @@ mod tests {
             },
         ];
 
-        let snapshot = build_encounter_activity_snapshot(&events, true, 1_350, false);
+        let snapshot = build_encounter_activity_snapshot(&events, true, true, 1_350, false);
         assert_eq!(snapshot.ble_discovery_status, "BLE discovery active");
+        assert!(snapshot.ble_discovery_enabled);
+        assert!(snapshot.ble_advertisements_detected_recently);
+        assert_eq!(snapshot.recent_ble_rejections_count, 0);
+        assert!(snapshot.last_ble_rejection_reason.is_none());
         assert_eq!(snapshot.recent_ble_sightings_count, 1);
         assert_eq!(
             snapshot.last_transfer_bearer.as_deref(),
@@ -5553,12 +5634,34 @@ mod tests {
             transfer_bearer: None,
         }];
 
-        let snapshot = build_encounter_activity_snapshot(&events, false, 6_000, false);
+        let snapshot = build_encounter_activity_snapshot(&events, false, true, 6_000, false);
         assert_eq!(
             snapshot.no_transfer_path_message.as_deref(),
             Some("No transfer path available: relay and local network transfer are off")
         );
         assert_eq!(snapshot.no_transfer_path_unix_ms, Some(5_000));
+        assert_eq!(snapshot.recent_ble_rejections_count, 0);
+        assert!(snapshot.last_ble_rejection_reason.is_none());
+    }
+
+    #[test]
+    fn encounter_activity_snapshot_surfaces_ble_rejection_summary() {
+        let events = vec![EncounterActivityEvent {
+            seq: 11,
+            at_unix_ms: 7_000,
+            code: EncounterActivityCode::BleDiscoveryRejected,
+            message: "BLE advertisement rejected: missing primary service UUID (bluetoothctl)"
+                .to_string(),
+            discovery_bearer: Some("ble-discovery".to_string()),
+            transfer_bearer: None,
+        }];
+
+        let snapshot = build_encounter_activity_snapshot(&events, true, true, 7_500, false);
+        assert_eq!(snapshot.recent_ble_rejections_count, 1);
+        assert_eq!(
+            snapshot.last_ble_rejection_reason.as_deref(),
+            Some("BLE advertisement rejected: missing primary service UUID (bluetoothctl)")
+        );
     }
 
     #[test]
@@ -5782,7 +5885,7 @@ mod tests {
 
         let mut recent_outbound = HashMap::new();
         let mut encounter = GossipEncounterState::new("peer-wayfarer".to_string());
-        let runtime = GossipRuntime::new(true);
+        let runtime = GossipRuntime::new(true, true);
 
         let item_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
         let item_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
@@ -5869,7 +5972,7 @@ mod tests {
     #[test]
     fn encounter_stop_conditions_cover_budgets_no_progress_and_shutdown() {
         let mut encounter = GossipEncounterState::new("peer-wayfarer".to_string());
-        let runtime = GossipRuntime::new(true);
+        let runtime = GossipRuntime::new(true, true);
 
         encounter.no_progress_streak = LAN_ENCOUNTER_MAX_NO_PROGRESS_STREAK;
         assert!(matches!(
@@ -5898,7 +6001,7 @@ mod tests {
             Some(EncounterStopReason::TimeBudgetExceeded)
         ));
 
-        let runtime_disabled = GossipRuntime::new(false);
+        let runtime_disabled = GossipRuntime::new(false, true);
         let mut disabled = GossipEncounterState::new("peer-wayfarer".to_string());
         assert!(matches!(
             disabled.should_stop(&runtime_disabled, false),
