@@ -5,6 +5,7 @@
 
 mod app_body;
 mod app_state;
+mod ble_advertiser;
 mod media_v1;
 
 #[allow(dead_code)]
@@ -38,6 +39,7 @@ use app_state::{
     OutboundState, PersistedChatState,
 };
 use base64::Engine;
+use ble_advertiser::{AdvertiserPollEvent, CanonicalBleAdvertiser};
 use image::{imageops::FilterType, ImageBuffer, Luma, Rgba, RgbaImage};
 use qrcode::QrCode;
 use serde::{Deserialize, Serialize};
@@ -2202,8 +2204,12 @@ fn run_relay_diagnostics_blocking(
     Ok(reports)
 }
 
-fn gossip_runtime(initial_enabled: bool, initial_ble_discovery_enabled: bool) -> &'static GossipRuntime {
-    GOSSIP_RUNTIME.get_or_init(|| GossipRuntime::new(initial_enabled, initial_ble_discovery_enabled))
+fn gossip_runtime(
+    initial_enabled: bool,
+    initial_ble_discovery_enabled: bool,
+) -> &'static GossipRuntime {
+    GOSSIP_RUNTIME
+        .get_or_init(|| GossipRuntime::new(initial_enabled, initial_ble_discovery_enabled))
 }
 
 fn set_gossip_enabled(enabled: bool) {
@@ -2756,6 +2762,7 @@ fn start_gossip_worker_if_needed(initial_enabled: bool, initial_ble_discovery_en
         let mut ble_discovery_adapter = discovery_adapter_from_env();
         let mut ble_discovery_gate = BleDiscoveryGate::new(Duration::from_secs(5));
         let mut ble_encounters: HashMap<String, EncounterManager> = HashMap::new();
+        let mut ble_advertiser = CanonicalBleAdvertiser::new();
         let mut last_missing_pulse = Instant::now() - Duration::from_millis(500);
         let tcp_listener = match bind_gossip_tcp_listener() {
             Ok(listener) => Some(listener),
@@ -2813,6 +2820,26 @@ fn start_gossip_worker_if_needed(initial_enabled: bool, initial_ble_discovery_en
             }
 
             flush_media_control_fastlane(&socket, &peer_addr_by_node);
+
+            if let Some(event) = ble_advertiser.poll() {
+                match event {
+                    AdvertiserPollEvent::Started(report) => {
+                        log_info(&format!(
+                            "ble_advertiser_started source={} uuid={} wayfarer_id={} primary_ad={} service_data_ad={} payload={} identity_ref={}",
+                            report.source,
+                            report.uuid,
+                            report.wayfarer_id,
+                            report.primary_ad_hex,
+                            report.service_data_ad_hex,
+                            report.payload_hex,
+                            report.identity_ref_hex
+                        ));
+                    }
+                    AdvertiserPollEvent::Error(err) => {
+                        log_verbose(&format!("ble_advertiser_error: {err}"));
+                    }
+                }
+            }
 
             process_ble_discovery_signals(
                 &mut ble_discovery_adapter,

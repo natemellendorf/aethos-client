@@ -29,6 +29,7 @@ url = "2"
 webbrowser = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 dbus = "0.9"
+dbus-crossroads = "0.5"
 
 [features]
 default = []

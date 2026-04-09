@@ -26,6 +26,7 @@ dependencies = [
  "chacha20poly1305",
  "ciborium",
  "dbus",
+ "dbus-crossroads",
  "ed25519-dalek",
  "image",
  "qrcode",
@@ -653,6 +654,15 @@ dependencies = [
  "libc",
  "libdbus-sys",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "dbus-crossroads"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64bff0bd181fba667660276c6b7ebdc50cff37ce593e7adf9e734f89c8f444e8"
+dependencies = [
+ "dbus",
 ]
 
 [[package]]
