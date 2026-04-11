@@ -71,7 +71,8 @@ use crate::aethos_core::identity_store::{
     regenerate_local_identity, save_contact_aliases,
 };
 use crate::aethos_core::logging::{
-    app_log_file_path, log_info, log_verbose, set_verbose_logging_enabled, verbose_logging_enabled,
+    app_log_file_path, clear_app_log_if_requested, log_error, log_info, log_verbose,
+    set_verbose_logging_enabled, verbose_logging_enabled,
 };
 use crate::aethos_core::protocol::{
     build_envelope_payload_b64, bytes_to_hex_lower, is_valid_wayfarer_id,
@@ -121,6 +122,7 @@ const UDP_TRANSFER_FRAME_HARD_MAX_BYTES: usize = 65_507;
 const E2E_MEDIA_HOUSEKEEPING_MIN_INTERVAL_MS_DEFAULT: u64 = 2_000;
 const RECENT_BLE_SIGHTINGS_WINDOW_MS: u64 = 10 * 60 * 1000;
 const RECENT_ENCOUNTER_ACTIVITY_LIMIT: usize = 20;
+const AETHOS_BLE_IDREF_CONTEXT_V1: &[u8] = b"aethos:ble:idref:v1\0";
 
 fn lan_fallback_transfer_max_bytes() -> u64 {
     std::env::var("AETHOS_LAN_FALLBACK_TRANSFER_MAX_BYTES")
@@ -2825,8 +2827,9 @@ fn start_gossip_worker_if_needed(initial_enabled: bool, initial_ble_discovery_en
                 match event {
                     AdvertiserPollEvent::Started(report) => {
                         log_info(&format!(
-                            "ble_advertiser_started source={} uuid={} wayfarer_id={} primary_ad={} service_data_ad={} payload={} identity_ref={}",
+                            "ble_advertiser_started source={} mode={} uuid={} wayfarer_id={} primary_ad={} service_data_ad={} payload={} identity_ref={}",
                             report.source,
+                            report.mode,
                             report.uuid,
                             report.wayfarer_id,
                             report.primary_ad_hex,
@@ -2836,7 +2839,7 @@ fn start_gossip_worker_if_needed(initial_enabled: bool, initial_ble_discovery_en
                         ));
                     }
                     AdvertiserPollEvent::Error(err) => {
-                        log_verbose(&format!("ble_advertiser_error: {err}"));
+                        log_error(&format!("ble_advertiser_error: {err}"));
                     }
                 }
             }
@@ -2929,6 +2932,7 @@ fn process_ble_discovery_signals(
     };
     let now_ms = now_unix_ms();
     let gate_result = gate.poll_ready_with_stats(adapter, now_ms);
+    let local_ble_peer_hint = local_ble_peer_hint_from_wayfarer_id(&identity.wayfarer_id);
     for rejected in &gate_result.rejected {
         log_verbose(&format!(
             "ble_observation_rejected reason_code={} reason_label=\"{}\" source={} detail=\"{}\"",
@@ -2981,8 +2985,40 @@ fn process_ble_discovery_signals(
     }
 
     for signal in gate_result.ready {
+        if is_self_ble_signal(local_ble_peer_hint.as_deref(), &signal.peer_hint) {
+            log_verbose(&format!(
+                "ble_observation_ignored_self peer_hint={} source={} reason=self_advertisement",
+                signal.peer_hint, signal.source
+            ));
+            continue;
+        }
         handle_ble_discovery_signal(encounters, &identity.wayfarer_id, &signal, runtime);
     }
+}
+
+fn local_ble_peer_hint_from_wayfarer_id(wayfarer_id: &str) -> Option<String> {
+    if !is_valid_wayfarer_id(wayfarer_id) {
+        return None;
+    }
+    let mut wayfarer_bytes = [0u8; 32];
+    for idx in 0..32 {
+        let from = idx * 2;
+        let to = from + 2;
+        let byte = u8::from_str_radix(&wayfarer_id[from..to], 16).ok()?;
+        wayfarer_bytes[idx] = byte;
+    }
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(AETHOS_BLE_IDREF_CONTEXT_V1);
+    hasher.update(wayfarer_bytes);
+    let digest = hasher.finalize();
+    Some(format!("ble-idref:{}", bytes_to_hex_lower(&digest[..8])))
+}
+
+fn is_self_ble_signal(local_peer_hint: Option<&str>, observed_peer_hint: &str) -> bool {
+    let Some(local_peer_hint) = local_peer_hint else {
+        return false;
+    };
+    local_peer_hint.eq_ignore_ascii_case(observed_peer_hint.trim())
 }
 
 fn handle_ble_discovery_signal(
@@ -5289,6 +5325,7 @@ pub fn run() {
 
 fn main() {
     apply_cli_state_overrides();
+    clear_app_log_if_requested();
     run();
 }
 
@@ -6189,6 +6226,26 @@ mod tests {
 
         assert_eq!(request_fingerprint(&a), request_fingerprint(&b));
         assert_ne!(request_fingerprint(&a), request_fingerprint(&c));
+    }
+
+    #[test]
+    fn local_ble_peer_hint_derivation_matches_contract_vector() {
+        let wayfarer_id = "1111111111111111111111111111111111111111111111111111111111111111";
+        let hint = local_ble_peer_hint_from_wayfarer_id(wayfarer_id).expect("derive hint");
+        assert_eq!(hint, "ble-idref:d6b6fc2bf0f08cdf");
+    }
+
+    #[test]
+    fn self_ble_signal_detection_is_case_insensitive() {
+        assert!(is_self_ble_signal(
+            Some("ble-idref:d6b6fc2bf0f08cdf"),
+            "BLE-IDREF:D6B6FC2BF0F08CDF"
+        ));
+        assert!(!is_self_ble_signal(
+            Some("ble-idref:d6b6fc2bf0f08cdf"),
+            "ble-idref:0000000000000001"
+        ));
+        assert!(!is_self_ble_signal(None, "ble-idref:d6b6fc2bf0f08cdf"));
     }
 
     #[test]

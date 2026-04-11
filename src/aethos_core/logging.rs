@@ -11,6 +11,13 @@ const APP_LOG_FILE_NAME: &str = "aethos-linux.log";
 
 static VERBOSE_LOGGING_ENABLED: AtomicBool = AtomicBool::new(false);
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum LogLevel {
+    Error,
+    Info,
+    Debug,
+}
+
 pub fn set_verbose_logging_enabled(enabled: bool) {
     VERBOSE_LOGGING_ENABLED.store(enabled, Ordering::SeqCst);
 }
@@ -20,14 +27,28 @@ pub fn verbose_logging_enabled() -> bool {
 }
 
 pub fn log_info(message: &str) {
-    if let Err(err) = append_local_log_inner(message) {
+    if !should_emit(LogLevel::Info) {
+        return;
+    }
+    if let Err(err) = append_local_log_inner("INFO", message) {
+        eprintln!("local log warning: {err}");
+    }
+}
+
+pub fn log_error(message: &str) {
+    if !should_emit(LogLevel::Error) {
+        return;
+    }
+    if let Err(err) = append_local_log_inner("ERROR", message) {
         eprintln!("local log warning: {err}");
     }
 }
 
 pub fn log_verbose(message: &str) {
-    if verbose_logging_enabled() {
-        log_info(message);
+    if verbose_logging_enabled() && should_emit(LogLevel::Debug) {
+        if let Err(err) = append_local_log_inner("DEBUG", message) {
+            eprintln!("local log warning: {err}");
+        }
     }
 }
 
@@ -51,7 +72,21 @@ pub fn app_log_file_path() -> PathBuf {
     std::env::temp_dir().join(APP_LOG_FILE_NAME)
 }
 
-fn append_local_log_inner(message: &str) -> Result<(), String> {
+pub fn clear_app_log_if_requested() {
+    let should_clear = std::env::var("AETHOS_CLEAR_APP_LOG_ON_START")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !should_clear {
+        return;
+    }
+
+    let path = app_log_file_path();
+    if path.exists() {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn append_local_log_inner(level: &str, message: &str) -> Result<(), String> {
     let path = app_log_file_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -72,6 +107,7 @@ fn append_local_log_inner(message: &str) -> Result<(), String> {
     if structured_logs_enabled() {
         let event = json!({
             "ts_unix": now,
+            "level": level,
             "run_id": std::env::var("AETHOS_E2E_RUN_ID").ok(),
             "test_case_id": std::env::var("AETHOS_E2E_TEST_CASE_ID").ok(),
             "scenario": std::env::var("AETHOS_E2E_SCENARIO").ok(),
@@ -83,9 +119,27 @@ fn append_local_log_inner(message: &str) -> Result<(), String> {
         writeln!(file, "{}", event)
             .map_err(|err| format!("failed writing app log file at {}: {err}", path.display()))
     } else {
-        writeln!(file, "[{now}] {message}")
+        writeln!(file, "[{now}] [{level}] {message}")
             .map_err(|err| format!("failed writing app log file at {}: {err}", path.display()))
     }
+}
+
+fn configured_log_level() -> LogLevel {
+    match std::env::var("AETHOS_LOG_LEVEL")
+        .ok()
+        .unwrap_or_else(|| "info".to_string())
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "error" => LogLevel::Error,
+        "debug" => LogLevel::Debug,
+        _ => LogLevel::Info,
+    }
+}
+
+fn should_emit(level: LogLevel) -> bool {
+    level <= configured_log_level()
 }
 
 fn structured_logs_enabled() -> bool {

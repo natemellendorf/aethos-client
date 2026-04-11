@@ -39,10 +39,38 @@ In a separate terminal:
 sudo btmon
 ```
 
+After capturing output to a log file, you can extract likely primary/scan bytes and run the inspector automatically:
+
+```bash
+scripts/extract-btmon-ble-identity.sh --input ./btmon.log
+```
+
+Optional: pin to a specific advertiser MAC address:
+
+```bash
+scripts/extract-btmon-ble-identity.sh --input ./btmon.log --address AA:BB:CC:DD:EE:FF
+```
+
+Optional: list every scan-response report seen for that advertiser (helps diagnose missing/empty `SCAN_RSP`):
+
+```bash
+scripts/extract-btmon-ble-identity.sh --input ./btmon.log --address AA:BB:CC:DD:EE:FF --scan-report --no-run-inspector
+```
+
 Confirm the advertisement set includes:
 
 - UUID list AD (`0x07` or `0x06`) containing `4e ee 0d d2 6c 0e f7 87 f9 50 29 5a 85 a5 1a 18`.
 - Service Data AD (`0x21`) keyed by same UUID with exactly 12 payload bytes.
+
+Optional: decode captured bytes with the local inspector:
+
+```bash
+cargo run --bin ble-identity-inspector -- \
+  --primary 11074eee0dd26c0ef787f950295a85a51a18 \
+  --scan 1d214eee0dd26c0ef787f950295a85a51a1801000100d6b6fc2bf0f08cdf
+```
+
+The inspector prints AD-structure breakdown and the exact fail-closed rejection reason code if bytes are non-conformant.
 
 ## 3) Verify scanner side with `bluetoothctl`
 
