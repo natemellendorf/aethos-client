@@ -1718,11 +1718,11 @@ export default function App() {
 
         {tab === "settings" && settings && (
           <div className="space-y-4">
-            <Card className="border-border/60 bg-slate-900/50">
-              <CardHeader className="p-4 pb-2"><CardTitle className="text-lg">Sync & Features</CardTitle></CardHeader>
-              <CardContent className="p-4 pt-0">
-                <form className="space-y-6" onSubmit={saveSettings}>
-                  <div className="space-y-4">
+            <form className="space-y-6" onSubmit={saveSettings}>
+              <div className="grid gap-4 lg:grid-cols-2">
+                <Card className="border-border/60 bg-slate-900/50">
+                  <CardHeader className="p-4 pb-2"><CardTitle className="text-lg">Sync & Features</CardTitle></CardHeader>
+                  <CardContent className="space-y-4 p-4 pt-0">
                     <div className="flex items-center justify-between">
                       <div className="space-y-0.5 pr-4">
                         <label className="text-sm font-medium leading-none text-slate-100">Enable relay sync</label>
@@ -1762,14 +1762,17 @@ export default function App() {
                       </div>
                       <Switch data-testid="settings-enter-to-send" checked={settingsDraft.enterToSend} onCheckedChange={(v) => setSettingsDraft(d => ({...d, enterToSend: v}))} />
                     </div>
-                  </div>
 
-                  <div className="space-y-4 border-t border-border/40 pt-4">
-                    <div className="space-y-2">
+                    <div className="space-y-2 border-t border-border/40 pt-4">
                       <label className="text-sm font-medium leading-none text-slate-100">Message TTL (seconds)</label>
                       <Input name="message_ttl_seconds" type="number" defaultValue={settings.messageTtlSeconds} className="max-w-[200px]" />
                     </div>
-                    
+                  </CardContent>
+                </Card>
+
+                <Card className={`border-border/60 bg-slate-900/50 transition-opacity ${settingsDraft.relaySyncEnabled ? "opacity-100" : "opacity-50"}`}>
+                  <CardHeader className="p-4 pb-2"><CardTitle className="text-lg">Relay Configuration</CardTitle></CardHeader>
+                  <CardContent className="space-y-4 p-4 pt-0">
                     <div className="space-y-2">
                       <label className="text-sm font-medium leading-none text-slate-100">Relay Endpoints (one per line)</label>
                       <Textarea
@@ -1779,20 +1782,23 @@ export default function App() {
                         value={relayEndpointsDraft}
                         onChange={(event) => setRelayEndpointsDraft(event.target.value)}
                         className="font-mono text-xs"
+                        disabled={!settingsDraft.relaySyncEnabled}
                       />
                     </div>
-                  </div>
+                    <div className="flex flex-wrap items-center gap-3">
+                      <Button type="button" variant="secondary" onClick={resetRelayEndpoints} disabled={!settingsDraft.relaySyncEnabled}>Reset Relay Default</Button>
+                    </div>
+                  </CardContent>
+                </Card>
+              </div>
 
-                  <div className="flex flex-wrap items-center gap-3 border-t border-border/40 pt-4">
-                    <Button data-testid="settings-save" type="submit" className="bg-cyan-600 text-white hover:bg-cyan-500"><CheckCircle2 className="mr-2 h-4 w-4" />Save Settings</Button>
-                    <Button type="button" variant="secondary" onClick={resetRelayEndpoints}>Reset Relay Default</Button>
-                    <Button data-testid="settings-announce-gossip" type="button" variant="secondary" onClick={announceGossip}>Announce LAN Gossip</Button>
-                    <div className="flex-1"></div>
-                    <Button type="button" variant="destructive" onClick={clearAllMessages}>Delete ALL Messages</Button>
-                  </div>
-                </form>
-              </CardContent>
-            </Card>
+              <div className="flex flex-wrap items-center gap-3">
+                <Button data-testid="settings-save" type="submit" className="bg-cyan-600 text-white hover:bg-cyan-500"><CheckCircle2 className="mr-2 h-4 w-4" />Save Settings</Button>
+                <Button data-testid="settings-announce-gossip" type="button" variant="secondary" onClick={announceGossip}>Announce LAN Gossip</Button>
+                <div className="flex-1"></div>
+                <Button type="button" variant="destructive" onClick={clearAllMessages}>Delete ALL Messages</Button>
+              </div>
+            </form>
 
             <div className="rounded-xl border border-border/40 bg-background/30 p-4">
               <h4 className="mb-3 text-sm font-medium text-slate-300">Advanced & Debugging</h4>
