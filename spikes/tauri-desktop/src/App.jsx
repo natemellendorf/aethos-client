@@ -1195,8 +1195,7 @@ export default function App() {
   const bleEnabled = settings?.bleDiscoveryEnabled !== false;
   const bleLastSightingMs = Number(encounterActivity.lastBleSightingUnixMs || 0);
   const bleSightingDetectedRecently = bleEnabled && bleLastSightingMs > 0 && Date.now() - bleLastSightingMs <= BLE_ICON_PULSE_WINDOW_MS;
-  const bleRecentRejections = Number(encounterActivity.recentBleRejectionsCount || 0);
-  const bleLastRejectionReason = String(encounterActivity.lastBleRejectionReason || "").trim();
+  const bleRecentAccepts = Number(encounterActivity.recentBleSightingsCount || 0);
   const filteredLogLines = useMemo(() => {
     const lines = (logTail.content || "").split("\n");
     const needles = LOG_FILTERS[logFilter] || [];
@@ -1324,12 +1323,12 @@ export default function App() {
               >
                 <Bluetooth className="h-3.5 w-3.5" />
               </span>
-              {bleEnabled && bleRecentRejections > 0 ? (
+              {bleEnabled && bleRecentAccepts > 0 ? (
                 <span
-                  className="ble-rejection-chip"
-                  title={bleLastRejectionReason || `BLE rejected observations in recent window: ${bleRecentRejections}`}
+                  className="ble-accept-chip"
+                  title={`Aethos BLE advertisements accepted in recent window: ${bleRecentAccepts}`}
                 >
-                  BLE rejects: {bleRecentRejections}
+                  BLE accepts: {bleRecentAccepts}
                 </span>
               ) : null}
             </div>
@@ -1772,10 +1771,7 @@ export default function App() {
                   BLE setting: <span className="text-foreground">{encounterActivity.bleDiscoveryEnabled === false ? "disabled" : "enabled"}</span>
                 </p>
                 <p>
-                  Recent BLE rejects (10m): <span className="text-foreground">{encounterActivity.recentBleRejectionsCount || 0}</span>
-                  {encounterActivity.lastBleRejectionReason ? (
-                    <span className="text-muted-foreground"> · latest: {encounterActivity.lastBleRejectionReason}</span>
-                  ) : null}
+                  Recent BLE accepts (10m): <span className="text-foreground">{encounterActivity.recentBleSightingsCount || 0}</span>
                 </p>
                 <p>
                   Last BLE sighting: <span className="text-foreground">{formatActivityTime(encounterActivity.lastBleSightingUnixMs)}</span>

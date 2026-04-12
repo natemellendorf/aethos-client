@@ -78,22 +78,20 @@ EOF
 cat > "${CHECKLIST_PATH}" <<EOF
 # Expected evidence checklist
 
-- [ ] Desktop emits canonical advertisement on-air (UUID list + 0x21 service data).
+- [ ] Desktop emits v2 wakeup hint on-air (UUID list only, no 0x21 service data).
 - [ ] iOS scanner shows accepted_count > 0 for desktop signal.
-- [ ] iOS rejection reason is no longer "missing primary service UUID" for desktop signal.
 - [ ] BLE-triggered encounter activation is observed.
 
 ## Desktop logs to capture
 
 - [ ] ble_advertiser_started source=bluez-le-advertiser ...
-- [ ] ble_observation_accepted count=<n> source=canonical_ble_identity_v1
+- [ ] ble_wakeup_hint_accepted count=<n> source=ble_wakeup_v2
 - [ ] encounter_ble_handoff ... reason=ble-discovery ...
 
 ## btmon logs to capture
 
 - [ ] Aethos primary UUID in AD type 0x07 or 0x06
-- [ ] AD type 0x21 service data keyed by Aethos UUID
-- [ ] 12-byte payload structure: version, flags, capabilities, identity_ref
+- [ ] No AD type 0x21 service data keyed by Aethos UUID (v2 forbids it)
 
 ## iOS logs to capture
 

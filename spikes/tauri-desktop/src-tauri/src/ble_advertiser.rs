@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use dbus::arg::PropMap;
@@ -9,16 +8,11 @@ use dbus::channel::MatchingReceiver;
 use dbus::message::MatchRule;
 use dbus::Path;
 use dbus_crossroads::Crossroads;
-use sha2::{Digest, Sha256};
 
 use crate::aethos_core::ble_discovery::{
-    build_identity_service_data_ad, build_primary_uuid_list_ad, canonical_ble_primary_service_uuid,
-    BleIdentityCapabilities, BleIdentityPayloadV1,
+    build_primary_uuid_list_ad, canonical_ble_primary_service_uuid,
 };
-use crate::aethos_core::identity_store::ensure_local_identity;
-use crate::aethos_core::protocol::is_valid_wayfarer_id;
 
-const AETHOS_BLE_IDREF_CONTEXT_V1: &[u8] = b"aethos:ble:idref:v1\0";
 const ADVERTISEMENT_OBJECT_PATH: &str = "/org/aethos/ble/advertisement0";
 
 pub enum AdvertiserPollEvent {
@@ -31,11 +25,7 @@ pub struct EmittedCanonicalAdvertisement {
     pub source: &'static str,
     pub mode: &'static str,
     pub uuid: String,
-    pub wayfarer_id: String,
     pub primary_ad_hex: String,
-    pub service_data_ad_hex: String,
-    pub payload_hex: String,
-    pub identity_ref_hex: String,
 }
 
 pub struct CanonicalBleAdvertiser {
@@ -78,25 +68,7 @@ impl CanonicalBleAdvertiser {
         }
         self.last_attempt = Some(Instant::now());
 
-        let identity = match ensure_local_identity() {
-            Ok(identity) => identity,
-            Err(err) => {
-                return Some(AdvertiserPollEvent::Error(format!(
-                    "local identity unavailable: {err}"
-                )));
-            }
-        };
-
-        let payload = match build_canonical_identity_payload(&identity.wayfarer_id) {
-            Ok(payload) => payload,
-            Err(err) => {
-                return Some(AdvertiserPollEvent::Error(format!(
-                    "failed building canonical BLE identity payload: {err}"
-                )));
-            }
-        };
-
-        match BluezAdvertisementHandle::register(&identity.wayfarer_id, &payload) {
+        match BluezAdvertisementHandle::register() {
             Ok(handle) => {
                 let report = handle.report.clone();
                 self.active = Some(handle);
@@ -113,7 +85,7 @@ impl CanonicalBleAdvertiser {
 struct AdvertisementConfig {
     advertisement_type: String,
     service_uuids: Vec<String>,
-    service_data: HashMap<String, Vec<u8>>,
+    includes: Vec<String>,
     discoverable: bool,
     secondary_channel: Option<String>,
 }
@@ -132,25 +104,11 @@ struct BluezAdvertisementHandle {
 }
 
 impl BluezAdvertisementHandle {
-    fn register(
-        wayfarer_id: &str,
-        payload: &BleIdentityPayloadV1,
-    ) -> Result<BluezAdvertisementHandle, String> {
+    fn register() -> Result<BluezAdvertisementHandle, String> {
         let primary_ad = build_primary_uuid_list_ad();
-        let service_data_ad = build_identity_service_data_ad(payload);
-        let payload_bytes = payload_to_bytes(payload);
         let primary_ad_hex = bytes_to_hex_lower(&primary_ad);
-        let service_data_ad_hex = bytes_to_hex_lower(&service_data_ad);
-        let payload_hex = bytes_to_hex_lower(&payload_bytes);
-        let identity_ref_hex = bytes_to_hex_lower(&payload.identity_ref);
 
-        let mut service_data = HashMap::new();
-        service_data.insert(
-            canonical_ble_primary_service_uuid().to_string(),
-            payload_bytes.to_vec(),
-        );
-
-        let attempts = advertisement_attempts(service_data);
+        let attempts = advertisement_attempts();
         let mut failures = Vec::new();
         for attempt in attempts {
             let connection =
@@ -176,11 +134,7 @@ impl BluezAdvertisementHandle {
                             source: "bluez-le-advertiser",
                             mode: attempt.mode,
                             uuid: canonical_ble_primary_service_uuid().to_string(),
-                            wayfarer_id: wayfarer_id.to_string(),
                             primary_ad_hex,
-                            service_data_ad_hex,
-                            payload_hex,
-                            identity_ref_hex,
                         },
                     });
                 }
@@ -229,70 +183,6 @@ fn ble_advertising_is_disabled() -> bool {
             .unwrap_or(false)
 }
 
-fn build_canonical_identity_payload(wayfarer_id: &str) -> Result<BleIdentityPayloadV1, String> {
-    let identity_ref = derive_stable_identity_ref(wayfarer_id)?;
-    let capabilities = BleIdentityCapabilities {
-        lan: true,
-        mpc: false,
-        relay: false,
-        normalized_bits: 0x0001,
-        raw_bits: 0x0001,
-    };
-    Ok(BleIdentityPayloadV1 {
-        version: 0x01,
-        identity_rotating: false,
-        identity_private: false,
-        capabilities,
-        identity_ref,
-    })
-}
-
-fn derive_stable_identity_ref(wayfarer_id: &str) -> Result<[u8; 8], String> {
-    let wayfarer_bytes = parse_wayfarer_id_hex(wayfarer_id)?;
-    let mut hasher = Sha256::new();
-    hasher.update(AETHOS_BLE_IDREF_CONTEXT_V1);
-    hasher.update(wayfarer_bytes);
-    let digest = hasher.finalize();
-    let mut out = [0u8; 8];
-    out.copy_from_slice(&digest[..8]);
-    if out.iter().all(|byte| *byte == 0) {
-        return Err("identity_ref derivation produced zero bytes".to_string());
-    }
-    Ok(out)
-}
-
-fn parse_wayfarer_id_hex(wayfarer_id: &str) -> Result<[u8; 32], String> {
-    if !is_valid_wayfarer_id(wayfarer_id) {
-        return Err("invalid wayfarer_id; expected 64 lowercase hex chars".to_string());
-    }
-    let mut out = [0u8; 32];
-    for idx in 0..32 {
-        let from = idx * 2;
-        let to = from + 2;
-        out[idx] = u8::from_str_radix(&wayfarer_id[from..to], 16)
-            .map_err(|err| format!("failed to parse wayfarer_id hex at byte {idx}: {err}"))?;
-    }
-    Ok(out)
-}
-
-fn payload_to_bytes(payload: &BleIdentityPayloadV1) -> [u8; 12] {
-    let mut out = [0u8; 12];
-    out[0] = payload.version;
-    let mut flags = 0u8;
-    if payload.identity_rotating {
-        flags |= 0x01;
-    }
-    if payload.identity_private {
-        flags |= 0x02;
-    }
-    out[1] = flags;
-    let capabilities = payload.capabilities.raw_bits.to_le_bytes();
-    out[2] = capabilities[0];
-    out[3] = capabilities[1];
-    out[4..12].copy_from_slice(&payload.identity_ref);
-    out
-}
-
 fn register_advertisement_object(
     connection: &Connection,
     advertisement_path: &Path<'static>,
@@ -309,8 +199,8 @@ fn register_advertisement_object(
             .property("ServiceUUIDs")
             .get(|_, cfg: &mut AdvertisementConfig| Ok(cfg.service_uuids.clone()));
         builder
-            .property("ServiceData")
-            .get(|_, cfg: &mut AdvertisementConfig| Ok(cfg.service_data.clone()));
+            .property("Includes")
+            .get(|_, cfg: &mut AdvertisementConfig| Ok(cfg.includes.clone()));
         builder
             .property("Discoverable")
             .get(|_, cfg: &mut AdvertisementConfig| Ok(cfg.discoverable));
@@ -336,15 +226,23 @@ fn register_advertisement_object(
     Ok(())
 }
 
-fn advertisement_attempts(service_data: HashMap<String, Vec<u8>>) -> Vec<AdvertisementAttempt> {
+// V2 §4.2: UUID-only, no service data.
+fn advertisement_attempts() -> Vec<AdvertisementAttempt> {
     let uuid = canonical_ble_primary_service_uuid().to_string();
+
+    let mode = std::env::var("AETHOS_BLE_ADVERTISER_MODE")
+        .ok()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+
     let extended = AdvertisementAttempt {
         mode: "extended-secondary-1m",
         include_secondary_channel_property: true,
         config: AdvertisementConfig {
             advertisement_type: "peripheral".to_string(),
             service_uuids: vec![uuid.clone()],
-            service_data: service_data.clone(),
+            includes: Vec::new(),
             discoverable: true,
             secondary_channel: Some("1M".to_string()),
         },
@@ -354,25 +252,31 @@ fn advertisement_attempts(service_data: HashMap<String, Vec<u8>>) -> Vec<Adverti
         include_secondary_channel_property: false,
         config: AdvertisementConfig {
             advertisement_type: "peripheral".to_string(),
+            service_uuids: vec![uuid.clone()],
+            includes: Vec::new(),
+            discoverable: true,
+            secondary_channel: None,
+        },
+    };
+    let uuid_only_broadcast = AdvertisementAttempt {
+        mode: "uuid-only-broadcast-baseline",
+        include_secondary_channel_property: false,
+        config: AdvertisementConfig {
+            advertisement_type: "broadcast".to_string(),
             service_uuids: vec![uuid],
-            service_data,
+            includes: Vec::new(),
             discoverable: true,
             secondary_channel: None,
         },
     };
 
-    if prefer_legacy_advertiser_mode() {
-        vec![legacy, extended]
+    if mode == "legacy" {
+        vec![legacy, extended, uuid_only_broadcast]
+    } else if mode == "uuid-only" || mode == "broadcast" {
+        vec![uuid_only_broadcast, legacy, extended]
     } else {
-        vec![extended, legacy]
+        vec![extended, legacy, uuid_only_broadcast]
     }
-}
-
-fn prefer_legacy_advertiser_mode() -> bool {
-    std::env::var("AETHOS_BLE_ADVERTISER_MODE")
-        .ok()
-        .map(|value| value.trim().eq_ignore_ascii_case("legacy"))
-        .unwrap_or(false)
 }
 
 fn register_with_bluez_manager(
@@ -460,46 +364,39 @@ fn bytes_to_hex_lower(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        build_canonical_identity_payload, bytes_to_hex_lower, derive_stable_identity_ref,
-        payload_to_bytes,
-    };
-    use crate::aethos_core::ble_discovery::{
-        build_identity_service_data_ad, build_primary_uuid_list_ad,
-    };
-
-    const VECTOR_WAYFARER_ID: &str =
-        "1111111111111111111111111111111111111111111111111111111111111111";
+    use super::bytes_to_hex_lower;
+    use crate::aethos_core::ble_discovery::build_primary_uuid_list_ad;
 
     #[test]
-    fn stable_identity_ref_derivation_matches_vector() {
-        let derived = derive_stable_identity_ref(VECTOR_WAYFARER_ID).expect("derive identity_ref");
-        assert_eq!(bytes_to_hex_lower(&derived), "d6b6fc2bf0f08cdf");
-    }
-
-    #[test]
-    fn canonical_payload_builder_packs_exact_12_bytes() {
-        let payload = build_canonical_identity_payload(VECTOR_WAYFARER_ID).expect("build payload");
-        let payload_bytes = payload_to_bytes(&payload);
-        assert_eq!(payload_bytes.len(), 12);
-        assert_eq!(
-            bytes_to_hex_lower(&payload_bytes),
-            "01000100d6b6fc2bf0f08cdf"
-        );
-    }
-
-    #[test]
-    fn canonical_ad_structures_match_contract_bytes() {
-        let payload = build_canonical_identity_payload(VECTOR_WAYFARER_ID).expect("build payload");
+    fn v2_primary_uuid_ad_matches_expected_bytes() {
         let primary_ad = build_primary_uuid_list_ad();
-        let service_data_ad = build_identity_service_data_ad(&payload);
         assert_eq!(
             bytes_to_hex_lower(&primary_ad),
             "11074eee0dd26c0ef787f950295a85a51a18"
         );
-        assert_eq!(
-            bytes_to_hex_lower(&service_data_ad),
-            "1d214eee0dd26c0ef787f950295a85a51a1801000100d6b6fc2bf0f08cdf"
-        );
+    }
+
+    #[test]
+    fn v2_primary_uuid_ad_is_exactly_18_bytes() {
+        let primary_ad = build_primary_uuid_list_ad();
+        assert_eq!(primary_ad.len(), 18);
+    }
+
+    #[test]
+    fn v2_advertisement_carries_no_service_data() {
+        let attempts = super::advertisement_attempts();
+        assert!(!attempts.is_empty());
+        for attempt in &attempts {
+            assert!(
+                attempt.config.service_uuids.len() == 1,
+                "mode={}: expected exactly 1 service UUID",
+                attempt.mode
+            );
+            assert_eq!(
+                attempt.config.service_uuids[0], "181aa585-5a29-50f9-87f7-0e6cd20dee4e",
+                "mode={}",
+                attempt.mode
+            );
+        }
     }
 }

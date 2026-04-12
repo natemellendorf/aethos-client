@@ -7,8 +7,11 @@ usage() {
   cat <<'EOF'
 usage: scripts/extract-btmon-ble-identity.sh --input <btmon.log> [--address <MAC>] [--scan-report] [--no-run-inspector]
 
-Extracts the latest primary advertisement + scan response pair from btmon text output,
+Extracts the latest primary advertisement from btmon text output,
 then (by default) runs `ble-identity-inspector` with the recovered bytes.
+
+In v2 only the primary advertisement is needed (UUID-only wakeup hint).
+Scan response data is no longer required.
 
 When `--scan-report` is set, prints a summary of all scan-response reports for the
 selected address (line number, event type, payload length, Aethos-UUID presence).
@@ -112,6 +115,29 @@ def is_scan_response(event_type: str) -> bool:
 
 def has_aethos_uuid(data_hex: str) -> bool:
     return AETHOS_UUID_LE_HEX in data_hex.lower()
+
+
+def ad_types(data_hex: str):
+    out = []
+    raw = bytes.fromhex(data_hex) if data_hex else b""
+    cursor = 0
+    while cursor < len(raw):
+        length = raw[cursor]
+        cursor += 1
+        if length == 0:
+            break
+        if cursor + length > len(raw):
+            break
+        ad_type = raw[cursor]
+        out.append(ad_type)
+        cursor += length
+    return out
+
+
+def format_ad_types(types):
+    if not types:
+        return "none"
+    return ",".join([f"0x{value:02x}" for value in types])
 
 
 def parse_reports(raw_lines):
@@ -263,13 +289,21 @@ print(
 )
 if scan:
     print(
-        f"- selected_scan=line:{scan['line_no']} address:{scan['address'] or 'unknown'} event:{scan['event_type'] or 'unknown'} len:{len(scan_hex) // 2}"
+        f"- selected_scan=line:{scan['line_no']} address:{scan['address'] or 'unknown'} event:{scan['event_type'] or 'unknown'} len:{len(scan_hex) // 2} (not used by v2 inspector)"
     )
 else:
-    print("- selected_scan=none (inspector will likely reject as missing_identity_payload unless 0x21 is in primary)")
+    print("- selected_scan=none (not required for v2 wakeup hint acceptance)")
 
 print(f"- primary_hex={primary['data_hex']}")
 print(f"- scan_hex={scan_hex}")
+primary_types = ad_types(primary["data_hex"])
+scan_types = ad_types(scan_hex)
+print(f"- primary_ad_types={format_ad_types(primary_types)}")
+print(f"- primary_has_0x07={0x07 in primary_types}")
+print(f"- primary_has_0x21={0x21 in primary_types}")
+print(f"- scan_ad_types={format_ad_types(scan_types)}")
+print(f"- scan_has_0x07={0x07 in scan_types}")
+print(f"- scan_has_0x21={0x21 in scan_types}")
 
 scan_report_address = address_filter or primary["address"]
 if scan_report and scan_report_address:
@@ -284,7 +318,7 @@ if scan_report and scan_report_address:
         data_hex = entry["data_hex"]
         short_hex = data_hex if len(data_hex) <= 64 else f"{data_hex[:64]}..."
         print(
-            f"  scan[{idx}] line:{entry['line_no']} event:{entry['event_type'] or 'unknown'} len:{len(data_hex)//2} has_aethos_uuid:{has_aethos_uuid(data_hex)} data_hex:{short_hex}"
+            f"  scan[{idx}] line:{entry['line_no']} event:{entry['event_type'] or 'unknown'} len:{len(data_hex)//2} has_aethos_uuid:{has_aethos_uuid(data_hex)} ad_types:{format_ad_types(ad_types(data_hex))} data_hex:{short_hex}"
         )
 elif scan_report:
     print("- scan_report_address=unknown")
@@ -299,8 +333,8 @@ inspector_cmd = [
     "--primary",
     primary["data_hex"],
 ]
-if scan_hex:
-    inspector_cmd.extend(["--scan", scan_hex])
+if primary["address"]:
+    inspector_cmd.extend(["--address", primary["address"]])
 
 print("- inspector_cmd=" + " ".join(inspector_cmd))
 

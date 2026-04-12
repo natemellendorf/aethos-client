@@ -107,6 +107,7 @@ Primary files:
 Convergence assertion:
 - Baseline message convergence uses persisted state (`chat-history.json`) as source-of-truth.
 - UI thread rendering checks are retained as supporting diagnostics, not sole pass/fail criteria.
+- BLE encounter coverage asserts canonical-contract acceptance and fail-closed rejection diagnostics (`ble_observation_accepted` / `ble_observation_rejected`) on both desktop peers before LAN handoff.
 
 ## Scenario config
 

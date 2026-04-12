@@ -81,6 +81,9 @@ const E2E_UDP_TRANSFER_FRAME_MAX_BYTES = Number(
 const MEDIA_E2E_HOUSEKEEPING_MIN_INTERVAL_MS = Number(
   process.env.AETHOS_MEDIA_E2E_HOUSEKEEPING_MIN_INTERVAL_MS || "2000"
 );
+const CANONICAL_BLE_PRIMARY_AD_HEX = "11074eee0dd26c0ef787f950295a85a51a18";
+const CANONICAL_BLE_SCAN_RESPONSE_HEX = "1d214eee0dd26c0ef787f950295a85a51a1801030700deadbeefcafebabe";
+const MALFORMED_BLE_PRIMARY_AD_HEX = "zz";
 
 const TAURI_DRIVER_A_PORT = 4444;
 const TAURI_DRIVER_B_PORT = 4454;
@@ -1105,17 +1108,22 @@ describe("dual instance gossip e2e", function () {
     }
   });
 
-  it("emits BLE discovery and hands off to LAN transfer path", async function () {
+  it("proves desktop-to-desktop BLE discovery path with canonical acceptance and fail-closed diagnostics", async function () {
     this.timeout(TEST_TIMEOUT_MS);
 
     let a;
     let b;
     try {
+      const simulatedSignals = [
+        `ad:${CANONICAL_BLE_PRIMARY_AD_HEX}|sr:${CANONICAL_BLE_SCAN_RESPONSE_HEX}@-52`,
+        `ad:${MALFORMED_BLE_PRIMARY_AD_HEX}|sr:${CANONICAL_BLE_SCAN_RESPONSE_HEX}@-47`
+      ].join(",");
+
       a = await openTauriSession("a", stateRootPath("ble-discovery-a"), TAURI_DRIVER_A_PORT, {
-        AETHOS_BLE_SIMULATED_SIGNALS: "peer-ble-a@-52,peer-ble-b@-45"
+        AETHOS_BLE_SIMULATED_SIGNALS: simulatedSignals
       });
       b = await openTauriSession("b", stateRootPath("ble-discovery-b"), TAURI_DRIVER_B_PORT, {
-        AETHOS_BLE_SIMULATED_SIGNALS: "peer-ble-a@-52,peer-ble-b@-45"
+        AETHOS_BLE_SIMULATED_SIGNALS: simulatedSignals
       });
 
       await waitForSplashToClear(a.driver);
@@ -1130,26 +1138,42 @@ describe("dual instance gossip e2e", function () {
       await clickContactInChats(a.driver, idB);
       await clickContactInChats(b.driver, idA);
 
-      const discovered = await waitForLogPattern(
-        a.logPath,
-        /encounter_discovery_observed.*bearer_adapter=ble-bootstrap/,
-        120000
-      );
-      expect(Boolean(discovered)).to.equal(true);
+      for (const session of [a, b]) {
+        const accepted = await waitForLogPattern(
+          session.logPath,
+          /ble_observation_accepted count=\d+ source=canonical_ble_identity_v1/,
+          120000
+        );
+        expect(Boolean(accepted)).to.equal(true);
 
-      const controlStart = await waitForLogPattern(
-        a.logPath,
-        /encounter_control_exchange_started.*reason=ble-discovery/,
-        120000
-      );
-      expect(Boolean(controlStart)).to.equal(true);
+        const rejected = await waitForLogPattern(
+          session.logPath,
+          /ble_observation_rejected reason_code=malformed_ad_structure reason_label="malformed AD structure"/,
+          120000
+        );
+        expect(Boolean(rejected)).to.equal(true);
 
-      const handoff = await waitForLogPattern(
-        a.logPath,
-        /encounter_bearer_selected.*bearer_adapter=lan-datagram.*reason=ble-discovery/,
-        120000
-      );
-      expect(Boolean(handoff)).to.equal(true);
+        const discovered = await waitForLogPattern(
+          session.logPath,
+          /encounter_discovery_observed.*bearer_adapter=ble-bootstrap/,
+          120000
+        );
+        expect(Boolean(discovered)).to.equal(true);
+
+        const controlStart = await waitForLogPattern(
+          session.logPath,
+          /encounter_control_exchange_started.*reason=ble-discovery/,
+          120000
+        );
+        expect(Boolean(controlStart)).to.equal(true);
+
+        const handoff = await waitForLogPattern(
+          session.logPath,
+          /encounter_bearer_selected.*bearer_adapter=lan-datagram.*reason=ble-discovery/,
+          120000
+        );
+        expect(Boolean(handoff)).to.equal(true);
+      }
 
       const text = `ble-discovery-${Date.now()}`;
       await sendChatMessage(a.driver, text);

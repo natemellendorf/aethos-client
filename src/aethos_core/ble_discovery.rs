@@ -7,15 +7,41 @@ use dbus::blocking::stdintf::org_freedesktop_dbus::ObjectManager;
 use dbus::blocking::Connection;
 use dbus::Path;
 
-const AETHOS_BLE_PRIMARY_SERVICE_UUID: &str = "181aa585-5a29-50f9-87f7-0e6cd20dee4e";
-const AETHOS_BLE_PRIMARY_SERVICE_UUID_LE: [u8; 16] = [
+// ── Frozen constants (unchanged across protocol versions) ───────────────────
+
+/// Primary Aethos Discovery Service UUID (128-bit, frozen).
+/// Derivation: UUIDv5(DNS, "aethos.ble.discovery.identity.v1") — name retains
+/// `v1` because the UUID is frozen and MUST NOT change across versions.
+pub const AETHOS_BLE_PRIMARY_SERVICE_UUID: &str = "181aa585-5a29-50f9-87f7-0e6cd20dee4e";
+
+/// Little-endian BLE byte order of the primary service UUID (on-air encoding).
+pub const AETHOS_BLE_PRIMARY_SERVICE_UUID_LE: [u8; 16] = [
     0x4e, 0xee, 0x0d, 0xd2, 0x6c, 0x0e, 0xf7, 0x87, 0xf9, 0x50, 0x29, 0x5a, 0x85, 0xa5, 0x1a, 0x18,
 ];
-const BLE_IDENTITY_V1_VERSION: u8 = 0x01;
-const BLE_IDENTITY_V1_PAYLOAD_LEN: usize = 12;
-const BLE_IDENTITY_V1_IDENTITY_REF_LEN: usize = 8;
+
 type BluezManagedObjects = HashMap<Path<'static>, HashMap<String, PropMap>>;
 
+// ── V2 wakeup hint types ────────────────────────────────────────────────────
+
+/// A validated BLE wakeup hint per v2 §7.1.
+///
+/// Carries NO identity — only signals that an Aethos peer is nearby.
+/// The `ble_address` is unstable and non-identifying (v2 §9.3); it is used
+/// solely for debounce (§7.3) and activation window tracking (§8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeupHint {
+    pub ble_address: String,
+    pub received_at: Instant,
+}
+
+// ── Discovery signal (v2 semantics) ─────────────────────────────────────────
+
+/// A discovery signal emitted by a BLE source.
+///
+/// In v2 the `peer_hint` field contains a BLE address (or opaque handle for
+/// simulated sources). This value is **unstable and non-identifying** — it is
+/// used for debounce and activation-window keying only.  Identity is
+/// established exclusively through the post-connection Encounter handshake.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoverySignal {
     pub peer_hint: String,
@@ -25,6 +51,8 @@ pub struct DiscoverySignal {
     pub source: &'static str,
 }
 
+// ── Observation rejection ───────────────────────────────────────────────────
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BleObservationRejection {
     pub reason_code: &'static str,
@@ -32,6 +60,8 @@ pub struct BleObservationRejection {
     pub source: &'static str,
     pub detail: String,
 }
+
+// ── Poll report ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BleSourcePollReport {
@@ -48,41 +78,15 @@ impl BleSourcePollReport {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BleIdentityCapabilities {
-    pub lan: bool,
-    pub mpc: bool,
-    pub relay: bool,
-    pub normalized_bits: u16,
-    pub raw_bits: u16,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BleIdentityPayloadV1 {
-    pub version: u8,
-    pub identity_rotating: bool,
-    pub identity_private: bool,
-    pub capabilities: BleIdentityCapabilities,
-    pub identity_ref: [u8; BLE_IDENTITY_V1_IDENTITY_REF_LEN],
-}
-
-impl BleIdentityPayloadV1 {
-    pub fn peer_hint(&self) -> String {
-        format!("ble-idref:{}", bytes_to_hex_lower(&self.identity_ref))
-    }
-}
+// ── V2 parse rejection (slimmed — identity variants removed) ────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BleParseReject {
+pub(crate) enum BleParseReject {
+    /// Advertisement does not contain the Aethos UUID in a valid UUID-list.
     MissingPrimaryServiceUuid,
+    /// AD type 0x06/0x07 UUID-list has invalid length ((len-1) % 16 != 0).
     MalformedPrimaryServiceUuidList,
-    MissingIdentityPayload,
-    DuplicateIdentityPayloadInPdu,
-    ConflictingIdentityPayloadCopies,
-    MalformedPayloadLength,
-    UnsupportedVersion,
-    ReservedFlagBitsSet,
-    InvalidOrZeroIdentityRef,
+    /// Raw AD bytes are structurally invalid.
     MalformedAdStructure,
 }
 
@@ -91,13 +95,6 @@ impl BleParseReject {
         match self {
             Self::MissingPrimaryServiceUuid => "missing_primary_service_uuid",
             Self::MalformedPrimaryServiceUuidList => "malformed_primary_service_uuid_list",
-            Self::MissingIdentityPayload => "missing_identity_payload",
-            Self::DuplicateIdentityPayloadInPdu => "duplicate_identity_payload",
-            Self::ConflictingIdentityPayloadCopies => "conflicting_identity_payload",
-            Self::MalformedPayloadLength => "malformed_payload_length",
-            Self::UnsupportedVersion => "unsupported_version",
-            Self::ReservedFlagBitsSet => "reserved_flag_bits_set",
-            Self::InvalidOrZeroIdentityRef => "invalid_or_zero_identity_ref",
             Self::MalformedAdStructure => "malformed_ad_structure",
         }
     }
@@ -106,17 +103,58 @@ impl BleParseReject {
         match self {
             Self::MissingPrimaryServiceUuid => "missing primary service UUID",
             Self::MalformedPrimaryServiceUuidList => "malformed primary service UUID list",
-            Self::MissingIdentityPayload => "missing identity payload",
-            Self::DuplicateIdentityPayloadInPdu => "duplicate identity payload",
-            Self::ConflictingIdentityPayloadCopies => "conflicting identity payload",
-            Self::MalformedPayloadLength => "malformed payload length",
-            Self::UnsupportedVersion => "unsupported version",
-            Self::ReservedFlagBitsSet => "reserved flag bits set",
-            Self::InvalidOrZeroIdentityRef => "invalid or zero identity_ref",
             Self::MalformedAdStructure => "malformed AD structure",
         }
     }
 }
+
+// ── V2 wakeup hint acceptance (§6) ──────────────────────────────────────────
+
+/// Accept a BLE advertisement as an Aethos v2 wakeup hint.
+///
+/// Per v2 §6.1 the advertisement is accepted if and only if AD type 0x06 or
+/// 0x07 contains the Aethos primary service UUID in a structurally valid
+/// UUID-list.  Any AD type 0x21 (service data) is ignored per §6.3.
+///
+/// Returns `Ok(())` on acceptance or the structural rejection reason.
+pub fn accept_v2_wakeup_hint(ad_bytes: &[u8]) -> Result<(), BleParseReject> {
+    ensure_primary_uuid_list_contains_aethos(ad_bytes)
+}
+
+/// Accept a raw AD observation and produce a `DiscoverySignal` if valid.
+///
+/// This is the v2 replacement for the former `parse_canonical_ble_observation`.
+/// No identity payload is inspected — only UUID presence in a valid list.
+#[allow(dead_code)]
+pub fn accept_v2_wakeup_observation(
+    ad_bytes: &[u8],
+    ble_address: &str,
+    now_unix_ms: u64,
+    rssi: Option<i16>,
+    source: &'static str,
+) -> Result<DiscoverySignal, BleObservationRejection> {
+    accept_v2_wakeup_hint(ad_bytes).map_err(|reject| {
+        build_rejection(
+            reject,
+            source,
+            format!(
+                "uuid={} address={} ad_len={}",
+                AETHOS_BLE_PRIMARY_SERVICE_UUID,
+                ble_address,
+                ad_bytes.len()
+            ),
+        )
+    })?;
+    Ok(DiscoverySignal {
+        peer_hint: ble_address.to_string(),
+        observed_at_unix_ms: now_unix_ms,
+        rssi,
+        bearer_type: "ble",
+        source,
+    })
+}
+
+// ── Discovery source trait ──────────────────────────────────────────────────
 
 pub trait BleDiscoverySource {
     fn poll_signals(&mut self, now_unix_ms: u64) -> Vec<DiscoverySignal>;
@@ -129,9 +167,11 @@ pub trait BleDiscoverySource {
     }
 }
 
+// ── Debounce gate (v2 §7.3 — BLE-address keyed, 30s default) ───────────────
+
 pub struct BleDiscoveryGate {
-    dedupe_window: Duration,
-    last_seen_by_peer: HashMap<String, u64>,
+    debounce_window: Duration,
+    last_seen_by_address: HashMap<String, u64>,
 }
 
 pub struct GatePollResult {
@@ -141,10 +181,10 @@ pub struct GatePollResult {
 }
 
 impl BleDiscoveryGate {
-    pub fn new(dedupe_window: Duration) -> Self {
+    pub fn new(debounce_window: Duration) -> Self {
         Self {
-            dedupe_window,
-            last_seen_by_peer: HashMap::new(),
+            debounce_window,
+            last_seen_by_address: HashMap::new(),
         }
     }
 
@@ -167,15 +207,15 @@ impl BleDiscoveryGate {
         let mut deduped_count = 0;
         for signal in report.accepted {
             let allow = self
-                .last_seen_by_peer
+                .last_seen_by_address
                 .get(&signal.peer_hint)
                 .map(|previous| {
                     signal.observed_at_unix_ms.saturating_sub(*previous)
-                        >= self.dedupe_window.as_millis() as u64
+                        >= self.debounce_window.as_millis() as u64
                 })
                 .unwrap_or(true);
             if allow {
-                self.last_seen_by_peer
+                self.last_seen_by_address
                     .insert(signal.peer_hint.clone(), signal.observed_at_unix_ms);
                 out.push(signal);
             } else {
@@ -189,6 +229,73 @@ impl BleDiscoveryGate {
         }
     }
 }
+
+// ── Discovery activation window (v2 §8) ────────────────────────────────────
+
+/// Tracks per-BLE-address discovery activation windows.
+///
+/// After a wakeup hint passes debounce, an activation window is opened for
+/// that address.  During the window the scanner MAY attempt connections.
+/// After expiry, no connection attempts are made until the next post-debounce
+/// wakeup hint.
+pub struct ActivationWindowTracker {
+    window_duration: Duration,
+    max_concurrent: usize,
+    active: HashMap<String, Instant>,
+}
+
+impl ActivationWindowTracker {
+    /// Create a new tracker.
+    ///
+    /// * `window_duration` — length of each activation window (v2 §8.2: 10-60s).
+    /// * `max_concurrent` — maximum simultaneous windows (v2 §8.3: recommended 4).
+    pub fn new(window_duration: Duration, max_concurrent: usize) -> Self {
+        Self {
+            window_duration,
+            max_concurrent,
+            active: HashMap::new(),
+        }
+    }
+
+    /// Expire windows whose lifetime has elapsed.
+    pub fn expire_stale(&mut self) {
+        let now = Instant::now();
+        self.active
+            .retain(|_, opened_at| now.duration_since(*opened_at) < self.window_duration);
+    }
+
+    /// Try to open a window for `ble_address`.
+    ///
+    /// Returns `true` if a window was opened (or was already active).
+    /// Returns `false` if the concurrent window limit is reached.
+    pub fn open_window(&mut self, ble_address: &str) -> bool {
+        self.expire_stale();
+        if self.active.contains_key(ble_address) {
+            return true; // already active
+        }
+        if self.active.len() >= self.max_concurrent {
+            return false; // at capacity
+        }
+        self.active.insert(ble_address.to_string(), Instant::now());
+        true
+    }
+
+    /// Check whether `ble_address` has an active window.
+    #[allow(dead_code)]
+    pub fn is_active(&self, ble_address: &str) -> bool {
+        self.active.get(ble_address).is_some_and(|opened_at| {
+            Instant::now().duration_since(*opened_at) < self.window_duration
+        })
+    }
+
+    /// Number of currently active windows (before expiry sweep).
+    #[allow(dead_code)]
+    pub fn active_count(&self) -> usize {
+        self.active.len()
+    }
+}
+
+// ── Discovery adapter ───────────────────────────────────────────────────────
 
 pub enum DiscoveryAdapter {
     Simulated(SimulatedBleDiscoverySource),
@@ -233,6 +340,8 @@ pub fn discovery_adapter_from_env() -> DiscoveryAdapter {
     DiscoveryAdapter::BluetoothCtl(BluetoothCtlDiscoverySource::default())
 }
 
+// ── Simulated source (v2 — UUID-only matching) ─────────────────────────────
+
 #[derive(Debug, Clone)]
 struct SimulatedSignalSeed {
     kind: SimulatedSignalSeedKind,
@@ -241,10 +350,9 @@ struct SimulatedSignalSeed {
 
 #[derive(Debug, Clone)]
 enum SimulatedSignalSeedKind {
-    Canonical {
-        primary_advertisement_hex: String,
-        scan_response_hex: String,
-    },
+    /// Raw AD bytes — validated for UUID presence only (v2).
+    Canonical { ad_hex: String, ble_address: String },
+    /// Bare peer-hint string (test convenience, no AD validation).
     LegacyPeerHint(String),
 }
 
@@ -254,6 +362,10 @@ pub struct SimulatedBleDiscoverySource {
 }
 
 impl SimulatedBleDiscoverySource {
+    /// Parse the `AETHOS_BLE_SIMULATED_SIGNALS` env-var format.
+    ///
+    /// V2 format: `ad:<ad_hex>|addr:<ble_address>@<rssi>` — UUID-only check.
+    /// Legacy format: `<peer_hint>@<rssi>` — pass-through, no AD validation.
     fn from_env_string(raw: &str) -> Self {
         let pending = raw
             .split(',')
@@ -268,10 +380,10 @@ impl SimulatedBleDiscoverySource {
                     .next()
                     .and_then(|value| value.trim().parse::<i16>().ok());
                 let kind = if let Some(ad) = seed_raw.strip_prefix("ad:") {
-                    let (primary_advertisement_hex, scan_response_hex) = ad.split_once("|sr:")?;
+                    let (ad_hex, addr) = ad.split_once("|addr:")?;
                     SimulatedSignalSeedKind::Canonical {
-                        primary_advertisement_hex: primary_advertisement_hex.trim().to_string(),
-                        scan_response_hex: scan_response_hex.trim().to_string(),
+                        ad_hex: ad_hex.trim().to_string(),
+                        ble_address: addr.trim().to_string(),
                     }
                 } else {
                     let peer_hint = seed_raw.to_string();
@@ -304,31 +416,21 @@ impl BleDiscoverySource for SimulatedBleDiscoverySource {
         for seed in &self.pending {
             match &seed.kind {
                 SimulatedSignalSeedKind::Canonical {
-                    primary_advertisement_hex,
-                    scan_response_hex,
+                    ad_hex,
+                    ble_address,
                 } => {
-                    let Some(primary_advertisement) = hex_decode(primary_advertisement_hex) else {
+                    let Some(ad_bytes) = hex_decode(ad_hex) else {
                         report.rejected.push(build_rejection(
                             BleParseReject::MalformedAdStructure,
                             "simulated",
-                            format!(
-                                "invalid primary advertisement hex: {primary_advertisement_hex}"
-                            ),
-                        ));
-                        continue;
-                    };
-                    let Some(scan_response) = hex_decode(scan_response_hex) else {
-                        report.rejected.push(build_rejection(
-                            BleParseReject::MalformedAdStructure,
-                            "simulated",
-                            format!("invalid scan response hex: {scan_response_hex}"),
+                            format!("invalid ad hex: {ad_hex}"),
                         ));
                         continue;
                     };
 
-                    match parse_ble_identity_v1(&primary_advertisement, &scan_response) {
-                        Ok(identity) => report.accepted.push(DiscoverySignal {
-                            peer_hint: identity.peer_hint(),
+                    match accept_v2_wakeup_hint(&ad_bytes) {
+                        Ok(()) => report.accepted.push(DiscoverySignal {
+                            peer_hint: ble_address.clone(),
                             observed_at_unix_ms: now_unix_ms,
                             rssi: seed.rssi,
                             bearer_type: "ble",
@@ -337,7 +439,7 @@ impl BleDiscoverySource for SimulatedBleDiscoverySource {
                         Err(reject) => report.rejected.push(build_rejection(
                             reject,
                             "simulated",
-                            "canonical payload rejected".to_string(),
+                            format!("wakeup hint rejected for address={ble_address}"),
                         )),
                     }
                 }
@@ -355,6 +457,8 @@ impl BleDiscoverySource for SimulatedBleDiscoverySource {
         report
     }
 }
+
+// ── BlueZ D-Bus source ─────────────────────────────────────────────────────
 
 pub struct BluetoothCtlDiscoverySource {
     poll_interval: Duration,
@@ -440,6 +544,8 @@ impl BluetoothCtlDiscoverySource {
     }
 }
 
+// ── BlueZ D-Bus helpers ────────────────────────────────────────────────────
+
 fn read_bluez_managed_objects(connection: &Connection) -> Option<BluezManagedObjects> {
     let proxy = connection.with_proxy("org.bluez", "/", Duration::from_millis(1200));
     proxy.get_managed_objects().ok()
@@ -461,6 +567,11 @@ fn request_bluez_start_discovery(connection: &Connection, adapter_path: &str) {
     let _: Result<(), _> = proxy.method_call("org.bluez.Adapter1", "StartDiscovery", ());
 }
 
+/// Parse BlueZ D-Bus managed objects for v2 wakeup hints.
+///
+/// Acceptance: device exposes the Aethos UUID in its `UUIDs` property.
+/// The BLE address is used as the `peer_hint` (unstable, for debounce only).
+/// Any service data (0x21) is ignored per v2 §6.3.
 fn parse_bluez_managed_objects(
     managed: &BluezManagedObjects,
     now_unix_ms: u64,
@@ -478,41 +589,17 @@ fn parse_bluez_managed_objects(
         let has_primary_uuid = prop_string_array(device, "UUIDs")
             .iter()
             .any(|uuid| uuid_matches_aethos_primary(uuid));
-        let service_data = prop_service_data(device);
-        let primary_service_data = service_data
-            .iter()
-            .find(|(uuid, _)| uuid_matches_aethos_primary(uuid))
-            .map(|(_, payload)| payload.clone());
 
         if has_primary_uuid {
-            if let Some(payload) = primary_service_data {
-                match parse_identity_payload_v1_from_service_data(&payload) {
-                    Ok(identity) => report.accepted.push(DiscoverySignal {
-                        peer_hint: identity.peer_hint(),
-                        observed_at_unix_ms: now_unix_ms,
-                        rssi,
-                        bearer_type: "ble",
-                        source: "bluez-dbus",
-                    }),
-                    Err(reject) => report.rejected.push(build_rejection(
-                        reject,
-                        "bluez-dbus",
-                        format!(
-                            "device={} name={} payload_len={}",
-                            address,
-                            name,
-                            payload.len()
-                        ),
-                    )),
-                }
-                continue;
-            }
-
-            report.rejected.push(build_rejection(
-                BleParseReject::MissingIdentityPayload,
-                "bluez-dbus",
-                format!("device={} name={}", address, name),
-            ));
+            // V2: UUID presence is sufficient. No payload inspection.
+            // Service data (0x21) is ignored per §6.3.
+            report.accepted.push(DiscoverySignal {
+                peer_hint: address.clone(),
+                observed_at_unix_ms: now_unix_ms,
+                rssi,
+                bearer_type: "ble",
+                source: "bluez-dbus",
+            });
             continue;
         }
 
@@ -545,6 +632,8 @@ fn parse_bluez_managed_objects(
     report
 }
 
+// ── D-Bus property helpers ─────────────────────────────────────────────────
+
 fn prop_string(props: &PropMap, key: &str) -> Option<String> {
     props.get(key)?.0.as_str().map(|value| value.to_string())
 }
@@ -565,6 +654,7 @@ fn prop_string_array(props: &PropMap, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+#[allow(dead_code)]
 fn prop_service_data(props: &PropMap) -> HashMap<String, Vec<u8>> {
     let mut out = HashMap::new();
     let Some(raw) = props.get("ServiceData") else {
@@ -615,6 +705,8 @@ fn refarg_bytes(arg: &dyn RefArg) -> Option<Vec<u8>> {
     Some(out)
 }
 
+// ── UUID matching ───────────────────────────────────────────────────────────
+
 fn uuid_matches_aethos_primary(raw: &str) -> bool {
     normalize_uuid_text(raw) == normalize_uuid_text(AETHOS_BLE_PRIMARY_SERVICE_UUID)
 }
@@ -626,40 +718,7 @@ fn normalize_uuid_text(raw: &str) -> String {
         .collect::<String>()
 }
 
-fn parse_identity_payload_v1_from_service_data(
-    payload: &[u8],
-) -> Result<BleIdentityPayloadV1, BleParseReject> {
-    if payload.len() != BLE_IDENTITY_V1_PAYLOAD_LEN {
-        return Err(BleParseReject::MalformedPayloadLength);
-    }
-    if payload[0] != BLE_IDENTITY_V1_VERSION {
-        return Err(BleParseReject::UnsupportedVersion);
-    }
-    let flags = payload[1];
-    if flags & 0b1111_1100 != 0 {
-        return Err(BleParseReject::ReservedFlagBitsSet);
-    }
-    let capabilities_raw = u16::from_le_bytes([payload[2], payload[3]]);
-    let mut identity_ref = [0u8; BLE_IDENTITY_V1_IDENTITY_REF_LEN];
-    identity_ref.copy_from_slice(&payload[4..12]);
-    if identity_ref.iter().all(|byte| *byte == 0) {
-        return Err(BleParseReject::InvalidOrZeroIdentityRef);
-    }
-    let normalized_bits = capabilities_raw & 0x0007;
-    Ok(BleIdentityPayloadV1 {
-        version: payload[0],
-        identity_rotating: flags & 0x01 != 0,
-        identity_private: flags & 0x02 != 0,
-        capabilities: BleIdentityCapabilities {
-            lan: normalized_bits & 0x0001 != 0,
-            mpc: normalized_bits & 0x0002 != 0,
-            relay: normalized_bits & 0x0004 != 0,
-            normalized_bits,
-            raw_bits: capabilities_raw,
-        },
-        identity_ref,
-    })
-}
+// ── bluetoothctl text parser ────────────────────────────────────────────────
 
 fn parse_bluetoothctl_devices(
     raw: &str,
@@ -708,58 +767,10 @@ fn parse_bluetoothctl_devices(
     report
 }
 
-fn parse_ble_identity_v1(
-    primary_advertisement: &[u8],
-    scan_response: &[u8],
-) -> Result<BleIdentityPayloadV1, BleParseReject> {
-    ensure_primary_uuid_list_contains_aethos(primary_advertisement)?;
-    let scan_payload = extract_identity_payload_from_pdu(scan_response)?;
-    let primary_payload = extract_identity_payload_from_pdu(primary_advertisement)?;
-    let payload = match (scan_payload, primary_payload) {
-        (Some(scan), Some(primary)) => {
-            if scan != primary {
-                return Err(BleParseReject::ConflictingIdentityPayloadCopies);
-            }
-            scan
-        }
-        (Some(scan), None) => scan,
-        (None, Some(primary)) => primary,
-        (None, None) => return Err(BleParseReject::MissingIdentityPayload),
-    };
+// ── AD structure parsing (reused from v1, unchanged) ────────────────────────
 
-    if payload.len() != BLE_IDENTITY_V1_PAYLOAD_LEN {
-        return Err(BleParseReject::MalformedPayloadLength);
-    }
-    if payload[0] != BLE_IDENTITY_V1_VERSION {
-        return Err(BleParseReject::UnsupportedVersion);
-    }
-    let flags = payload[1];
-    if flags & 0b1111_1100 != 0 {
-        return Err(BleParseReject::ReservedFlagBitsSet);
-    }
-    let capabilities_raw = u16::from_le_bytes([payload[2], payload[3]]);
-    let mut identity_ref = [0u8; BLE_IDENTITY_V1_IDENTITY_REF_LEN];
-    identity_ref.copy_from_slice(&payload[4..12]);
-    if identity_ref.iter().all(|byte| *byte == 0) {
-        return Err(BleParseReject::InvalidOrZeroIdentityRef);
-    }
-
-    let normalized_bits = capabilities_raw & 0x0007;
-    Ok(BleIdentityPayloadV1 {
-        version: payload[0],
-        identity_rotating: flags & 0x01 != 0,
-        identity_private: flags & 0x02 != 0,
-        capabilities: BleIdentityCapabilities {
-            lan: normalized_bits & 0x0001 != 0,
-            mpc: normalized_bits & 0x0002 != 0,
-            relay: normalized_bits & 0x0004 != 0,
-            normalized_bits,
-            raw_bits: capabilities_raw,
-        },
-        identity_ref,
-    })
-}
-
+/// Check that a raw AD byte stream contains the Aethos primary UUID in an
+/// AD type 0x06 or 0x07 UUID-list with valid structure.
 fn ensure_primary_uuid_list_contains_aethos(
     primary_advertisement: &[u8],
 ) -> Result<(), BleParseReject> {
@@ -786,27 +797,6 @@ fn ensure_primary_uuid_list_contains_aethos(
     }
 }
 
-fn extract_identity_payload_from_pdu(pdu: &[u8]) -> Result<Option<Vec<u8>>, BleParseReject> {
-    let ad_structures = parse_ad_structures(pdu)?;
-    let mut payload: Option<Vec<u8>> = None;
-    for (ad_type, data) in ad_structures {
-        if ad_type != 0x21 {
-            continue;
-        }
-        if data.len() < 16 {
-            return Err(BleParseReject::MalformedPayloadLength);
-        }
-        if data[0..16] != AETHOS_BLE_PRIMARY_SERVICE_UUID_LE {
-            continue;
-        }
-        if payload.is_some() {
-            return Err(BleParseReject::DuplicateIdentityPayloadInPdu);
-        }
-        payload = Some(data[16..].to_vec());
-    }
-    Ok(payload)
-}
-
 fn parse_ad_structures(raw: &[u8]) -> Result<Vec<(u8, &[u8])>, BleParseReject> {
     let mut entries = Vec::new();
     let mut cursor = 0usize;
@@ -827,6 +817,8 @@ fn parse_ad_structures(raw: &[u8]) -> Result<Vec<(u8, &[u8])>, BleParseReject> {
     Ok(entries)
 }
 
+// ── Rejection builder ───────────────────────────────────────────────────────
+
 fn build_rejection(
     reject: BleParseReject,
     source: &'static str,
@@ -839,6 +831,8 @@ fn build_rejection(
         detail,
     }
 }
+
+// ── Hex helpers ─────────────────────────────────────────────────────────────
 
 fn hex_decode(raw: &str) -> Option<Vec<u8>> {
     let cleaned = raw
@@ -856,6 +850,7 @@ fn hex_decode(raw: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+#[allow(dead_code)]
 fn bytes_to_hex_lower(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -873,11 +868,14 @@ fn nibble_to_hex(value: u8) -> char {
     }
 }
 
+// ── Public helpers ──────────────────────────────────────────────────────────
+
 #[allow(dead_code)]
 pub fn canonical_ble_primary_service_uuid() -> &'static str {
     AETHOS_BLE_PRIMARY_SERVICE_UUID
 }
 
+/// Build a conforming v2 advertisement PDU: AD type 0x07 with the Aethos UUID.
 #[allow(dead_code)]
 pub fn build_primary_uuid_list_ad() -> Vec<u8> {
     let mut out = vec![17u8, 0x07u8];
@@ -885,91 +883,126 @@ pub fn build_primary_uuid_list_ad() -> Vec<u8> {
     out
 }
 
-#[allow(dead_code)]
-pub fn build_identity_service_data_ad(payload: &BleIdentityPayloadV1) -> Vec<u8> {
-    let mut out = vec![29u8, 0x21u8];
-    out.extend_from_slice(&AETHOS_BLE_PRIMARY_SERVICE_UUID_LE);
-    out.push(payload.version);
-    let mut flags = 0u8;
-    if payload.identity_rotating {
-        flags |= 0x01;
-    }
-    if payload.identity_private {
-        flags |= 0x02;
-    }
-    out.push(flags);
-    out.extend_from_slice(&payload.capabilities.raw_bits.to_le_bytes());
-    out.extend_from_slice(&payload.identity_ref);
-    out
-}
+// ── Tests ───────────────────────────────────────────────────────────────────
 
-#[allow(dead_code)]
-pub fn parse_canonical_ble_observation(
-    primary_advertisement: &[u8],
-    scan_response: &[u8],
-    now_unix_ms: u64,
-    rssi: Option<i16>,
-    source: &'static str,
-) -> Result<DiscoverySignal, BleObservationRejection> {
-    let identity =
-        parse_ble_identity_v1(primary_advertisement, scan_response).map_err(|reject| {
-            build_rejection(
-                reject,
-                source,
-                format!(
-                    "uuid={} primary_len={} scan_len={}",
-                    AETHOS_BLE_PRIMARY_SERVICE_UUID,
-                    primary_advertisement.len(),
-                    scan_response.len()
-                ),
-            )
-        })?;
-    Ok(DiscoverySignal {
-        peer_hint: identity.peer_hint(),
-        observed_at_unix_ms: now_unix_ms,
-        rssi,
-        bearer_type: "ble",
-        source,
-    })
-}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde::Deserialize;
-    use std::fs;
-    use std::path::{Path, PathBuf};
 
-    fn canonical_primary_advertisement() -> Vec<u8> {
+    // ── AD byte builders for test convenience ───────────────────────────
+
+    /// Canonical v2 advertisement: AD type 0x07 with the Aethos UUID only.
+    fn v2_uuid_only_ad() -> Vec<u8> {
         build_primary_uuid_list_ad()
     }
 
-    fn canonical_scan_response(
-        payload_overrides: Option<[u8; BLE_IDENTITY_V1_PAYLOAD_LEN]>,
-    ) -> Vec<u8> {
-        let payload = payload_overrides.unwrap_or([
-            0x01, 0x03, 0x07, 0x00, 0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe,
-        ]);
-        let mut out = vec![29u8, 0x21u8];
+    /// AD type 0x06 (Incomplete List) with the Aethos UUID.
+    fn v2_uuid_incomplete_list_ad() -> Vec<u8> {
+        let mut out = vec![17u8, 0x06u8];
         out.extend_from_slice(&AETHOS_BLE_PRIMARY_SERVICE_UUID_LE);
-        out.extend_from_slice(&payload);
         out
     }
 
+    /// AD with Aethos UUID in 0x07 AND a legacy 0x21 service data entry.
+    fn v2_uuid_with_service_data_ad() -> Vec<u8> {
+        let mut out = v2_uuid_only_ad();
+        // Append AD type 0x21 with Aethos UUID + 12 bytes of junk payload
+        let mut sd = vec![29u8, 0x21u8];
+        sd.extend_from_slice(&AETHOS_BLE_PRIMARY_SERVICE_UUID_LE);
+        sd.extend_from_slice(&[
+            0x01, 0x03, 0x07, 0x00, 0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe,
+        ]);
+        out.extend_from_slice(&sd);
+        out
+    }
+
+    /// AD with no Aethos UUID at all.
+    fn non_aethos_ad() -> Vec<u8> {
+        let mut out = vec![17u8, 0x07u8];
+        // Random non-Aethos UUID
+        out.extend_from_slice(&[0x00; 16]);
+        out
+    }
+
+    // ── accept_v2_wakeup_hint tests ─────────────────────────────────────
+
     #[test]
-    fn simulated_source_emits_once_for_deterministic_harness() {
-        let mut source = SimulatedBleDiscoverySource::from_env_string(
-            "ad:11074eee0dd26c0ef787f950295a85a51a18|sr:1d214eee0dd26c0ef787f950295a85a51a1801030700deadbeefcafebabe@-55,peer-beta@-49",
-        );
-        let first = source.poll_signals(1000);
-        assert_eq!(first.len(), 2);
-        assert_eq!(first[0].peer_hint, "ble-idref:deadbeefcafebabe");
-        assert_eq!(first[0].rssi, Some(-55));
-        let second = source.poll_signals(2000);
-        assert!(second.is_empty());
+    fn v2_uuid_in_0x07_is_accepted() {
+        assert!(accept_v2_wakeup_hint(&v2_uuid_only_ad()).is_ok());
     }
 
     #[test]
-    fn gate_dedupes_duplicate_signals_within_window() {
+    fn v2_uuid_in_0x06_is_accepted() {
+        assert!(accept_v2_wakeup_hint(&v2_uuid_incomplete_list_ad()).is_ok());
+    }
+
+    #[test]
+    fn v2_uuid_absent_is_rejected() {
+        let err = accept_v2_wakeup_hint(&non_aethos_ad()).unwrap_err();
+        assert_eq!(err, BleParseReject::MissingPrimaryServiceUuid);
+    }
+
+    #[test]
+    fn v2_service_data_alongside_uuid_is_ignored_and_accepted() {
+        // §6.3: presence of 0x21 does not invalidate the wakeup hint.
+        assert!(accept_v2_wakeup_hint(&v2_uuid_with_service_data_ad()).is_ok());
+    }
+
+    #[test]
+    fn v2_invalid_uuid_list_length_is_rejected() {
+        // 0x07 entry with 15 bytes (not multiple of 16)
+        let ad = vec![
+            16u8, 0x07u8, 0x4e, 0xee, 0x0d, 0xd2, 0x6c, 0x0e, 0xf7, 0x87, 0xf9, 0x50, 0x29, 0x5a,
+            0x85, 0xa5, 0x1a,
+        ];
+        let err = accept_v2_wakeup_hint(&ad).unwrap_err();
+        assert_eq!(err, BleParseReject::MalformedPrimaryServiceUuidList);
+    }
+
+    #[test]
+    fn v2_empty_advertisement_is_rejected() {
+        let err = accept_v2_wakeup_hint(&[]).unwrap_err();
+        assert_eq!(err, BleParseReject::MissingPrimaryServiceUuid);
+    }
+
+    #[test]
+    fn v2_malformed_ad_structure_is_rejected() {
+        // Length byte claims more data than available
+        let ad = vec![0x20, 0x07, 0x01];
+        let err = accept_v2_wakeup_hint(&ad).unwrap_err();
+        assert_eq!(err, BleParseReject::MalformedAdStructure);
+    }
+
+    // ── accept_v2_wakeup_observation tests ──────────────────────────────
+
+    #[test]
+    fn v2_observation_returns_signal_with_ble_address_as_peer_hint() {
+        let signal = accept_v2_wakeup_observation(
+            &v2_uuid_only_ad(),
+            "AA:BB:CC:DD:EE:FF",
+            1000,
+            Some(-55),
+            "test",
+        )
+        .expect("must accept");
+        assert_eq!(signal.peer_hint, "AA:BB:CC:DD:EE:FF");
+        assert_eq!(signal.observed_at_unix_ms, 1000);
+        assert_eq!(signal.rssi, Some(-55));
+        assert_eq!(signal.bearer_type, "ble");
+    }
+
+    #[test]
+    fn v2_observation_rejects_missing_uuid() {
+        let err =
+            accept_v2_wakeup_observation(&non_aethos_ad(), "AA:BB:CC:DD:EE:FF", 1000, None, "test")
+                .expect_err("must reject");
+        assert_eq!(err.reason_code, "missing_primary_service_uuid");
+    }
+
+    // ── Debounce gate tests ─────────────────────────────────────────────
+
+    #[test]
+    fn gate_debounces_duplicate_signals_within_window() {
         struct InlineSource {
             frames: Vec<Vec<DiscoverySignal>>,
         }
@@ -983,35 +1016,40 @@ mod tests {
         }
 
         let signal = DiscoverySignal {
-            peer_hint: "peer-1".to_string(),
+            peer_hint: "AA:BB:CC:DD:EE:FF".to_string(),
             observed_at_unix_ms: 1000,
             rssi: Some(-60),
             bearer_type: "ble",
             source: "test",
         };
         let signal_soon = DiscoverySignal {
-            observed_at_unix_ms: 1500,
+            observed_at_unix_ms: 5000,
             ..signal.clone()
         };
         let signal_later = DiscoverySignal {
-            observed_at_unix_ms: 9000,
+            observed_at_unix_ms: 35_000,
             ..signal
         };
         let mut source = InlineSource {
             frames: vec![vec![signal_soon.clone()], vec![signal_later.clone()]],
         };
-        let mut gate = BleDiscoveryGate::new(Duration::from_secs(5));
-        gate.last_seen_by_peer.insert("peer-1".to_string(), 1000);
+        // 30s debounce window (v2 default)
+        let mut gate = BleDiscoveryGate::new(Duration::from_secs(30));
+        gate.last_seen_by_address
+            .insert("AA:BB:CC:DD:EE:FF".to_string(), 1000);
 
-        let first = gate.poll_ready(&mut source, 1500);
+        // 5s after last seen — within 30s window, should be debounced
+        let first = gate.poll_ready(&mut source, 5000);
         assert!(first.is_empty());
-        let second = gate.poll_ready(&mut source, 9000);
+
+        // 35s after last seen — outside 30s window, should pass
+        let second = gate.poll_ready(&mut source, 35_000);
         assert_eq!(second.len(), 1);
-        assert_eq!(second[0].observed_at_unix_ms, 9000);
+        assert_eq!(second[0].observed_at_unix_ms, 35_000);
     }
 
     #[test]
-    fn gate_reports_deduped_counts_for_visibility_layers() {
+    fn gate_reports_deduped_counts() {
         struct InlineSource {
             signals: Vec<DiscoverySignal>,
         }
@@ -1021,19 +1059,20 @@ mod tests {
             }
         }
 
-        let mut gate = BleDiscoveryGate::new(Duration::from_secs(5));
-        gate.last_seen_by_peer.insert("peer-a".to_string(), 10_000);
+        let mut gate = BleDiscoveryGate::new(Duration::from_secs(30));
+        gate.last_seen_by_address
+            .insert("AA:BB:CC:DD:EE:FF".to_string(), 10_000);
         let mut source = InlineSource {
             signals: vec![
                 DiscoverySignal {
-                    peer_hint: "peer-a".to_string(),
+                    peer_hint: "AA:BB:CC:DD:EE:FF".to_string(),
                     observed_at_unix_ms: 12_000,
                     rssi: Some(-55),
                     bearer_type: "ble",
                     source: "test",
                 },
                 DiscoverySignal {
-                    peer_hint: "peer-b".to_string(),
+                    peer_hint: "11:22:33:44:55:66".to_string(),
                     observed_at_unix_ms: 12_000,
                     rssi: Some(-57),
                     bearer_type: "ble",
@@ -1045,9 +1084,63 @@ mod tests {
         let result = gate.poll_ready_with_stats(&mut source, 12_000);
         assert_eq!(result.deduped_count, 1);
         assert_eq!(result.ready.len(), 1);
-        assert_eq!(result.ready[0].peer_hint, "peer-b");
+        assert_eq!(result.ready[0].peer_hint, "11:22:33:44:55:66");
         assert!(result.rejected.is_empty());
     }
+
+    // ── Activation window tests ─────────────────────────────────────────
+
+    #[test]
+    fn activation_window_opens_and_limits_concurrent() {
+        let mut tracker = ActivationWindowTracker::new(Duration::from_secs(30), 2);
+        assert!(tracker.open_window("AA:BB:CC:DD:EE:FF"));
+        assert!(tracker.open_window("11:22:33:44:55:66"));
+        // Third should be rejected (max 2)
+        assert!(!tracker.open_window("77:88:99:AA:BB:CC"));
+        assert_eq!(tracker.active_count(), 2);
+    }
+
+    #[test]
+    fn activation_window_allows_reopening_existing_address() {
+        let mut tracker = ActivationWindowTracker::new(Duration::from_secs(30), 1);
+        assert!(tracker.open_window("AA:BB:CC:DD:EE:FF"));
+        // Same address should succeed even at capacity
+        assert!(tracker.open_window("AA:BB:CC:DD:EE:FF"));
+        assert_eq!(tracker.active_count(), 1);
+    }
+
+    // ── Simulated source tests (v2 format) ──────────────────────────────
+
+    #[test]
+    fn simulated_source_v2_accepts_uuid_only_ad() {
+        let ad_hex = "11074eee0dd26c0ef787f950295a85a51a18";
+        let env_str = format!("ad:{ad_hex}|addr:AA:BB:CC:DD:EE:FF@-55,peer-beta@-49");
+        let mut source = SimulatedBleDiscoverySource::from_env_string(&env_str);
+        let first = source.poll_signals(1000);
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].peer_hint, "AA:BB:CC:DD:EE:FF");
+        assert_eq!(first[0].rssi, Some(-55));
+        assert_eq!(first[1].peer_hint, "peer-beta");
+        let second = source.poll_signals(2000);
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn simulated_source_v2_rejects_missing_uuid() {
+        // AD with non-Aethos UUID
+        let ad_hex = "110700000000000000000000000000000000";
+        let env_str = format!("ad:{ad_hex}|addr:AA:BB:CC:DD:EE:FF@-55");
+        let mut source = SimulatedBleDiscoverySource::from_env_string(&env_str);
+        let report = source.poll_signals_with_diagnostics(1000);
+        assert!(report.accepted.is_empty());
+        assert_eq!(report.rejected.len(), 1);
+        assert_eq!(
+            report.rejected[0].reason_code,
+            "missing_primary_service_uuid"
+        );
+    }
+
+    // ── bluetoothctl parser tests ───────────────────────────────────────
 
     #[test]
     fn parser_supports_aethos_name_or_ephemeral_fallback() {
@@ -1065,273 +1158,23 @@ mod tests {
         assert_eq!(legacy.accepted[0].peer_hint, "wayfarer-peer");
     }
 
+    // ── AD structure parsing tests ──────────────────────────────────────
+
     #[test]
-    fn canonical_advertisement_is_accepted() {
-        let parsed = parse_ble_identity_v1(
-            &canonical_primary_advertisement(),
-            &canonical_scan_response(None),
-        )
-        .expect("must parse canonical identity");
-        assert_eq!(parsed.version, 1);
-        assert!(parsed.identity_rotating);
-        assert!(parsed.identity_private);
-        assert_eq!(parsed.peer_hint(), "ble-idref:deadbeefcafebabe");
+    fn parse_ad_structures_returns_correct_types_and_data() {
+        let ad = v2_uuid_only_ad();
+        let structures = parse_ad_structures(&ad).expect("valid AD");
+        assert_eq!(structures.len(), 1);
+        assert_eq!(structures[0].0, 0x07);
+        assert_eq!(structures[0].1, &AETHOS_BLE_PRIMARY_SERVICE_UUID_LE[..]);
     }
 
     #[test]
-    fn wrong_uuid_is_rejected() {
-        let mut primary = canonical_primary_advertisement();
-        primary[2] = 0xff;
-        let error = parse_ble_identity_v1(&primary, &canonical_scan_response(None))
-            .expect_err("must reject wrong uuid");
-        assert_eq!(error.as_reason_label(), "missing primary service UUID");
-    }
-
-    #[test]
-    fn malformed_payload_length_is_rejected() {
-        let mut scan = canonical_scan_response(None);
-        scan[0] = 0x1e;
-        scan.push(0xff);
-        let error = parse_ble_identity_v1(&canonical_primary_advertisement(), &scan)
-            .expect_err("must reject malformed payload length");
-        assert_eq!(error.as_reason_label(), "malformed payload length");
-    }
-
-    #[test]
-    fn unsupported_version_is_rejected() {
-        let mut payload = [0u8; BLE_IDENTITY_V1_PAYLOAD_LEN];
-        payload.copy_from_slice(&[0x02, 0x03, 0x07, 0x00, 1, 2, 3, 4, 5, 6, 7, 8]);
-        let error = parse_ble_identity_v1(
-            &canonical_primary_advertisement(),
-            &canonical_scan_response(Some(payload)),
-        )
-        .expect_err("must reject unsupported version");
-        assert_eq!(error.as_reason_label(), "unsupported version");
-    }
-
-    #[test]
-    fn zero_identity_ref_is_rejected() {
-        let payload = [0x01, 0x03, 0x07, 0x00, 0, 0, 0, 0, 0, 0, 0, 0];
-        let error = parse_ble_identity_v1(
-            &canonical_primary_advertisement(),
-            &canonical_scan_response(Some(payload)),
-        )
-        .expect_err("must reject zero identity_ref");
-        assert_eq!(error.as_reason_label(), "invalid or zero identity_ref");
-    }
-
-    #[test]
-    fn capabilities_decode_is_normalized_and_forward_compatible() {
-        let payload = [0x01, 0x00, 0x0f, 0x80, 1, 2, 3, 4, 5, 6, 7, 8];
-        let parsed = parse_ble_identity_v1(
-            &canonical_primary_advertisement(),
-            &canonical_scan_response(Some(payload)),
-        )
-        .expect("must parse capabilities");
-        assert_eq!(parsed.capabilities.raw_bits, 0x800f);
-        assert_eq!(parsed.capabilities.normalized_bits, 0x0007);
-        assert!(parsed.capabilities.lan);
-        assert!(parsed.capabilities.mpc);
-        assert!(parsed.capabilities.relay);
-    }
-
-    #[test]
-    fn parse_canonical_observation_returns_structured_rejection_reason() {
-        let mut primary = canonical_primary_advertisement();
-        primary[0] = 16;
-        let rejected = parse_canonical_ble_observation(
-            &primary,
-            &canonical_scan_response(None),
-            10,
-            None,
-            "test",
-        )
-        .expect_err("must reject malformed advertisement");
-        assert_eq!(rejected.reason_code, "malformed_ad_structure");
-        assert_eq!(rejected.reason_label, "malformed AD structure");
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct FixtureManifest {
-        fixtures: Vec<FixtureManifestEntry>,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct FixtureManifestEntry {
-        fixture: String,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct BleIdentityFixture {
-        #[serde(rename = "fixtureID")]
-        fixture_id: String,
-        #[serde(rename = "primaryAdvertisementHex")]
-        primary_advertisement_hex: String,
-        #[serde(rename = "scanResponseHex")]
-        scan_response_hex: String,
-        expected: BleIdentityFixtureExpected,
-    }
-
-    #[derive(Debug, Deserialize)]
-    #[serde(tag = "outcome", rename_all = "lowercase")]
-    enum BleIdentityFixtureExpected {
-        Accepted {
-            #[serde(rename = "peerHint")]
-            peer_hint: String,
-            version: u8,
-            #[serde(rename = "identityRotating")]
-            identity_rotating: bool,
-            #[serde(rename = "identityPrivate")]
-            identity_private: bool,
-            #[serde(rename = "capabilitiesNormalizedBits")]
-            capabilities_normalized_bits: u16,
-            #[serde(rename = "capabilitiesRawBits")]
-            capabilities_raw_bits: u16,
-        },
-        Rejected {
-            #[serde(rename = "reasonCode")]
-            reason_code: String,
-            #[serde(rename = "reasonLabel")]
-            reason_label: String,
-        },
-    }
-
-    fn fixture_suite_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("test-data/ble/identity-v1")
-    }
-
-    #[test]
-    fn fixture_suite_matches_canonical_acceptance_and_rejection_diagnostics() {
-        let manifest_path = fixture_suite_root().join("manifest.json");
-        let manifest_raw = fs::read_to_string(&manifest_path)
-            .unwrap_or_else(|err| panic!("failed reading {}: {err}", manifest_path.display()));
-        let manifest: FixtureManifest = serde_json::from_str(&manifest_raw)
-            .unwrap_or_else(|err| panic!("failed parsing {}: {err}", manifest_path.display()));
-
-        assert!(
-            !manifest.fixtures.is_empty(),
-            "fixture manifest must include at least one vector"
-        );
-
-        for entry in manifest.fixtures {
-            let fixture_path = fixture_suite_root().join(entry.fixture.trim_start_matches("./"));
-            let raw = fs::read_to_string(&fixture_path)
-                .unwrap_or_else(|err| panic!("failed reading {}: {err}", fixture_path.display()));
-            let fixture: BleIdentityFixture = serde_json::from_str(&raw)
-                .unwrap_or_else(|err| panic!("failed parsing {}: {err}", fixture_path.display()));
-
-            let primary = hex_decode(&fixture.primary_advertisement_hex).unwrap_or_else(|| {
-                panic!(
-                    "fixture {} has invalid primaryAdvertisementHex",
-                    fixture.fixture_id
-                )
-            });
-            let scan = hex_decode(&fixture.scan_response_hex).unwrap_or_else(|| {
-                panic!("fixture {} has invalid scanResponseHex", fixture.fixture_id)
-            });
-
-            match fixture.expected {
-                BleIdentityFixtureExpected::Accepted {
-                    peer_hint,
-                    version,
-                    identity_rotating,
-                    identity_private,
-                    capabilities_normalized_bits,
-                    capabilities_raw_bits,
-                } => {
-                    let parsed = parse_ble_identity_v1(&primary, &scan).unwrap_or_else(|err| {
-                        panic!(
-                            "fixture {} expected accepted but got rejection: {}",
-                            fixture.fixture_id,
-                            err.as_reason_code()
-                        )
-                    });
-                    assert_eq!(
-                        parsed.peer_hint(),
-                        peer_hint,
-                        "fixture {}",
-                        fixture.fixture_id
-                    );
-                    assert_eq!(parsed.version, version, "fixture {}", fixture.fixture_id);
-                    assert_eq!(
-                        parsed.identity_rotating, identity_rotating,
-                        "fixture {}",
-                        fixture.fixture_id
-                    );
-                    assert_eq!(
-                        parsed.identity_private, identity_private,
-                        "fixture {}",
-                        fixture.fixture_id
-                    );
-                    assert_eq!(
-                        parsed.capabilities.normalized_bits, capabilities_normalized_bits,
-                        "fixture {}",
-                        fixture.fixture_id
-                    );
-                    assert_eq!(
-                        parsed.capabilities.raw_bits, capabilities_raw_bits,
-                        "fixture {}",
-                        fixture.fixture_id
-                    );
-
-                    let observation = parse_canonical_ble_observation(
-                        &primary,
-                        &scan,
-                        1_700_000_000_000,
-                        Some(-51),
-                        "fixture-suite",
-                    )
-                    .unwrap_or_else(|err| {
-                        panic!(
-                            "fixture {} expected accepted observation but got rejection: {}",
-                            fixture.fixture_id, err.reason_code
-                        )
-                    });
-                    assert_eq!(
-                        observation.peer_hint, peer_hint,
-                        "fixture {}",
-                        fixture.fixture_id
-                    );
-                }
-                BleIdentityFixtureExpected::Rejected {
-                    reason_code,
-                    reason_label,
-                } => {
-                    let rejection = parse_ble_identity_v1(&primary, &scan)
-                        .expect_err("fixture marked rejected must fail closed");
-                    assert_eq!(
-                        rejection.as_reason_code(),
-                        reason_code,
-                        "fixture {}",
-                        fixture.fixture_id
-                    );
-                    assert_eq!(
-                        rejection.as_reason_label(),
-                        reason_label,
-                        "fixture {}",
-                        fixture.fixture_id
-                    );
-
-                    let observation = parse_canonical_ble_observation(
-                        &primary,
-                        &scan,
-                        1_700_000_000_000,
-                        None,
-                        "fixture-suite",
-                    )
-                    .expect_err("fixture marked rejected must fail closed");
-                    assert_eq!(
-                        observation.reason_code, reason_code,
-                        "fixture {}",
-                        fixture.fixture_id
-                    );
-                    assert_eq!(
-                        observation.reason_label, reason_label,
-                        "fixture {}",
-                        fixture.fixture_id
-                    );
-                }
-            }
-        }
+    fn build_primary_uuid_list_ad_produces_valid_v2_advertisement() {
+        let ad = build_primary_uuid_list_ad();
+        // Must be accepted as a valid v2 wakeup hint
+        assert!(accept_v2_wakeup_hint(&ad).is_ok());
+        // Must be exactly 18 bytes: 1 (length) + 1 (type 0x07) + 16 (UUID)
+        assert_eq!(ad.len(), 18);
     }
 }

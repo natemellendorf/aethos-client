@@ -6,7 +6,7 @@ mod aethos_core;
 use std::process::ExitCode;
 
 use aethos_core::ble_discovery::{
-    canonical_ble_primary_service_uuid, parse_canonical_ble_observation,
+    accept_v2_wakeup_observation, canonical_ble_primary_service_uuid,
 };
 
 const AETHOS_PRIMARY_UUID_LE: [u8; 16] = [
@@ -30,28 +30,21 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let scan = match decode_hex(&args.scan_hex) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            eprintln!("invalid --scan hex: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
 
-    println!("BLE Identity Inspector v1");
+    println!("BLE Wakeup Inspector v2");
     println!("- canonical_uuid={}", canonical_ble_primary_service_uuid());
-    println!("- primary_len={} scan_len={}", primary.len(), scan.len());
+    println!("- primary_len={}", primary.len());
 
     println!("\nPrimary advertisement AD structures:");
     print_ad_summary(&primary);
-    println!("\nScan response AD structures:");
-    print_ad_summary(&scan);
 
     let now_ms = 0;
-    match parse_canonical_ble_observation(&primary, &scan, now_ms, None, "inspector") {
+    let ble_address = args.ble_address.as_deref().unwrap_or("00:00:00:00:00:00");
+    match accept_v2_wakeup_observation(&primary, ble_address, now_ms, None, "inspector") {
         Ok(signal) => {
-            println!("\nVerdict: ACCEPTED");
+            println!("\nVerdict: ACCEPTED (v2 wakeup hint)");
             println!("- peer_hint={}", signal.peer_hint);
+            println!("- source={}", signal.source);
             ExitCode::SUCCESS
         }
         Err(rejection) => {
@@ -67,7 +60,7 @@ fn main() -> ExitCode {
 
 struct ParsedArgs {
     primary_hex: String,
-    scan_hex: String,
+    ble_address: Option<String>,
 }
 
 fn parse_args(args: Vec<String>) -> Result<ParsedArgs, String> {
@@ -76,7 +69,7 @@ fn parse_args(args: Vec<String>) -> Result<ParsedArgs, String> {
     }
 
     let mut primary_hex: Option<String> = None;
-    let mut scan_hex: Option<String> = None;
+    let mut ble_address: Option<String> = None;
     let mut index = 0usize;
     while index < args.len() {
         match args[index].as_str() {
@@ -87,11 +80,11 @@ fn parse_args(args: Vec<String>) -> Result<ParsedArgs, String> {
                 primary_hex = Some(value.to_string());
                 index += 2;
             }
-            "--scan" | "--scan-response" => {
+            "--address" | "--addr" => {
                 let Some(value) = args.get(index + 1) else {
-                    return Err("--scan requires a value".to_string());
+                    return Err("--address requires a value".to_string());
                 };
-                scan_hex = Some(value.to_string());
+                ble_address = Some(value.to_string());
                 index += 2;
             }
             unexpected => {
@@ -106,12 +99,12 @@ fn parse_args(args: Vec<String>) -> Result<ParsedArgs, String> {
 
     Ok(ParsedArgs {
         primary_hex,
-        scan_hex: scan_hex.unwrap_or_default(),
+        ble_address,
     })
 }
 
 fn usage() -> &'static str {
-    "usage: cargo run --bin ble-identity-inspector -- --primary <hex> [--scan <hex>]\n\nexample:\n  cargo run --bin ble-identity-inspector -- --primary 11074eee0dd26c0ef787f950295a85a51a18 --scan 1d214eee0dd26c0ef787f950295a85a51a1801000100d6b6fc2bf0f08cdf"
+    "usage: cargo run --bin ble-identity-inspector -- --primary <hex> [--address <ble-addr>]\n\nIn v2 BLE is a discovery-only wakeup hint. Only the primary advertisement\nis inspected for the Aethos UUID in AD type 0x06/0x07. Scan response and\nidentity payloads are not used.\n\nexample:\n  cargo run --bin ble-identity-inspector -- --primary 11074eee0dd26c0ef787f950295a85a51a18\n  cargo run --bin ble-identity-inspector -- --primary 11074eee0dd26c0ef787f950295a85a51a18 --address AA:BB:CC:DD:EE:FF"
 }
 
 fn decode_hex(raw: &str) -> Result<Vec<u8>, String> {
@@ -175,33 +168,21 @@ fn print_ad_summary(raw: &[u8]) {
             }
         }
         if *ad_type == 0x21 {
+            // v2: service data is ignored by the scanner, but still useful to
+            // display for diagnostic purposes during the migration window.
             if data.len() < 16 {
-                println!("  service_data_error=missing_uuid_prefix");
+                println!("  service_data_note=short_entry (ignored in v2)");
                 continue;
             }
             let uuid = &data[0..16];
             let payload = &data[16..];
             let uuid_match = uuid == AETHOS_PRIMARY_UUID_LE;
             println!(
-                "  service_data_uuid={}{} payload_len={} payload={}",
+                "  service_data_uuid={}{} payload_len={} (ignored in v2)",
                 bytes_to_hex_lower(uuid),
                 if uuid_match { " (aethos-primary)" } else { "" },
-                payload.len(),
-                bytes_to_hex_lower(payload)
+                payload.len()
             );
-            if payload.len() == 12 {
-                let version = payload[0];
-                let flags = payload[1];
-                let capabilities = u16::from_le_bytes([payload[2], payload[3]]);
-                let identity_ref = &payload[4..12];
-                println!(
-                    "  payload_decoded=version:{} flags:0x{flags:02x} rotating:{} private:{} capabilities_raw:0x{capabilities:04x} identity_ref:{}",
-                    version,
-                    flags & 0x01 != 0,
-                    flags & 0x02 != 0,
-                    bytes_to_hex_lower(identity_ref)
-                );
-            }
         }
     }
 }
@@ -234,32 +215,15 @@ fn parse_ad_structures(raw: &[u8]) -> Result<Vec<(u8, Vec<u8>)>, String> {
 fn remediation_hint(reason_code: &str) -> &'static str {
     match reason_code {
         "missing_primary_service_uuid" => {
-            "Primary advertisement must include AD type 0x06/0x07 with Aethos UUID in little-endian BLE order."
+            "Primary advertisement must include AD type 0x06/0x07 with Aethos UUID in little-endian BLE order. See ble-identity-v2.md §4."
         }
         "malformed_primary_service_uuid_list" => {
             "AD type 0x06/0x07 data length must be an exact multiple of 16 bytes."
         }
-        "missing_identity_payload" => {
-            "Provide AD type 0x21 with Aethos UUID + 12-byte payload in scan response (preferred) or primary advertisement."
-        }
-        "duplicate_identity_payload" => {
-            "Each PDU can contain at most one Aethos AD type 0x21 entry."
-        }
-        "conflicting_identity_payload" => {
-            "If both primary and scan response include Aethos AD type 0x21, payload bytes must be identical."
-        }
-        "malformed_payload_length" => {
-            "Aethos AD type 0x21 payload after UUID must be exactly 12 bytes."
-        }
-        "unsupported_version" => "Payload byte 0 (version) must be 0x01 for v1.",
-        "reserved_flag_bits_set" => "Payload flags bits 2..7 must be zero.",
-        "invalid_or_zero_identity_ref" => {
-            "Payload identity_ref bytes 4..11 cannot be all zeros."
-        }
         "malformed_ad_structure" => {
             "One or more AD structures are malformed (length byte does not match available bytes)."
         }
-        _ => "See docs/protocol/ble-identity-v1.md for fail-closed checks.",
+        _ => "See docs/protocol/ble-identity-v2.md for v2 wakeup hint acceptance rules.",
     }
 }
 
