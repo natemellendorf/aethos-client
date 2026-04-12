@@ -15,7 +15,7 @@ mod aethos_core;
 #[path = "../../../../src/relay/mod.rs"]
 mod relay;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
@@ -2829,10 +2829,7 @@ fn start_gossip_worker_if_needed(initial_enabled: bool, initial_ble_discovery_en
                     AdvertiserPollEvent::Started(report) => {
                         log_info(&format!(
                             "ble_advertiser_started source={} mode={} uuid={} primary_ad={}",
-                            report.source,
-                            report.mode,
-                            report.uuid,
-                            report.primary_ad_hex
+                            report.source, report.mode, report.uuid, report.primary_ad_hex
                         ));
                     }
                     AdvertiserPollEvent::Error(err) => {
@@ -2995,8 +2992,6 @@ fn process_ble_discovery_signals(
         handle_ble_discovery_signal(encounters, &local_wayfarer_id, &signal, runtime);
     }
 }
-
-
 
 fn handle_ble_discovery_signal(
     encounters: &mut HashMap<String, EncounterManager>,
@@ -4922,14 +4917,8 @@ fn generate_share_qr_png(wayfarer_id: &str) -> Result<PathBuf, String> {
         }
     }
 
-    let monogram = a_monogram_icon_rgba((width / 6).max(36));
-    let monogram = image::imageops::resize(
-        &monogram,
-        monogram.width(),
-        monogram.height(),
-        FilterType::Triangle,
-    );
-    overlay_center(&mut rgba, &monogram);
+    let logo = aethos_logo_icon_rgba((width / 6).max(36))?;
+    overlay_center(&mut rgba, &logo);
 
     let path = share_qr_file_path();
     if let Some(parent) = path.parent() {
@@ -5003,90 +4992,116 @@ fn overlay_center(base: &mut RgbaImage, overlay: &RgbaImage) {
     }
 }
 
-fn a_monogram_icon_rgba(size: u32) -> RgbaImage {
-    let mut img = RgbaImage::from_pixel(size, size, Rgba([255, 255, 255, 0]));
-    let cx = size as f32 * 0.5;
-    let cy = size as f32 * 0.5;
-    let radius = size as f32 * 0.44;
+fn aethos_logo_icon_rgba(size: u32) -> Result<RgbaImage, String> {
+    let raw = include_bytes!("../../public/logo.png");
+    let decoded = image::load_from_memory(raw)
+        .map_err(|err| format!("failed to decode embedded Aethos logo: {err}"))?
+        .to_rgba8();
 
-    for y in 0..size {
-        for x in 0..size {
-            let dx = x as f32 - cx;
-            let dy = y as f32 - cy;
-            let dist = (dx * dx + dy * dy).sqrt();
-            if dist <= radius {
-                img.put_pixel(x, y, Rgba([250, 252, 255, 245]));
-            }
+    let width = decoded.width();
+    let height = decoded.height();
+    let mut backdrop = vec![false; (width * height) as usize];
+    let mut queue = VecDeque::new();
+
+    let mut push_if_backdrop = |x: u32, y: u32, queue: &mut VecDeque<(u32, u32)>| {
+        let idx = (y * width + x) as usize;
+        if backdrop[idx] {
+            return;
+        }
+        let pixel = decoded.get_pixel(x, y);
+        if !is_logo_backdrop_pixel(*pixel) {
+            return;
+        }
+        backdrop[idx] = true;
+        queue.push_back((x, y));
+    };
+
+    for x in 0..width {
+        push_if_backdrop(x, 0, &mut queue);
+        push_if_backdrop(x, height.saturating_sub(1), &mut queue);
+    }
+    for y in 0..height {
+        push_if_backdrop(0, y, &mut queue);
+        push_if_backdrop(width.saturating_sub(1), y, &mut queue);
+    }
+
+    while let Some((x, y)) = queue.pop_front() {
+        if x > 0 {
+            push_if_backdrop(x - 1, y, &mut queue);
+        }
+        if x + 1 < width {
+            push_if_backdrop(x + 1, y, &mut queue);
+        }
+        if y > 0 {
+            push_if_backdrop(x, y - 1, &mut queue);
+        }
+        if y + 1 < height {
+            push_if_backdrop(x, y + 1, &mut queue);
         }
     }
 
-    let stroke = Rgba([33, 79, 188, 255]);
-    let left_x = (size as f32 * 0.32) as i32;
-    let right_x = (size as f32 * 0.68) as i32;
-    let top_y = (size as f32 * 0.28) as i32;
-    let bottom_y = (size as f32 * 0.74) as i32;
-    let cross_y = (size as f32 * 0.54) as i32;
+    let mut cleaned = RgbaImage::from_pixel(width, height, Rgba([255, 255, 255, 0]));
+    let mut min_x = decoded.width();
+    let mut min_y = decoded.height();
+    let mut max_x = 0;
+    let mut max_y = 0;
+    let mut found_visible = false;
 
-    draw_line(
-        &mut img,
-        left_x,
-        bottom_y,
-        (size as f32 * 0.5) as i32,
-        top_y,
-        stroke,
-    );
-    draw_line(
-        &mut img,
-        right_x,
-        bottom_y,
-        (size as f32 * 0.5) as i32,
-        top_y,
-        stroke,
-    );
-    draw_line(
-        &mut img,
-        (size as f32 * 0.39) as i32,
-        cross_y,
-        (size as f32 * 0.61) as i32,
-        cross_y,
-        stroke,
-    );
+    for y in 0..decoded.height() {
+        for x in 0..decoded.width() {
+            let idx = (y * width + x) as usize;
+            if backdrop[idx] {
+                continue;
+            }
+            let pixel = decoded.get_pixel(x, y);
+            let [_, _, _, a] = pixel.0;
+            if a == 0 {
+                continue;
+            }
 
-    img
+            cleaned.put_pixel(x, y, *pixel);
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+            found_visible = true;
+        }
+    }
+
+    if !found_visible {
+        return Err(
+            "embedded Aethos logo had no visible pixels after background removal".to_string(),
+        );
+    }
+
+    let cropped =
+        image::imageops::crop_imm(&cleaned, min_x, min_y, max_x - min_x + 1, max_y - min_y + 1)
+            .to_image();
+
+    let longest_side = cropped.width().max(cropped.height()).max(1);
+    let scaled_width = ((cropped.width() * size) / longest_side).max(1);
+    let scaled_height = ((cropped.height() * size) / longest_side).max(1);
+    let resized =
+        image::imageops::resize(&cropped, scaled_width, scaled_height, FilterType::Lanczos3);
+
+    let mut canvas = RgbaImage::from_pixel(size, size, Rgba([255, 255, 255, 0]));
+    overlay_center(&mut canvas, &resized);
+    Ok(canvas)
 }
 
-fn draw_line(img: &mut RgbaImage, mut x0: i32, mut y0: i32, x1: i32, y1: i32, color: Rgba<u8>) {
-    let dx = (x1 - x0).abs();
-    let sx = if x0 < x1 { 1 } else { -1 };
-    let dy = -(y1 - y0).abs();
-    let sy = if y0 < y1 { 1 } else { -1 };
-    let mut err = dx + dy;
-
-    loop {
-        for oy in -1..=1 {
-            for ox in -1..=1 {
-                let px = x0 + ox;
-                let py = y0 + oy;
-                if px >= 0 && py >= 0 && (px as u32) < img.width() && (py as u32) < img.height() {
-                    img.put_pixel(px as u32, py as u32, color);
-                }
-            }
-        }
-
-        if x0 == x1 && y0 == y1 {
-            break;
-        }
-
-        let e2 = 2 * err;
-        if e2 >= dy {
-            err += dy;
-            x0 += sx;
-        }
-        if e2 <= dx {
-            err += dx;
-            y0 += sy;
-        }
+fn is_logo_backdrop_pixel(pixel: Rgba<u8>) -> bool {
+    let [r, g, b, a] = pixel.0;
+    if a == 0 {
+        return true;
     }
+
+    let max_channel = r.max(g).max(b);
+    let min_channel = r.min(g).min(b);
+    let saturation = max_channel.saturating_sub(min_channel);
+    let dark_neutral = max_channel < 72 && saturation < 26;
+    let dim_blue_glow = max_channel < 105 && saturation < 52 && b >= r && b >= g;
+
+    dark_neutral || dim_blue_glow
 }
 
 fn sanitize_seed_for_file(seed: &str) -> String {
