@@ -806,8 +806,8 @@ export default function App() {
     }
   };
 
-  const requestConfirmation = ({ title, body, confirmLabel, confirmClassName, onConfirm }) => {
-    setConfirmDialog({ title, body, confirmLabel, confirmClassName, onConfirm });
+  const requestConfirmation = ({ title, body, confirmLabel, onConfirm }) => {
+    setConfirmDialog({ title, body, confirmLabel, onConfirm });
   };
 
   const performDeleteMessage = async (msgId) => {
@@ -833,7 +833,6 @@ export default function App() {
       title: "Delete message?",
       body: "This permanently removes the selected message from local chat history.",
       confirmLabel: "Delete",
-      confirmClassName: "bg-red-600 text-white hover:bg-red-500",
       onConfirm: () => performDeleteMessage(msgId)
     });
   };
@@ -861,7 +860,6 @@ export default function App() {
       title: "Clear this thread?",
       body: "This permanently removes all local messages in the current thread.",
       confirmLabel: "Clear Thread",
-      confirmClassName: "bg-red-600 text-white hover:bg-red-500",
       onConfirm: performClearThreadMessages
     });
   };
@@ -887,7 +885,6 @@ export default function App() {
       title: "Delete all messages?",
       body: "This permanently removes all local messages on this client.",
       confirmLabel: "Delete All",
-      confirmClassName: "bg-red-600 text-white hover:bg-red-500",
       onConfirm: performClearAllMessages
     });
   };
@@ -1120,6 +1117,12 @@ export default function App() {
       soundManager.play("error");
     }
   };
+
+  useEffect(() => {
+    if (tab !== "share") return;
+    if (!identity?.wayfarerId) return;
+    void generateShareQr();
+  }, [tab, identity?.wayfarerId]);
 
   const announceGossip = async () => {
     const next = await withNetworkPulse(() => invoke("gossip_announce_now"));
@@ -1456,7 +1459,7 @@ export default function App() {
                           </p>
                           <div className="mt-1 h-1.5 w-full overflow-hidden rounded bg-slate-800/80">
                             <div
-                              className={cn("h-full transition-all duration-300", mediaStatus(m.media) === "failed" ? "bg-red-500" : "bg-cyan-400")}
+                              className={cn("h-full transition-all duration-300", mediaStatus(m.media) === "failed" ? "bg-red-500" : "bg-blue-400")}
                               style={{ width: `${m.direction === "Outgoing" ? outgoingMediaProgressPercent(m) : mediaProgressPercent(m.media)}%` }}
                             />
                           </div>
@@ -1643,7 +1646,7 @@ export default function App() {
               <p className="mt-1 text-sm text-slate-300">{confirmDialog.body}</p>
               <div className="mt-4 flex justify-end gap-2">
                 <Button variant="ghost" onClick={() => setConfirmDialog(null)}>Cancel</Button>
-                <Button className={confirmDialog.confirmClassName || ""} onClick={handleConfirmDialogProceed}>
+                <Button variant="destructive" onClick={handleConfirmDialogProceed}>
                   {confirmDialog.confirmLabel || "Confirm"}
                 </Button>
               </div>
@@ -1687,33 +1690,44 @@ export default function App() {
         )}
 
         {tab === "share" && (
-          <Card>
-            <CardHeader className="p-3 pb-1"><CardTitle className="text-base">Share Your Wayfarer ID</CardTitle></CardHeader>
-            <CardContent className="space-y-2 p-3 pt-1">
-              <pre data-testid="share-wayfarer-id" className="overflow-auto rounded-lg border border-border/60 bg-background/60 p-3 text-xs">{identity?.wayfarerId || "Unavailable"}</pre>
-              <div className="flex flex-wrap gap-2">
-                <Button variant="secondary" onClick={generateShareQr}><QrCode className="mr-2 h-4 w-4" />Generate QR</Button>
+          <div className="grid gap-4 lg:grid-cols-2">
+            <Card className="border-border/60 bg-slate-900/50">
+              <CardHeader className="p-4 pb-2"><CardTitle className="text-base">Share Your Wayfarer ID</CardTitle></CardHeader>
+              <CardContent className="space-y-3 p-4 pt-0">
+                <pre data-testid="share-wayfarer-id" className="overflow-auto rounded-lg border border-border/60 bg-background/60 p-3 text-xs">{identity?.wayfarerId || "Unavailable"}</pre>
+                <div className="flex flex-wrap gap-2">
+                  <Button variant="secondary" onClick={generateShareQr}><QrCode className="mr-2 h-4 w-4" />Regenerate QR</Button>
+                  {shareQr?.pngBase64 ? (
+                    <Button variant="ghost" onClick={() => {
+                      const bin = atob(shareQr.pngBase64);
+                      const bytes = new Uint8Array(bin.length);
+                      for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
+                      const blob = new Blob([bytes], { type: "image/png" });
+                      const href = URL.createObjectURL(blob);
+                      const link = document.createElement("a");
+                      link.href = href;
+                      link.download = "aethos-share-wayfarer-qr.png";
+                      document.body.appendChild(link);
+                      link.click();
+                      link.remove();
+                      setTimeout(() => URL.revokeObjectURL(href), 400);
+                      setStatus("QR image downloaded");
+                    }}>Download QR</Button>
+                  ) : null}
+                </div>
+              </CardContent>
+            </Card>
+            <Card className="border-border/60 bg-slate-900/50">
+              <CardHeader className="p-4 pb-2"><CardTitle className="text-base">QR Code</CardTitle></CardHeader>
+              <CardContent className="flex min-h-[260px] items-center justify-center p-4 pt-0">
                 {shareQr?.pngBase64 ? (
-                  <Button variant="ghost" onClick={() => {
-                    const bin = atob(shareQr.pngBase64);
-                    const bytes = new Uint8Array(bin.length);
-                    for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
-                    const blob = new Blob([bytes], { type: "image/png" });
-                    const href = URL.createObjectURL(blob);
-                    const link = document.createElement("a");
-                    link.href = href;
-                    link.download = "aethos-share-wayfarer-qr.png";
-                    document.body.appendChild(link);
-                    link.click();
-                    link.remove();
-                    setTimeout(() => URL.revokeObjectURL(href), 400);
-                    setStatus("QR image downloaded");
-                  }}>Download QR</Button>
-                ) : null}
-              </div>
-              {shareQr?.pngBase64 ? <img alt="Share QR" src={`data:image/png;base64,${shareQr.pngBase64}`} className="max-w-xs rounded-xl border border-border bg-white p-2" /> : null}
-            </CardContent>
-          </Card>
+                  <img alt="Share QR" src={`data:image/png;base64,${shareQr.pngBase64}`} className="max-w-xs rounded-xl border border-border bg-white p-2" />
+                ) : (
+                  <p className="text-sm text-muted-foreground">Generating QR...</p>
+                )}
+              </CardContent>
+            </Card>
+          </div>
         )}
 
         {tab === "settings" && settings && (
@@ -1793,7 +1807,7 @@ export default function App() {
               </div>
 
               <div className="flex flex-wrap items-center gap-3">
-                <Button data-testid="settings-save" type="submit" className="bg-cyan-600 text-white hover:bg-cyan-500"><CheckCircle2 className="mr-2 h-4 w-4" />Save Settings</Button>
+                <Button data-testid="settings-save" type="submit"><CheckCircle2 className="mr-2 h-4 w-4" />Save Settings</Button>
                 <Button data-testid="settings-announce-gossip" type="button" variant="secondary" onClick={announceGossip}>Announce LAN Gossip</Button>
                 <div className="flex-1"></div>
                 <Button type="button" variant="destructive" onClick={clearAllMessages}>Delete ALL Messages</Button>

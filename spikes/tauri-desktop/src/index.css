@@ -7,7 +7,7 @@
   --foreground: 220 100% 96%;
   --card: 230 45% 13%;
   --card-foreground: 220 80% 95%;
-  --primary: 214 90% 58%;
+  --primary: 220 100% 65%;
   --primary-foreground: 220 100% 98%;
   --secondary: 228 36% 22%;
   --secondary-foreground: 220 100% 96%;
@@ -15,11 +15,11 @@
   --muted-foreground: 221 22% 71%;
   --accent: 262 83% 64%;
   --accent-foreground: 220 100% 97%;
-  --destructive: 343 85% 62%;
+  --destructive: 262 83% 58%;
   --destructive-foreground: 220 100% 98%;
   --border: 228 29% 33%;
   --input: 228 26% 30%;
-  --ring: 214 90% 58%;
+  --ring: 220 100% 65%;
   --radius: 0.8rem;
 }
 
