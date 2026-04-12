@@ -11,13 +11,14 @@
   },
   "app": {
     "windows": [
-      {
-        "label": "main",
-        "title": "Aethos",
-        "width": 1160,
-        "height": 800,
-        "resizable": true
-      }
+        {
+          "label": "main",
+          "title": "Aethos",
+          "width": 1160,
+          "height": 800,
+          "resizable": true,
+          "decorations": false
+        }
     ],
     "security": {
       "csp": null
