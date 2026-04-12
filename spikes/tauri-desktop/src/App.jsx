@@ -23,6 +23,7 @@ import { Badge } from "./components/ui/badge";
 import { Button } from "./components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "./components/ui/card";
 import { Input } from "./components/ui/input";
+import { Switch } from "./components/ui/switch";
 import { Textarea } from "./components/ui/textarea";
 import { soundManager } from "./lib/soundManager";
 import { cn } from "./lib/utils";
@@ -67,8 +68,8 @@ const DEFAULT_RELAY_ENDPOINT = "wss://aethos-relay.network";
 const DONATE_CRYPTO_ADDRESS = "0x114227a8B460E462f408F138a929660531790ee3";
 const DONATE_PAYPAL_URL = "https://www.paypal.com/donate/?hosted_button_id=TPTTR6TRKBYKS";
 const MEDIA_PREVIEW_GATE_BYTES = 5 * 1024 * 1024;
-const BLE_ICON_PULSE_WINDOW_MS = 20 * 1000;
-const GOSSIP_ACTIVITY_PULSE_WINDOW_MS = 20 * 1000;
+const BLE_ICON_PULSE_WINDOW_MS = 60 * 1000;
+const GOSSIP_ACTIVITY_PULSE_WINDOW_MS = 60 * 1000;
 
 function tinyId(id = "") {
   if (!id) return "-";
@@ -331,9 +332,12 @@ export default function App() {
   const logContainerRef = useRef(null);
   const threadContainerRef = useRef(null);
   const attachmentInputRef = useRef(null);
+  const encounterTimelineRef = useRef(null);
   const seenThreadMessageIdsRef = useRef(new Set());
   const seenIncomingMessageIdsRef = useRef(new Set());
   const hasHydratedIncomingRef = useRef(false);
+  const [settingsModal, setSettingsModal] = useState(null);
+  const [settingsDraft, setSettingsDraft] = useState({});
 
   const entries = useMemo(() => {
     const latestThreadActivityMs = (contactId) => {
@@ -661,6 +665,12 @@ export default function App() {
   }, [logTail, logFollow, tab]);
 
   useEffect(() => {
+    const el = encounterTimelineRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [encounterActivity.events, settingsModal]);
+
+  useEffect(() => {
     if (tab !== "chats") return;
     const el = threadContainerRef.current;
     if (!el) return;
@@ -737,6 +747,13 @@ export default function App() {
   useEffect(() => {
     if (!settings) return;
     setRelayEndpointsDraft((settings.relayEndpoints || []).join("\n"));
+    setSettingsDraft({
+      relaySyncEnabled: settings.relaySyncEnabled,
+      gossipSyncEnabled: settings.gossipSyncEnabled,
+      bleDiscoveryEnabled: settings.bleDiscoveryEnabled !== false,
+      verboseLoggingEnabled: settings.verboseLoggingEnabled,
+      enterToSend: settings.enterToSend !== false
+    });
   }, [settings]);
 
   const saveChat = async (nextChat) => {
@@ -1131,11 +1148,7 @@ export default function App() {
     const form = new FormData(event.currentTarget);
     const payload = {
       ...settings,
-      relaySyncEnabled: form.get("relay_sync_enabled") === "on",
-      gossipSyncEnabled: form.get("gossip_sync_enabled") === "on",
-      bleDiscoveryEnabled: form.get("ble_discovery_enabled") === "on",
-      verboseLoggingEnabled: form.get("verbose_logging_enabled") === "on",
-      enterToSend: form.get("enter_to_send") === "on",
+      ...settingsDraft,
       messageTtlSeconds: Number(form.get("message_ttl_seconds") || settings.messageTtlSeconds),
       relayEndpoints: String(relayEndpointsDraft || "")
         .split("\n")
@@ -1294,7 +1307,7 @@ export default function App() {
                   data-testid={`tab-${t.id}`}
                   variant={tab === t.id ? "default" : "ghost"}
                   className={cn("h-9 gap-1.5 px-3", t.id === "chats" && chatsTabNeedsAttention ? "tab-pill-alert" : "")}
-                  onClick={() => setTab(t.id)}
+                  onClick={() => { setTab(t.id); setSettingsModal(null); }}
                 >
                   <Icon className="h-4 w-4" />
                   {t.label}
@@ -1308,8 +1321,7 @@ export default function App() {
               <span
                 className={cn(
                   "tab-status-dot",
-                  relayDisabled ? "is-offline" : relayOnline ? "is-online" : "is-offline",
-                  relayActivityRecently && !relayDisabled ? "is-relay-active" : ""
+                  relayDisabled ? "is-offline" : relayOnline ? "is-online" : "is-offline"
                 )}
                 title={
                   relayDisabled
@@ -1320,12 +1332,12 @@ export default function App() {
                 }
               >
                 <Globe className="h-3.5 w-3.5" />
+                <span className={cn("status-orb", relayActivityRecently && !relayDisabled ? "is-orb-active" : "")} />
               </span>
               <span
                 className={cn(
                   "tab-status-dot",
-                  gossipOnline ? "is-online" : "is-offline",
-                  gossipActivityRecently ? "is-gossip-active" : ""
+                  gossipOnline ? "is-online" : "is-offline"
                 )}
                 title={
                   gossipOnline
@@ -1336,12 +1348,12 @@ export default function App() {
                 }
               >
                 <Wifi className="h-3.5 w-3.5" />
+                <span className={cn("status-orb", gossipActivityRecently ? "is-orb-active" : "")} />
               </span>
               <span
                 className={cn(
                   "tab-status-dot",
-                  bleEnabled ? "is-online" : "is-offline",
-                  bleSightingDetectedRecently ? "is-ble-detected" : ""
+                  bleEnabled ? "is-online" : "is-offline"
                 )}
                 title={
                   bleEnabled
@@ -1352,6 +1364,7 @@ export default function App() {
                 }
               >
                 <Bluetooth className="h-3.5 w-3.5" />
+                <span className={cn("status-orb", bleSightingDetectedRecently ? "is-orb-active" : "")} />
               </span>
             </div>
           </div>
@@ -1704,90 +1717,105 @@ export default function App() {
         )}
 
         {tab === "settings" && settings && (
-          <div className="space-y-3">
-            <div className="grid gap-3 lg:grid-cols-2">
-              <Card>
-              <CardHeader className="p-3 pb-1"><CardTitle className="text-base">Sync Settings</CardTitle></CardHeader>
-              <CardContent className="p-3 pt-1">
-                <form className="space-y-2" onSubmit={saveSettings}>
-                  <label className="flex items-center gap-2 text-sm"><input data-testid="settings-relay-sync" type="checkbox" name="relay_sync_enabled" defaultChecked={settings.relaySyncEnabled} /> Enable relay sync</label>
-                  <label className="flex items-center gap-2 text-sm"><input data-testid="settings-gossip-sync" type="checkbox" name="gossip_sync_enabled" defaultChecked={settings.gossipSyncEnabled} /> Enable LAN gossip sync</label>
-                  <label className="flex items-center gap-2 text-sm"><input data-testid="settings-ble-discovery" type="checkbox" name="ble_discovery_enabled" defaultChecked={settings.bleDiscoveryEnabled !== false} /> Enable BLE discovery</label>
-                  <label className="flex items-center gap-2 text-sm"><input data-testid="settings-verbose-logging" type="checkbox" name="verbose_logging_enabled" defaultChecked={settings.verboseLoggingEnabled} /> Enable verbose logging</label>
-                  <label className="flex items-center gap-2 text-sm"><input data-testid="settings-enter-to-send" type="checkbox" name="enter_to_send" defaultChecked={settings.enterToSend !== false} /> Enter sends message (Shift+Enter newline)</label>
-                  <Input name="message_ttl_seconds" type="number" defaultValue={settings.messageTtlSeconds} />
-                  <Textarea
-                    data-testid="settings-relay-endpoints"
-                    name="relay_endpoints"
-                    rows={4}
-                    value={relayEndpointsDraft}
-                    onChange={(event) => setRelayEndpointsDraft(event.target.value)}
-                  />
-                  <div className="flex flex-wrap gap-2">
-                    <Button data-testid="settings-save" type="submit"><CheckCircle2 className="mr-2 h-4 w-4" />Save Settings</Button>
+          <div className="space-y-4">
+            <Card className="border-border/60 bg-slate-900/50">
+              <CardHeader className="p-4 pb-2"><CardTitle className="text-lg">Sync & Features</CardTitle></CardHeader>
+              <CardContent className="p-4 pt-0">
+                <form className="space-y-6" onSubmit={saveSettings}>
+                  <div className="space-y-4">
+                    <div className="flex items-center justify-between">
+                      <div className="space-y-0.5 pr-4">
+                        <label className="text-sm font-medium leading-none text-slate-100">Enable relay sync</label>
+                        <p className="text-xs text-muted-foreground">Sync messages automatically over the internet relay.</p>
+                      </div>
+                      <Switch data-testid="settings-relay-sync" checked={settingsDraft.relaySyncEnabled} onCheckedChange={(v) => setSettingsDraft(d => ({...d, relaySyncEnabled: v}))} />
+                    </div>
+                    
+                    <div className="flex items-center justify-between">
+                      <div className="space-y-0.5 pr-4">
+                        <label className="text-sm font-medium leading-none text-slate-100">Enable LAN gossip sync</label>
+                        <p className="text-xs text-muted-foreground">Exchange messages directly with peers on the local network.</p>
+                      </div>
+                      <Switch data-testid="settings-gossip-sync" checked={settingsDraft.gossipSyncEnabled} onCheckedChange={(v) => setSettingsDraft(d => ({...d, gossipSyncEnabled: v}))} />
+                    </div>
+
+                    <div className="flex items-center justify-between">
+                      <div className="space-y-0.5 pr-4">
+                        <label className="text-sm font-medium leading-none text-slate-100">Enable BLE discovery</label>
+                        <p className="text-xs text-muted-foreground">Broadcast and discover nearby Aethos clients over Bluetooth.</p>
+                      </div>
+                      <Switch data-testid="settings-ble-discovery" checked={settingsDraft.bleDiscoveryEnabled} onCheckedChange={(v) => setSettingsDraft(d => ({...d, bleDiscoveryEnabled: v}))} />
+                    </div>
+
+                    <div className="flex items-center justify-between">
+                      <div className="space-y-0.5 pr-4">
+                        <label className="text-sm font-medium leading-none text-slate-100">Enable verbose logging</label>
+                        <p className="text-xs text-muted-foreground">Capture detailed debug information in the local log file.</p>
+                      </div>
+                      <Switch data-testid="settings-verbose-logging" checked={settingsDraft.verboseLoggingEnabled} onCheckedChange={(v) => setSettingsDraft(d => ({...d, verboseLoggingEnabled: v}))} />
+                    </div>
+
+                    <div className="flex items-center justify-between">
+                      <div className="space-y-0.5 pr-4">
+                        <label className="text-sm font-medium leading-none text-slate-100">Enter sends message</label>
+                        <p className="text-xs text-muted-foreground">Press Enter to send (Shift+Enter for newline).</p>
+                      </div>
+                      <Switch data-testid="settings-enter-to-send" checked={settingsDraft.enterToSend} onCheckedChange={(v) => setSettingsDraft(d => ({...d, enterToSend: v}))} />
+                    </div>
+                  </div>
+
+                  <div className="space-y-4 border-t border-border/40 pt-4">
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium leading-none text-slate-100">Message TTL (seconds)</label>
+                      <Input name="message_ttl_seconds" type="number" defaultValue={settings.messageTtlSeconds} className="max-w-[200px]" />
+                    </div>
+                    
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium leading-none text-slate-100">Relay Endpoints (one per line)</label>
+                      <Textarea
+                        data-testid="settings-relay-endpoints"
+                        name="relay_endpoints"
+                        rows={3}
+                        value={relayEndpointsDraft}
+                        onChange={(event) => setRelayEndpointsDraft(event.target.value)}
+                        className="font-mono text-xs"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-3 border-t border-border/40 pt-4">
+                    <Button data-testid="settings-save" type="submit" className="bg-cyan-600 text-white hover:bg-cyan-500"><CheckCircle2 className="mr-2 h-4 w-4" />Save Settings</Button>
                     <Button type="button" variant="secondary" onClick={resetRelayEndpoints}>Reset Relay Default</Button>
-                    <Button data-testid="settings-announce-gossip" type="button" variant="ghost" onClick={announceGossip}>Announce LAN Gossip</Button>
+                    <Button data-testid="settings-announce-gossip" type="button" variant="secondary" onClick={announceGossip}>Announce LAN Gossip</Button>
+                    <div className="flex-1"></div>
                     <Button type="button" variant="destructive" onClick={clearAllMessages}>Delete ALL Messages</Button>
                   </div>
                 </form>
               </CardContent>
-              </Card>
-              <Card>
-              <CardHeader className="p-3 pb-1"><CardTitle className="text-base">Diagnostics</CardTitle></CardHeader>
-              <CardContent className="space-y-1.5 p-3 pt-1 text-sm text-muted-foreground">
-                <p>{diagnostics ? `${diagnostics.platform}/${diagnostics.arch}` : "Loading"}</p>
-                <p>Primary relay: {relayHealth.primaryStatus}</p>
-                <p>Secondary relay: {relayHealth.secondaryStatus}</p>
-                <p>Gossip event: {gossipStatus.lastEvent}</p>
-                <div className="pt-2">
-                  <Button variant="secondary" size="sm" onClick={async () => {
-                    const reports = await invoke("run_relay_diagnostics", { request: { relayEndpoints: settings.relayEndpoints, authToken: null, traceItemId: null } });
-                    setRelayReports(reports);
-                    setStatus("Relay diagnostics completed");
-                  }}>Run Relay Diagnostics</Button>
-                </div>
-                {relayReports.length > 0 ? relayReports.map((report, idx) => (
-                  <div key={idx} className="rounded border border-border/50 bg-background/40 p-2 text-xs text-foreground">
-                    <p className="font-semibold">{report.relayHttp}</p>
-                    <p>Handshake: {report.handshakeStatus}</p>
-                    <p>Encounter: {report.encounterStatus}</p>
-                  </div>
-                )) : null}
+            </Card>
 
-                <div className="mt-2 rounded border border-border/50 bg-background/30 p-2 text-xs">
-                  <p className="mb-1 font-semibold text-foreground">Media Transfer Debug</p>
-                  {mediaDebugRows.length === 0 ? (
-                    <p className="text-muted-foreground" data-testid="media-debug-empty">No media transfers tracked yet.</p>
-                  ) : (
-                    <div className="max-h-48 overflow-auto space-y-1" data-testid="media-debug-list">
-                      {mediaDebugRows.map((row) => (
-                        <div key={row.key} className="rounded border border-border/40 bg-background/50 p-1.5">
-                          <p className="text-foreground" data-testid={`media-debug-${row.transferId}`}>
-                            {row.direction} · {row.contactAlias}
-                          </p>
-                          <p>transfer={tinyId(row.transferId)} status={row.status}</p>
-                          <p>chunks={row.receivedChunks}/{row.chunkCount}</p>
-                          <p>lastError={row.lastError}</p>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              </CardContent>
-              </Card>
+            <div className="rounded-xl border border-border/40 bg-background/30 p-4">
+              <h4 className="mb-3 text-sm font-medium text-slate-300">Advanced & Debugging</h4>
+              <div className="flex flex-wrap gap-2">
+                <Button variant="outline" size="sm" onClick={() => setSettingsModal("encounter")}>BLE & Encounter Activity</Button>
+                <Button variant="outline" size="sm" onClick={() => setSettingsModal("logs")}>Live Client Logs</Button>
+                <Button variant="outline" size="sm" onClick={() => setSettingsModal("diagnostics")}>Diagnostics</Button>
+              </div>
             </div>
+          </div>
+        )}
 
-            <Card data-testid="settings-encounter-activity">
-              <CardHeader className="p-3 pb-1">
-                <CardTitle className="text-base">BLE & Encounter Activity</CardTitle>
-                <p className="text-xs text-muted-foreground">
-                  See nearby discovery activity and which connection actually moved data.
-                </p>
-                <p className="text-xs text-muted-foreground">
-                  Live updates follow the "Live logs + encounter timeline" setting below.
-                </p>
-              </CardHeader>
-              <CardContent className="space-y-2 p-3 pt-1 text-sm text-muted-foreground">
+        {settingsModal === "encounter" ? (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 p-4">
+            <div className="flex w-full max-w-3xl max-h-[85vh] flex-col rounded-xl border border-border/70 bg-slate-900 p-4 shadow-xl">
+              <div className="mb-3 flex items-center justify-between">
+                <div>
+                  <h3 className="text-base font-semibold text-slate-100">BLE & Encounter Activity</h3>
+                  <p className="text-xs text-muted-foreground">See nearby discovery activity and which connection actually moved data.</p>
+                </div>
+                <Button variant="ghost" size="sm" onClick={() => setSettingsModal(null)}>Close</Button>
+              </div>
+              <div className="min-h-0 flex-1 overflow-auto space-y-2 text-sm text-muted-foreground">
                 <p data-testid="encounter-ble-status">{encounterActivity.bleDiscoveryStatus}</p>
                 <p>
                   BLE setting: <span className="text-foreground">{encounterActivity.bleDiscoveryEnabled === false ? "disabled" : "enabled"}</span>
@@ -1828,8 +1856,8 @@ export default function App() {
                 <div className="rounded border border-border/50 bg-background/30 p-2 text-xs">
                   <p className="mb-1 font-semibold text-foreground">Recent activity timeline</p>
                   {Array.isArray(encounterActivity.events) && encounterActivity.events.length > 0 ? (
-                    <div className="max-h-52 overflow-auto space-y-1" data-testid="encounter-activity-timeline">
-                      {encounterActivity.events.map((event) => (
+                    <div ref={encounterTimelineRef} className="max-h-52 overflow-auto space-y-1" data-testid="encounter-activity-timeline">
+                      {[...encounterActivity.events].sort((a, b) => (a.atUnixMs || 0) - (b.atUnixMs || 0)).map((event) => (
                         <div key={`${event.seq}-${event.atUnixMs}`} className="rounded border border-border/40 bg-background/50 p-1.5">
                           <p className="text-foreground">{event.message}</p>
                           <p className="text-muted-foreground">
@@ -1846,83 +1874,140 @@ export default function App() {
                     </p>
                   )}
                 </div>
-              </CardContent>
-            </Card>
-
-            <Card>
-              <CardHeader className="p-3 pb-1">
-                <CardTitle className="text-base">Live Client Logs</CardTitle>
-                <p data-testid="settings-log-path" className="text-xs text-muted-foreground">{logTail.logFilePath || "Log path unavailable"}</p>
-              </CardHeader>
-              <CardContent className="p-3 pt-1">
-                <div className="mb-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                  <Badge className="bg-slate-700/40">Showing {filteredLogLines.length} / {logTail.totalLines} lines</Badge>
-                  <label className="inline-flex items-center gap-2">
-                    <span>Filter</span>
-                    <select
-                      className="rounded border border-border/70 bg-background px-2 py-1 text-xs"
-                      value={logFilter}
-                      onChange={(event) => setLogFilter(event.target.value)}
-                    >
-                      <option value="all">All</option>
-                      <option value="errors">Errors</option>
-                      <option value="send">Send Path</option>
-                      <option value="gossip">Gossip</option>
-                      <option value="relay">Relay</option>
-                      <option value="transfer">Transfer/Import</option>
-                    </select>
-                  </label>
-                  <label className="inline-flex items-center gap-2">
-                    <input
-                      type="checkbox"
-                      checked={logFollow}
-                      onChange={(event) => setLogFollow(event.target.checked)}
-                    />
-                    Auto-follow
-                  </label>
-                  <label className="inline-flex items-center gap-2">
-                    <input
-                      type="checkbox"
-                      checked={logStreaming}
-                      onChange={(event) => setLogStreaming(event.target.checked)}
-                    />
-                    Live logs + encounter timeline (may impact performance)
-                  </label>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    onClick={async () => setLogTail(await invoke("read_app_log", { maxLines: 500 }))}
-                  >
-                    Refresh Logs
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="destructive"
-                    onClick={async () => {
-                      const cleared = await invoke("clear_app_log");
-                      setLogTail(cleared);
-                      setStatus("Client logs cleared");
-                    }}
-                  >
-                    Clear Logs
-                  </Button>
-                </div>
-
-                <div
-                  ref={logContainerRef}
-                  onScroll={(event) => {
-                    const el = event.currentTarget;
-                    const nearBottom = el.scrollHeight - (el.scrollTop + el.clientHeight) < 20;
-                    if (logFollow && !nearBottom) setLogFollow(false);
-                  }}
-                  className="max-h-[280px] overflow-auto rounded-lg border border-border/60 bg-black/40 p-2.5"
-                >
-                  <pre className="whitespace-pre-wrap text-xs leading-5 text-cyan-100">{filteredLogContent || "(no log lines for current filter)"}</pre>
-                </div>
-              </CardContent>
-            </Card>
+              </div>
+            </div>
           </div>
-        )}
+        ) : null}
+
+        {settingsModal === "logs" ? (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 p-4">
+            <div className="flex w-full max-w-4xl max-h-[85vh] flex-col rounded-xl border border-border/70 bg-slate-900 p-4 shadow-xl">
+              <div className="mb-3 flex items-center justify-between">
+                <div>
+                  <h3 className="text-base font-semibold text-slate-100">Live Client Logs</h3>
+                  <p data-testid="settings-log-path" className="text-xs text-muted-foreground">{logTail.logFilePath || "Log path unavailable"}</p>
+                </div>
+                <Button variant="ghost" size="sm" onClick={() => setSettingsModal(null)}>Close</Button>
+              </div>
+              <div className="mb-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                <Badge className="bg-slate-700/40">Showing {filteredLogLines.length} / {logTail.totalLines} lines</Badge>
+                <label className="inline-flex items-center gap-2">
+                  <span>Filter</span>
+                  <select
+                    className="rounded border border-border/70 bg-background px-2 py-1 text-xs"
+                    value={logFilter}
+                    onChange={(event) => setLogFilter(event.target.value)}
+                  >
+                    <option value="all">All</option>
+                    <option value="errors">Errors</option>
+                    <option value="send">Send Path</option>
+                    <option value="gossip">Gossip</option>
+                    <option value="relay">Relay</option>
+                    <option value="transfer">Transfer/Import</option>
+                  </select>
+                </label>
+                <label className="inline-flex items-center gap-2">
+                  <Switch
+                    checked={logFollow}
+                    onCheckedChange={setLogFollow}
+                  />
+                  Auto-follow
+                </label>
+                <label className="inline-flex items-center gap-2">
+                  <Switch
+                    checked={logStreaming}
+                    onCheckedChange={setLogStreaming}
+                  />
+                  Live logs + encounter timeline (may impact performance)
+                </label>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={async () => setLogTail(await invoke("read_app_log", { maxLines: 500 }))}
+                >
+                  Refresh Logs
+                </Button>
+                <Button
+                  size="sm"
+                  variant="destructive"
+                  onClick={async () => {
+                    const cleared = await invoke("clear_app_log");
+                    setLogTail(cleared);
+                    setStatus("Client logs cleared");
+                  }}
+                >
+                  Clear Logs
+                </Button>
+              </div>
+
+              <div
+                ref={logContainerRef}
+                onScroll={(event) => {
+                  const el = event.currentTarget;
+                  const nearBottom = el.scrollHeight - (el.scrollTop + el.clientHeight) < 20;
+                  if (logFollow && !nearBottom) setLogFollow(false);
+                }}
+                className="min-h-0 flex-1 overflow-auto rounded-lg border border-border/60 bg-black/40 p-2.5"
+              >
+                <pre className="whitespace-pre-wrap text-xs leading-5 text-cyan-100">{filteredLogContent || "(no log lines for current filter)"}</pre>
+              </div>
+            </div>
+          </div>
+        ) : null}
+
+        {settingsModal === "diagnostics" ? (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 p-4">
+            <div className="flex w-full max-w-3xl max-h-[85vh] flex-col rounded-xl border border-border/70 bg-slate-900 p-4 shadow-xl">
+              <div className="mb-3 flex items-center justify-between">
+                <div>
+                  <h3 className="text-base font-semibold text-slate-100">Diagnostics</h3>
+                  <p className="text-xs text-muted-foreground">Relay reports and media debug.</p>
+                </div>
+                <Button variant="ghost" size="sm" onClick={() => setSettingsModal(null)}>Close</Button>
+              </div>
+              <div className="min-h-0 flex-1 overflow-auto space-y-2 text-sm text-muted-foreground">
+                <p>{diagnostics ? `${diagnostics.platform}/${diagnostics.arch}` : "Loading"}</p>
+                <p>Primary relay: {relayHealth.primaryStatus}</p>
+                <p>Secondary relay: {relayHealth.secondaryStatus}</p>
+                <p>Gossip event: {gossipStatus.lastEvent}</p>
+                <div className="pt-2">
+                  <Button variant="secondary" size="sm" onClick={async () => {
+                    const reports = await invoke("run_relay_diagnostics", { request: { relayEndpoints: settings.relayEndpoints, authToken: null, traceItemId: null } });
+                    setRelayReports(reports);
+                    setStatus("Relay diagnostics completed");
+                  }}>Run Relay Diagnostics</Button>
+                </div>
+                {relayReports.length > 0 ? relayReports.map((report, idx) => (
+                  <div key={idx} className="rounded border border-border/50 bg-background/40 p-2 text-xs text-foreground">
+                    <p className="font-semibold">{report.relayHttp}</p>
+                    <p>Handshake: {report.handshakeStatus}</p>
+                    <p>Encounter: {report.encounterStatus}</p>
+                  </div>
+                )) : null}
+
+                <div className="mt-2 rounded border border-border/50 bg-background/30 p-2 text-xs">
+                  <p className="mb-1 font-semibold text-foreground">Media Transfer Debug</p>
+                  {mediaDebugRows.length === 0 ? (
+                    <p className="text-muted-foreground" data-testid="media-debug-empty">No media transfers tracked yet.</p>
+                  ) : (
+                    <div className="max-h-48 overflow-auto space-y-1" data-testid="media-debug-list">
+                      {mediaDebugRows.map((row) => (
+                        <div key={row.key} className="rounded border border-border/40 bg-background/50 p-1.5">
+                          <p className="text-foreground" data-testid={`media-debug-${row.transferId}`}>
+                            {row.direction} · {row.contactAlias}
+                          </p>
+                          <p>transfer={tinyId(row.transferId)} status={row.status}</p>
+                          <p>chunks={row.receivedChunks}/{row.chunkCount}</p>
+                          <p>lastError={row.lastError}</p>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        ) : null}
 
         <Card className="mt-2.5">
           <CardContent className="flex items-center gap-2 py-2 text-sm text-cyan-100">
