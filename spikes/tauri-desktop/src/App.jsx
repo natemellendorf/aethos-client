@@ -3,10 +3,10 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
-  BellRing,
   Bluetooth,
   CheckCircle2,
   ContactRound,
+  Globe,
   MessageCircle,
   QrCode,
   Settings,
@@ -68,6 +68,7 @@ const DONATE_CRYPTO_ADDRESS = "0x114227a8B460E462f408F138a929660531790ee3";
 const DONATE_PAYPAL_URL = "https://www.paypal.com/donate/?hosted_button_id=TPTTR6TRKBYKS";
 const MEDIA_PREVIEW_GATE_BYTES = 5 * 1024 * 1024;
 const BLE_ICON_PULSE_WINDOW_MS = 20 * 1000;
+const GOSSIP_ACTIVITY_PULSE_WINDOW_MS = 20 * 1000;
 
 function tinyId(id = "") {
   if (!id) return "-";
@@ -1195,7 +1196,10 @@ export default function App() {
   const bleEnabled = settings?.bleDiscoveryEnabled !== false;
   const bleLastSightingMs = Number(encounterActivity.lastBleSightingUnixMs || 0);
   const bleSightingDetectedRecently = bleEnabled && bleLastSightingMs > 0 && Date.now() - bleLastSightingMs <= BLE_ICON_PULSE_WINDOW_MS;
-  const bleRecentAccepts = Number(encounterActivity.recentBleSightingsCount || 0);
+  const gossipLastActivityMs = Number(gossipStatus.lastActivityMs || 0);
+  const gossipActivityRecently = gossipOnline && gossipLastActivityMs > 0 && Date.now() - gossipLastActivityMs <= GOSSIP_ACTIVITY_PULSE_WINDOW_MS;
+  const relayDisabled = relayHealth.chipState === "disabled";
+  const relayActivityRecently = relayOnline;
   const filteredLogLines = useMemo(() => {
     const lines = (logTail.content || "").split("\n");
     const needles = LOG_FILTERS[logFilter] || [];
@@ -1301,11 +1305,37 @@ export default function App() {
               <Button variant="ghost" className="h-9 w-9 p-0" onClick={toggleFullscreen} title={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}>
                 {isFullscreen ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
               </Button>
-              <span className={cn("tab-status-dot", relayOnline ? "is-online" : "is-offline")} title="Relay status">
-                <Wifi className="h-3.5 w-3.5" />
+              <span
+                className={cn(
+                  "tab-status-dot",
+                  relayDisabled ? "is-offline" : relayOnline ? "is-online" : "is-offline",
+                  relayActivityRecently && !relayDisabled ? "is-relay-active" : ""
+                )}
+                title={
+                  relayDisabled
+                    ? "Relay sync disabled"
+                    : relayOnline
+                      ? "Relay: connected"
+                      : "Relay: disconnected"
+                }
+              >
+                <Globe className="h-3.5 w-3.5" />
               </span>
-              <span className={cn("tab-status-dot", gossipOnline ? "is-online" : "is-offline")} title="LAN gossip status">
-                <BellRing className="h-3.5 w-3.5" />
+              <span
+                className={cn(
+                  "tab-status-dot",
+                  gossipOnline ? "is-online" : "is-offline",
+                  gossipActivityRecently ? "is-gossip-active" : ""
+                )}
+                title={
+                  gossipOnline
+                    ? gossipActivityRecently
+                      ? "LAN gossip: active"
+                      : "LAN gossip: enabled"
+                    : "LAN gossip: disabled"
+                }
+              >
+                <Wifi className="h-3.5 w-3.5" />
               </span>
               <span
                 className={cn(
@@ -1323,14 +1353,6 @@ export default function App() {
               >
                 <Bluetooth className="h-3.5 w-3.5" />
               </span>
-              {bleEnabled && bleRecentAccepts > 0 ? (
-                <span
-                  className="ble-accept-chip"
-                  title={`Aethos BLE advertisements accepted in recent window: ${bleRecentAccepts}`}
-                >
-                  BLE accepts: {bleRecentAccepts}
-                </span>
-              ) : null}
             </div>
           </div>
         </div>

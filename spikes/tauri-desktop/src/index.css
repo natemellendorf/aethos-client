@@ -430,24 +430,20 @@ body {
   border-color: rgba(154, 117, 255, 0.72);
 }
 
+.tab-status-dot.is-gossip-active {
+  animation: gossip-status-pulse 1.4s ease-in-out infinite;
+  border-color: rgba(117, 255, 154, 0.72);
+}
+
+.tab-status-dot.is-relay-active {
+  animation: relay-status-pulse 1.4s ease-in-out infinite;
+  border-color: rgba(117, 200, 255, 0.72);
+}
+
 .tab-status-dot.is-offline {
   background: rgba(8, 12, 20, 0.84);
   color: rgba(107, 125, 157, 0.9);
   border-color: rgba(67, 79, 101, 0.8);
-}
-
-.ble-accept-chip {
-  height: 24px;
-  padding: 0 8px;
-  border-radius: 999px;
-  display: inline-flex;
-  align-items: center;
-  border: 1px solid rgba(166, 116, 255, 0.62);
-  background: rgba(79, 43, 133, 0.38);
-  color: rgba(233, 214, 255, 0.96);
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.02em;
 }
 
 .network-orbit.is-active .dot-a {
@@ -652,12 +648,56 @@ body {
   }
 }
 
+@keyframes gossip-status-pulse {
+  0% {
+    background: rgba(76, 139, 255, 0.24);
+    color: rgba(211, 232, 255, 0.98);
+    box-shadow: 0 0 0 0 rgba(86, 255, 150, 0.16);
+    border-color: rgba(120, 255, 172, 0.6);
+  }
+  50% {
+    background: rgba(66, 200, 116, 0.3);
+    color: rgba(214, 255, 234, 0.98);
+    box-shadow: 0 0 0 4px rgba(118, 255, 174, 0.16);
+    border-color: rgba(146, 255, 190, 0.74);
+  }
+  100% {
+    background: rgba(76, 139, 255, 0.24);
+    color: rgba(211, 232, 255, 0.98);
+    box-shadow: 0 0 0 0 rgba(86, 255, 150, 0.08);
+    border-color: rgba(120, 255, 172, 0.6);
+  }
+}
+
+@keyframes relay-status-pulse {
+  0% {
+    background: rgba(76, 139, 255, 0.24);
+    color: rgba(211, 232, 255, 0.98);
+    box-shadow: 0 0 0 0 rgba(86, 200, 255, 0.16);
+    border-color: rgba(120, 200, 255, 0.6);
+  }
+  50% {
+    background: rgba(66, 160, 220, 0.3);
+    color: rgba(214, 240, 255, 0.98);
+    box-shadow: 0 0 0 4px rgba(118, 200, 255, 0.16);
+    border-color: rgba(146, 210, 255, 0.74);
+  }
+  100% {
+    background: rgba(76, 139, 255, 0.24);
+    color: rgba(211, 232, 255, 0.98);
+    box-shadow: 0 0 0 0 rgba(86, 200, 255, 0.08);
+    border-color: rgba(120, 200, 255, 0.6);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .chat-thread-row-alert,
   .chat-thread-row-alert::after,
   .tab-pill-alert,
   .tab-pill-alert::after,
-  .tab-status-dot.is-ble-detected {
+  .tab-status-dot.is-ble-detected,
+  .tab-status-dot.is-gossip-active,
+  .tab-status-dot.is-relay-active {
     animation: none;
   }
 }
