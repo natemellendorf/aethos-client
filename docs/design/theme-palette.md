@@ -9,23 +9,23 @@
 - `--foreground`: 220 100% 96% → Near-white blue (#ebf0ff)
 - `--card`: 230 45% 13% → Dark card surface (#121b30)
 - `--card-foreground`: 220 80% 95% → Bright card text
-- `--primary`: 214 90% 58% → Vivid blue (#2e7cf6)
+- `--primary`: 220 100% 65% → Activity icon blue (#4c8bff)
 - `--secondary`: 228 36% 22% → Muted navy (#24304a)
 - `--muted`: 228 30% 19% → Dimmed surface
 - `--muted-foreground`: 221 22% 71% → Subdued text
 - `--accent`: 262 83% 64% → Cosmic purple (#8b5cf6)
-- `--destructive`: 343 85% 62% → Alert red/pink
+- `--destructive`: 262 83% 58% → Cosmic purple, darker (#7c3aed)
 - `--border`: 228 29% 33% → Subtle border
 - `--input`: 228 26% 30% → Input field bg
-- `--ring`: 214 90% 58% → Focus ring blue
+- `--ring`: 220 100% 65% → Focus ring blue (matches primary)
 
 ## Semantic Color Roles
 - **Background**: deep-space navy with radial gradient overlays
 - **Cards**: frosted glass with `bg-slate-900/50` or `bg-background/30`
-- **Primary actions**: vivid blue (`bg-cyan-600` on save button)
+- **Primary actions**: activity-icon blue (`--primary: 220 100% 65%` / `#4c8bff`) for all standard buttons
 - **Accent/interactive**: cosmic purple (toggle switches, outgoing message bubbles)
 - **Text**: near-white for headings (`text-slate-100`), muted for descriptions (`text-muted-foreground`)
-- **Destructive**: pink-red for delete actions
+- **Destructive**: cosmic purple (`--destructive: 262 83% 58%` / `#7c3aed`) for delete/destructive actions
 
 ## Key Gradient Palette
 (From CSS classes)
