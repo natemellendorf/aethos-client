@@ -7,6 +7,7 @@ import {
   ContactRound,
   Globe,
   MessageCircle,
+  Minus,
   QrCode,
   Settings,
   Share2,
@@ -15,7 +16,8 @@ import {
   Maximize2,
   Minimize2,
   Paperclip,
-  FileDown
+  FileDown,
+  X
 } from "lucide-react";
 
 import { Badge } from "./components/ui/badge";
@@ -323,7 +325,7 @@ export default function App() {
   const [contacts, setContacts] = useState({});
   const [chat, setChat] = useState({ selectedContact: null, threads: {}, newContacts: [] });
   const [relayReports, setRelayReports] = useState([]);
-  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [isMaximized, setIsMaximized] = useState(false);
   const [currentVersion, setCurrentVersion] = useState("0.0.0");
   const [updateNotice, setUpdateNotice] = useState(null);
   const [updateDismissed, setUpdateDismissed] = useState(false);
@@ -560,7 +562,26 @@ export default function App() {
 
   useEffect(() => {
     const appWindow = getCurrentWindow();
-    appWindow.isFullscreen().then(setIsFullscreen).catch(() => {});
+    appWindow.isMaximized().then(setIsMaximized).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    const appWindow = getCurrentWindow();
+    let unlistenResize;
+    appWindow.onResized(async () => {
+      try {
+        setIsMaximized(await appWindow.isMaximized());
+      } catch {
+        // keep chrome responsive even if state query fails
+      }
+    }).then((fn) => {
+      unlistenResize = fn;
+    }).catch(() => {
+      // no-op if listener unsupported
+    });
+    return () => {
+      if (unlistenResize) unlistenResize();
+    };
   }, []);
 
   useEffect(() => {
@@ -1264,15 +1285,38 @@ export default function App() {
     }
   };
 
-  const toggleFullscreen = async () => {
+  const minimizeWindow = async () => {
     try {
       const appWindow = getCurrentWindow();
-      const next = !(await appWindow.isFullscreen());
-      await appWindow.setFullscreen(next);
-      setIsFullscreen(next);
-      setStatus(next ? "Entered fullscreen" : "Exited fullscreen");
+      await appWindow.minimize();
     } catch (error) {
-      setStatus(`Fullscreen toggle failed: ${String(error)}`);
+      setStatus(`Minimize failed: ${String(error)}`);
+      soundManager.play("error");
+    }
+  };
+
+  const toggleMaximizeWindow = async () => {
+    try {
+      const appWindow = getCurrentWindow();
+      const nextMaximized = !(await appWindow.isMaximized());
+      if (nextMaximized) {
+        await appWindow.maximize();
+      } else {
+        await appWindow.unmaximize();
+      }
+      setIsMaximized(nextMaximized);
+    } catch (error) {
+      setStatus(`Window resize failed: ${String(error)}`);
+      soundManager.play("error");
+    }
+  };
+
+  const closeWindow = async () => {
+    try {
+      const appWindow = getCurrentWindow();
+      await appWindow.close();
+    } catch (error) {
+      setStatus(`Window close failed: ${String(error)}`);
       soundManager.play("error");
     }
   };
@@ -1304,7 +1348,24 @@ export default function App() {
     <div className="relative min-h-screen overflow-x-hidden bg-[radial-gradient(circle_at_15%_10%,rgba(76,122,255,.26),transparent_42%),radial-gradient(circle_at_88%_-10%,rgba(42,189,255,.2),transparent_35%),#060914] text-foreground">
       <div className="app-atmosphere" aria-hidden="true" />
       <div className="app-atmosphere-grid" aria-hidden="true" />
-      <div className="mx-auto max-w-7xl p-2.5 md:p-3">
+      <div className="window-chrome" data-tauri-drag-region>
+        <div className="window-chrome__title" data-tauri-drag-region>
+          <img src="/logo.png" alt="Aethos" className="window-chrome__logo" data-tauri-drag-region />
+          <span data-tauri-drag-region>Aethos</span>
+        </div>
+        <div className="window-chrome__actions">
+          <button type="button" className="window-chrome__button" onClick={minimizeWindow} aria-label="Minimize window" title="Minimize">
+            <Minus className="h-3.5 w-3.5" />
+          </button>
+          <button type="button" className="window-chrome__button" onClick={toggleMaximizeWindow} aria-label={isMaximized ? "Restore window" : "Maximize window"} title={isMaximized ? "Restore" : "Maximize"}>
+            {isMaximized ? <Minimize2 className="h-3.5 w-3.5" /> : <Maximize2 className="h-3.5 w-3.5" />}
+          </button>
+          <button type="button" className="window-chrome__button window-chrome__button--close" onClick={closeWindow} aria-label="Close window" title="Close">
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      </div>
+      <div className="mx-auto max-w-7xl p-2.5 pt-11 md:p-3 md:pt-12">
 
         <div className="hero-stack">
           <Card className="hero-banner mb-1.5 overflow-hidden border-indigo-300/20">
@@ -1385,9 +1446,6 @@ export default function App() {
               );
             })}
             <div className="flex items-center gap-2">
-              <Button variant="ghost" className="h-9 w-9 p-0" onClick={toggleFullscreen} title={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}>
-                {isFullscreen ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
-              </Button>
               <span
                 className={cn(
                   "tab-status-dot",
