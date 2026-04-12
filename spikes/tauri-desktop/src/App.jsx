@@ -4,7 +4,6 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   Bluetooth,
-  CheckCircle2,
   ContactRound,
   Globe,
   MessageCircle,
@@ -207,6 +206,26 @@ function sanitizeDownloadFileName(input, fallback = "aethos-file") {
   return cleaned || fallback;
 }
 
+function PayPalIcon({ className = "h-5 w-5" }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true" className={className}>
+      <path d="M8.05 20 10.3 4.4c.08-.5.5-.87 1-.87h5.4c3.04 0 4.77 1.48 4.3 4.2-.23 1.33-.87 2.37-1.82 3.06-.95.69-2.21 1.01-3.66 1.01h-2.88c-.48 0-.89.35-.96.82L10.78 20H8.05Z" fill="#169BD7"/>
+      <path d="M5.34 20 7.85 2.65c.08-.5.5-.87 1-.87h5.8c1.87 0 3.24.38 4.08 1.18.4.38.68.82.84 1.32.16.49.17 1.08.03 1.75l-.1.48v.42c-.31 1.9-1.08 3.28-2.29 4.12-1.2.84-2.8 1.26-4.79 1.26H9.66c-.48 0-.89.35-.96.82L7.72 20H5.34Z" fill="#253B80"/>
+    </svg>
+  );
+}
+
+function EthereumIcon({ className = "h-5 w-5" }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true" className={className}>
+      <path d="M12 2 6.58 11.01 12 14.14l5.42-3.13L12 2Z" fill="#8B5CF6"/>
+      <path d="M12 15.2 6.58 12.07 12 22l5.42-9.93L12 15.2Z" fill="#4C8BFF"/>
+      <path d="M12 2v12.14l5.42-3.13L12 2Z" fill="#A78BFA"/>
+      <path d="M12 22v-6.8l5.42-3.13L12 22Z" fill="#60A5FA"/>
+    </svg>
+  );
+}
+
 function mediaStateKey(message) {
   const transferId = message?.media?.transferId;
   const objectSha = message?.media?.objectSha256Hex;
@@ -308,7 +327,7 @@ export default function App() {
   const [currentVersion, setCurrentVersion] = useState("0.0.0");
   const [updateNotice, setUpdateNotice] = useState(null);
   const [updateDismissed, setUpdateDismissed] = useState(false);
-  const [copyToast, setCopyToast] = useState("");
+  const [donateCopied, setDonateCopied] = useState(false);
   const [relayHealth, setRelayHealth] = useState(emptyRelay);
   const [gossipStatus, setGossipStatus] = useState(emptyGossip);
   const [encounterActivity, setEncounterActivity] = useState(emptyEncounterActivity);
@@ -329,6 +348,7 @@ export default function App() {
   const [logFilter, setLogFilter] = useState("all");
   const [arrivingMessageIds, setArrivingMessageIds] = useState({});
   const [confirmDialog, setConfirmDialog] = useState(null);
+  const [donateModalOpen, setDonateModalOpen] = useState(false);
   const logContainerRef = useRef(null);
   const threadContainerRef = useRef(null);
   const attachmentInputRef = useRef(null);
@@ -338,6 +358,7 @@ export default function App() {
   const hasHydratedIncomingRef = useRef(false);
   const [settingsModal, setSettingsModal] = useState(null);
   const [settingsDraft, setSettingsDraft] = useState({});
+  const [messageTtlDraft, setMessageTtlDraft] = useState("");
 
   const entries = useMemo(() => {
     const latestThreadActivityMs = (contactId) => {
@@ -747,6 +768,7 @@ export default function App() {
   useEffect(() => {
     if (!settings) return;
     setRelayEndpointsDraft((settings.relayEndpoints || []).join("\n"));
+    setMessageTtlDraft(String(settings.messageTtlSeconds ?? ""));
     setSettingsDraft({
       relaySyncEnabled: settings.relaySyncEnabled,
       gossipSyncEnabled: settings.gossipSyncEnabled,
@@ -755,6 +777,11 @@ export default function App() {
       enterToSend: settings.enterToSend !== false
     });
   }, [settings]);
+
+  const normalizedRelayEndpointsDraft = useMemo(() => String(relayEndpointsDraft || "")
+    .split("\n")
+    .map((v) => v.trim())
+    .filter(Boolean), [relayEndpointsDraft]);
 
   const saveChat = async (nextChat) => {
     const saved = await invoke("save_chat", { chat: nextChat });
@@ -1015,18 +1042,28 @@ export default function App() {
         if (!ok) throw new Error("clipboard_copy_failed");
       }
       setStatus("Crypto donation address copied");
-      setCopyToast("ETH address copied to clipboard");
+      setDonateCopied(true);
     } catch {
       setStatus("Could not copy crypto donation address");
       soundManager.play("error");
     }
   };
 
+  const openPayPalDonate = async () => {
+    try {
+      await invoke("open_external_url", { url: DONATE_PAYPAL_URL });
+      setStatus("Opened PayPal donation link");
+    } catch {
+      setStatus("Could not open PayPal donation link");
+      soundManager.play("error");
+    }
+  };
+
   useEffect(() => {
-    if (!copyToast) return;
-    const timer = setTimeout(() => setCopyToast(""), 2200);
+    if (!donateCopied) return;
+    const timer = setTimeout(() => setDonateCopied(false), 1800);
     return () => clearTimeout(timer);
-  }, [copyToast]);
+  }, [donateCopied]);
 
   const sendMessage = async () => {
     if (!selectedContactId) return setStatus("Select a contact before sending");
@@ -1146,48 +1183,84 @@ export default function App() {
     }
   };
 
-  const saveSettings = async (event) => {
-    event.preventDefault();
-    const form = new FormData(event.currentTarget);
-    const payload = {
-      ...settings,
-      ...settingsDraft,
-      messageTtlSeconds: Number(form.get("message_ttl_seconds") || settings.messageTtlSeconds),
-      relayEndpoints: String(relayEndpointsDraft || "")
-        .split("\n")
-        .map((v) => v.trim())
-        .filter(Boolean)
-    };
+  const persistSettings = async (payload, successMessage = "Settings saved") => {
     try {
       const saved = await withNetworkPulse(() => invoke("update_settings", { settings: payload }));
       setSettings(saved);
       setRelayHealth(await invoke("relay_health_status"));
       setGossipStatus(await invoke("gossip_status"));
       setLogTail(await invoke("read_app_log", { maxLines: 500 }));
-      setStatus("Settings saved");
+      setStatus(successMessage);
+      return saved;
     } catch (error) {
       setStatus(`Settings update failed: ${String(error)}`);
       soundManager.play("error");
+      return null;
     }
   };
+
+  const updateToggleSetting = async (key, value) => {
+    if (!settings) return;
+    const parsedMessageTtl = Number(messageTtlDraft);
+    const nextMessageTtlSeconds = messageTtlDraft.trim() !== "" && Number.isFinite(parsedMessageTtl)
+      ? parsedMessageTtl
+      : Number(settings.messageTtlSeconds);
+    const nextDraft = {
+      ...settingsDraft,
+      [key]: value
+    };
+    setSettingsDraft(nextDraft);
+    await persistSettings({
+      ...settings,
+      ...nextDraft,
+      relayEndpoints: normalizedRelayEndpointsDraft,
+      messageTtlSeconds: nextMessageTtlSeconds
+    }, "Settings saved");
+  };
+
+  useEffect(() => {
+    if (!settings) return;
+
+    const parsedMessageTtl = Number(messageTtlDraft);
+    const hasValidMessageTtlDraft = messageTtlDraft.trim() !== "" && Number.isFinite(parsedMessageTtl);
+    const nextMessageTtlSeconds = hasValidMessageTtlDraft
+      ? parsedMessageTtl
+      : Number(settings.messageTtlSeconds);
+
+    const persistedRelayEndpoints = (settings.relayEndpoints || []).map((value) => value.trim()).filter(Boolean);
+    const relayEndpointsChanged = normalizedRelayEndpointsDraft.join("\n") !== persistedRelayEndpoints.join("\n");
+    const ttlChanged = hasValidMessageTtlDraft && nextMessageTtlSeconds !== Number(settings.messageTtlSeconds);
+
+    if (!relayEndpointsChanged && !ttlChanged) return;
+
+    const timer = setTimeout(() => {
+      void persistSettings({
+        ...settings,
+        ...settingsDraft,
+        messageTtlSeconds: nextMessageTtlSeconds,
+        relayEndpoints: normalizedRelayEndpointsDraft
+      }, "Settings saved");
+    }, 500);
+
+    return () => clearTimeout(timer);
+  }, [messageTtlDraft, normalizedRelayEndpointsDraft, settings, settingsDraft]);
 
   const resetRelayEndpoints = async () => {
     if (!settings) return;
     const defaults = [DEFAULT_RELAY_ENDPOINT];
-    try {
-      const saved = await withNetworkPulse(() => invoke("update_settings", {
-        settings: {
-          ...settings,
-          relayEndpoints: defaults
-        }
-      }));
-      setSettings(saved);
-      setRelayEndpointsDraft(defaults.join("\n"));
-      setRelayHealth(await invoke("relay_health_status"));
-      setStatus("Relay configuration reset to default");
-    } catch (error) {
-      setStatus(`Relay reset failed: ${String(error)}`);
-      soundManager.play("error");
+    const parsedMessageTtl = Number(messageTtlDraft);
+    const nextMessageTtlSeconds = messageTtlDraft.trim() !== "" && Number.isFinite(parsedMessageTtl)
+      ? parsedMessageTtl
+      : Number(settings.messageTtlSeconds);
+    setRelayEndpointsDraft(defaults.join("\n"));
+    const saved = await persistSettings({
+      ...settings,
+      ...settingsDraft,
+      messageTtlSeconds: nextMessageTtlSeconds,
+      relayEndpoints: defaults
+    }, "Relay configuration reset to default");
+    if (!saved) {
+      setRelayEndpointsDraft((settings.relayEndpoints || []).join("\n"));
     }
   };
 
@@ -1268,32 +1341,26 @@ export default function App() {
                   </div>
                 </div>
                 <div className="hero-mark-wrap">
-                  <div className="hero-mark-ring" />
-                  <div className="hero-mark-shell">
-                    <img src="/logo.png" alt="Aethos mark" className="hero-mark" />
+                  <div className="hero-mark-stack">
+                    <div className="hero-mark-ring" />
+                    <div className="hero-mark-shell">
+                      <img src="/logo.png" alt="Aethos mark" className="hero-mark" />
+                    </div>
                   </div>
-                </div>
-                <div className="hero-donate-actions">
-                  <Button type="button" variant="secondary" size="sm" className="h-7 px-2 text-[11px]" onClick={copyDonateAddress}>
-                    ETH
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    className="h-7 border border-cyan-200/20 bg-background/30 px-2 text-[11px] hover:bg-cyan-500/10"
-                    onClick={async () => {
-                      try {
-                        await invoke("open_external_url", { url: DONATE_PAYPAL_URL });
-                        setStatus("Opened PayPal donation link");
-                      } catch {
-                        setStatus("Could not open PayPal donation link");
-                        soundManager.play("error");
-                      }
-                    }}
-                  >
-                    PayPal
-                  </Button>
+                  <div className="hero-donate-actions">
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="h-7 border border-blue-200/20 bg-background/30 px-3 text-[11px] text-blue-100 hover:bg-blue-500/10"
+                      onClick={() => {
+                        setDonateCopied(false);
+                        setDonateModalOpen(true);
+                      }}
+                    >
+                      Donate
+                    </Button>
+                  </div>
                 </div>
               </div>
             </CardContent>
@@ -1372,12 +1439,6 @@ export default function App() {
             </div>
           </div>
         </div>
-
-        {copyToast ? (
-          <div className="mb-2 inline-flex items-center rounded-md border border-cyan-300/40 bg-cyan-500/15 px-3 py-1.5 text-xs font-medium text-cyan-100">
-            {copyToast}
-          </div>
-        ) : null}
 
         {updateNotice && !updateDismissed ? (
           <Card className="mb-2 border-cyan-300/30 bg-cyan-500/8">
@@ -1654,6 +1715,72 @@ export default function App() {
           </div>
         ) : null}
 
+        {donateModalOpen ? (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 p-4">
+            <div className="flex w-full max-w-2xl flex-col rounded-2xl border border-blue-300/20 bg-slate-950/95 shadow-[0_30px_100px_rgba(0,0,0,0.55)] backdrop-blur-xl">
+              <div className="border-b border-border/50 p-5">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <h3 className="text-xl font-semibold text-slate-100">Support Aethos</h3>
+                    <p className="mt-1 max-w-xl text-sm leading-relaxed text-slate-300">
+                      Aethos began as Nathan Mellendorf’s vision for resilient, hard-to-suppress messaging. The protocol and clients continue to be designed and implemented through AI-assisted development with Anthropic Claude agent workflows, and donations help fund both the human direction behind the project and the compute that keeps improving the experience.
+                    </p>
+                  </div>
+                  <Button variant="ghost" size="sm" onClick={() => {
+                    setDonateCopied(false);
+                    setDonateModalOpen(false);
+                  }}>Close</Button>
+                </div>
+              </div>
+
+              <div className="grid gap-4 p-5 md:grid-cols-[1.2fr_0.8fr]">
+                <div className="rounded-2xl border border-blue-300/15 bg-blue-500/5 p-4">
+                  <h4 className="text-sm font-semibold uppercase tracking-[0.18em] text-blue-100/90">Why donate</h4>
+                  <div className="mt-3 space-y-3 text-sm leading-relaxed text-slate-300">
+                    <p>
+                      Contributions help sustain a free and unstoppable messaging platform while accelerating the protocol, desktop clients, and overall product polish.
+                    </p>
+                    <p>
+                      They also offset the AI time and compute used to ship new capabilities, refine the interface, and keep the platform moving forward.
+                    </p>
+                    <p className="text-slate-200">
+                      Thank you for using Aethos and for helping carry its message outward.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="space-y-3">
+                  <div className="rounded-2xl border border-border/60 bg-background/40 p-4">
+                    <div className="flex items-start gap-3">
+                      <div className="rounded-xl border border-violet-300/30 bg-violet-500/10 p-2 text-violet-100">
+                        <EthereumIcon className="h-5 w-5" />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <p className="font-semibold text-slate-100">Ethereum</p>
+                        <p className="mt-1 break-all text-xs text-slate-400">{DONATE_CRYPTO_ADDRESS}</p>
+                      </div>
+                    </div>
+                    <Button type="button" className="mt-3 w-full" onClick={copyDonateAddress}>{donateCopied ? "Copied" : "Copy ETH Address"}</Button>
+                  </div>
+
+                  <div className="rounded-2xl border border-border/60 bg-background/40 p-4">
+                    <div className="flex items-start gap-3">
+                      <div className="rounded-xl border border-blue-300/30 bg-blue-500/10 p-2 text-blue-100">
+                        <PayPalIcon className="h-5 w-5" />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <p className="font-semibold text-slate-100">PayPal</p>
+                        <p className="mt-1 text-xs text-slate-400">Fast support through the existing hosted PayPal donation flow.</p>
+                      </div>
+                    </div>
+                    <Button type="button" variant="secondary" className="mt-3 w-full" onClick={openPayPalDonate}>Open PayPal</Button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        ) : null}
+
         {tab === "contacts" && (
           <div className="grid gap-3 lg:grid-cols-2">
             <Card>
@@ -1679,7 +1806,7 @@ export default function App() {
               <CardHeader className="p-3 pb-1"><CardTitle className="text-base">Address Book</CardTitle></CardHeader>
               <CardContent className="space-y-1.5 p-3 pt-1">
                 {entries.map(([id, alias]) => (
-                  <button key={id} className={cn("w-full rounded-lg border p-2.5 text-left", id === selectedContactId ? "border-cyan-300 bg-cyan-500/20" : "border-border/60 bg-background/50")} onClick={() => selectContact(id)}>
+                  <button key={id} className={cn("w-full rounded-lg border p-2.5 text-left", id === selectedContactId ? "border-blue-300 bg-blue-500/20" : "border-border/60 bg-background/50")} onClick={() => selectContact(id)}>
                     <p className="truncate font-semibold">{alias || tinyId(id)}</p>
                     <p className="truncate text-xs text-muted-foreground">{id}</p>
                   </button>
@@ -1732,7 +1859,7 @@ export default function App() {
 
         {tab === "settings" && settings && (
           <div className="space-y-4">
-            <form className="space-y-6" onSubmit={saveSettings}>
+            <div className="space-y-6">
               <div className="grid gap-4 lg:grid-cols-2">
                 <Card className="border-border/60 bg-slate-900/50">
                   <CardHeader className="p-4 pb-2"><CardTitle className="text-lg">Sync & Features</CardTitle></CardHeader>
@@ -1742,7 +1869,7 @@ export default function App() {
                         <label className="text-sm font-medium leading-none text-slate-100">Enable relay sync</label>
                         <p className="text-xs text-muted-foreground">Sync messages automatically over the internet relay.</p>
                       </div>
-                      <Switch data-testid="settings-relay-sync" checked={settingsDraft.relaySyncEnabled} onCheckedChange={(v) => setSettingsDraft(d => ({...d, relaySyncEnabled: v}))} />
+                      <Switch data-testid="settings-relay-sync" checked={settingsDraft.relaySyncEnabled} onCheckedChange={(v) => void updateToggleSetting("relaySyncEnabled", v)} />
                     </div>
                     
                     <div className="flex items-center justify-between">
@@ -1750,7 +1877,7 @@ export default function App() {
                         <label className="text-sm font-medium leading-none text-slate-100">Enable LAN gossip sync</label>
                         <p className="text-xs text-muted-foreground">Exchange messages directly with peers on the local network.</p>
                       </div>
-                      <Switch data-testid="settings-gossip-sync" checked={settingsDraft.gossipSyncEnabled} onCheckedChange={(v) => setSettingsDraft(d => ({...d, gossipSyncEnabled: v}))} />
+                      <Switch data-testid="settings-gossip-sync" checked={settingsDraft.gossipSyncEnabled} onCheckedChange={(v) => void updateToggleSetting("gossipSyncEnabled", v)} />
                     </div>
 
                     <div className="flex items-center justify-between">
@@ -1758,7 +1885,7 @@ export default function App() {
                         <label className="text-sm font-medium leading-none text-slate-100">Enable BLE discovery</label>
                         <p className="text-xs text-muted-foreground">Broadcast and discover nearby Aethos clients over Bluetooth.</p>
                       </div>
-                      <Switch data-testid="settings-ble-discovery" checked={settingsDraft.bleDiscoveryEnabled} onCheckedChange={(v) => setSettingsDraft(d => ({...d, bleDiscoveryEnabled: v}))} />
+                      <Switch data-testid="settings-ble-discovery" checked={settingsDraft.bleDiscoveryEnabled} onCheckedChange={(v) => void updateToggleSetting("bleDiscoveryEnabled", v)} />
                     </div>
 
                     <div className="flex items-center justify-between">
@@ -1766,7 +1893,7 @@ export default function App() {
                         <label className="text-sm font-medium leading-none text-slate-100">Enable verbose logging</label>
                         <p className="text-xs text-muted-foreground">Capture detailed debug information in the local log file.</p>
                       </div>
-                      <Switch data-testid="settings-verbose-logging" checked={settingsDraft.verboseLoggingEnabled} onCheckedChange={(v) => setSettingsDraft(d => ({...d, verboseLoggingEnabled: v}))} />
+                      <Switch data-testid="settings-verbose-logging" checked={settingsDraft.verboseLoggingEnabled} onCheckedChange={(v) => void updateToggleSetting("verboseLoggingEnabled", v)} />
                     </div>
 
                     <div className="flex items-center justify-between">
@@ -1774,12 +1901,18 @@ export default function App() {
                         <label className="text-sm font-medium leading-none text-slate-100">Enter sends message</label>
                         <p className="text-xs text-muted-foreground">Press Enter to send (Shift+Enter for newline).</p>
                       </div>
-                      <Switch data-testid="settings-enter-to-send" checked={settingsDraft.enterToSend} onCheckedChange={(v) => setSettingsDraft(d => ({...d, enterToSend: v}))} />
+                      <Switch data-testid="settings-enter-to-send" checked={settingsDraft.enterToSend} onCheckedChange={(v) => void updateToggleSetting("enterToSend", v)} />
                     </div>
 
                     <div className="space-y-2 border-t border-border/40 pt-4">
                       <label className="text-sm font-medium leading-none text-slate-100">Message TTL (seconds)</label>
-                      <Input name="message_ttl_seconds" type="number" defaultValue={settings.messageTtlSeconds} className="max-w-[200px]" />
+                      <Input
+                        name="message_ttl_seconds"
+                        type="number"
+                        value={messageTtlDraft}
+                        onChange={(event) => setMessageTtlDraft(event.target.value)}
+                        className="max-w-[200px]"
+                      />
                     </div>
                   </CardContent>
                 </Card>
@@ -1807,12 +1940,11 @@ export default function App() {
               </div>
 
               <div className="flex flex-wrap items-center gap-3">
-                <Button data-testid="settings-save" type="submit"><CheckCircle2 className="mr-2 h-4 w-4" />Save Settings</Button>
                 <Button data-testid="settings-announce-gossip" type="button" variant="secondary" onClick={announceGossip}>Announce LAN Gossip</Button>
                 <div className="flex-1"></div>
                 <Button type="button" variant="destructive" onClick={clearAllMessages}>Delete ALL Messages</Button>
               </div>
-            </form>
+            </div>
 
             <div className="rounded-xl border border-border/40 bg-background/30 p-4">
               <h4 className="mb-3 text-sm font-medium text-slate-300">Advanced & Debugging</h4>
@@ -2030,8 +2162,8 @@ export default function App() {
         ) : null}
 
         <Card className="mt-2.5">
-          <CardContent className="flex items-center gap-2 py-2 text-sm text-cyan-100">
-            <Badge className="bg-cyan-500/20 border-cyan-400/40">Status</Badge>
+          <CardContent className="flex items-center gap-2 py-2 text-sm text-blue-100">
+            <Badge className="border-blue-300/40 bg-blue-500/20 text-blue-100">Status</Badge>
             <span data-testid="status-text">{status}</span>
           </CardContent>
         </Card>
