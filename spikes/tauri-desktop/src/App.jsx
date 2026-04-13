@@ -1345,10 +1345,11 @@ export default function App() {
   const filteredLogContent = filteredLogLines.join("\n");
 
   return (
-    <div className="relative min-h-screen overflow-x-hidden bg-[radial-gradient(circle_at_15%_10%,rgba(76,122,255,.26),transparent_42%),radial-gradient(circle_at_88%_-10%,rgba(42,189,255,.2),transparent_35%),#060914] text-foreground">
-      <div className="app-atmosphere" aria-hidden="true" />
-      <div className="app-atmosphere-grid" aria-hidden="true" />
-      <div className="window-chrome" data-tauri-drag-region>
+    <div className="app-shell">
+      <div className="app-shell__viewport relative h-full overflow-x-hidden rounded-[inherit] bg-[radial-gradient(circle_at_15%_10%,rgba(76,122,255,.26),transparent_42%),radial-gradient(circle_at_88%_-10%,rgba(42,189,255,.2),transparent_35%),#060914] text-foreground">
+        <div className="app-atmosphere" aria-hidden="true" />
+        <div className="app-atmosphere-grid" aria-hidden="true" />
+        <div className="window-chrome" data-tauri-drag-region>
         <div className="window-chrome__title" data-tauri-drag-region>
           <img src="/logo.png" alt="Aethos" className="window-chrome__logo" data-tauri-drag-region />
           <span data-tauri-drag-region>Aethos</span>
@@ -1365,7 +1366,7 @@ export default function App() {
           </button>
         </div>
       </div>
-      <div className="mx-auto max-w-7xl p-2.5 pt-11 md:p-3 md:pt-12">
+        <div className="app-shell__content mx-auto max-w-7xl p-2.5 pt-11 md:p-3 md:pt-12">
 
         <div className="hero-stack">
           <Card className="hero-banner mb-1.5 overflow-hidden border-indigo-300/20">
@@ -2235,6 +2236,7 @@ export default function App() {
             </div>
           </div>
         ) : null}
+        </div>
       </div>
     </div>
   );

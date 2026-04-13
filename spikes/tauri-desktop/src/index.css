@@ -28,12 +28,40 @@
 }
 
 body {
-  @apply m-0 bg-background text-foreground antialiased;
+  @apply m-0 bg-transparent text-foreground antialiased;
   font-family: "Plus Jakarta Sans", "Manrope", "Segoe UI", sans-serif;
+  overflow: hidden;
+}
+
+#root {
+  height: 100vh;
+  background: transparent;
+}
+
+.app-shell {
+  position: fixed;
+  inset: 8px;
+  border-radius: 22px;
+  overflow: hidden;
+  background: #060914;
+  border: none;
+  box-shadow: none;
+}
+
+.app-shell__viewport {
+  height: 100%;
+}
+
+.app-shell__content {
+  position: relative;
+  z-index: 1;
+  height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 
 .window-chrome {
-  position: fixed;
+  position: absolute;
   top: 0;
   left: 0;
   right: 0;
@@ -103,6 +131,17 @@ body {
 .window-chrome__button--close:hover {
   background: rgba(124, 58, 237, 0.24);
   border-color: rgba(196, 181, 253, 0.32);
+}
+
+@media (max-width: 768px) {
+  .app-shell {
+    inset: 6px;
+    border-radius: 18px;
+  }
+
+  .app-shell__content {
+    padding-top: 40px;
+  }
 }
 
 .app-atmosphere {
@@ -175,7 +214,7 @@ body {
 
 .tabs-dock {
   position: sticky;
-  top: 6px;
+  top: 0;
   z-index: 20;
   padding: 6px 8px;
   border: 1px solid rgba(148, 183, 231, 0.24);
