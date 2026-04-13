@@ -584,6 +584,16 @@ export default function App() {
     };
   }, []);
 
+  // macOS: transparent + undecorated windows need shadow enabled and
+  // explicit cursor-event opt-in for proper hit-testing.
+  useEffect(() => {
+    const ua = navigator.userAgent || "";
+    if (!/Macintosh|Mac OS X/i.test(ua)) return;
+    const appWindow = getCurrentWindow();
+    appWindow.setShadow(true).catch(() => {});
+    appWindow.setIgnoreCursorEvents(false).catch(() => {});
+  }, []);
+
   useEffect(() => {
     let disposed = false;
     let unlisten;
