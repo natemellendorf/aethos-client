@@ -2,7 +2,8 @@
   "app": {
     "windows": [
       {
-        "shadow": true
+        "shadow": true,
+        "backgroundColor": "#060914"
       }
     ]
   }
