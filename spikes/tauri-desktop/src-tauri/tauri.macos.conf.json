@@ -2,8 +2,8 @@
   "app": {
     "windows": [
       {
-        "shadow": true,
-        "backgroundColor": "#060914"
+        "decorations": true,
+        "transparent": false
       }
     ]
   }
