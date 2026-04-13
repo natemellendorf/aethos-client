@@ -2,9 +2,13 @@ use std::collections::HashMap;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
 use dbus::arg::{ArgType, PropMap, RefArg, Variant};
+#[cfg(target_os = "linux")]
 use dbus::blocking::stdintf::org_freedesktop_dbus::ObjectManager;
+#[cfg(target_os = "linux")]
 use dbus::blocking::Connection;
+#[cfg(target_os = "linux")]
 use dbus::Path;
 
 // ── Frozen constants (unchanged across protocol versions) ───────────────────
@@ -19,6 +23,7 @@ pub const AETHOS_BLE_PRIMARY_SERVICE_UUID_LE: [u8; 16] = [
     0x4e, 0xee, 0x0d, 0xd2, 0x6c, 0x0e, 0xf7, 0x87, 0xf9, 0x50, 0x29, 0x5a, 0x85, 0xa5, 0x1a, 0x18,
 ];
 
+#[cfg(target_os = "linux")]
 type BluezManagedObjects = HashMap<Path<'static>, HashMap<String, PropMap>>;
 
 // ── V2 wakeup hint types ────────────────────────────────────────────────────
@@ -299,6 +304,7 @@ impl ActivationWindowTracker {
 
 pub enum DiscoveryAdapter {
     Simulated(SimulatedBleDiscoverySource),
+    #[cfg(target_os = "linux")]
     BluetoothCtl(BluetoothCtlDiscoverySource),
     Disabled,
 }
@@ -307,6 +313,7 @@ impl BleDiscoverySource for DiscoveryAdapter {
     fn poll_signals(&mut self, now_unix_ms: u64) -> Vec<DiscoverySignal> {
         match self {
             Self::Simulated(source) => source.poll_signals(now_unix_ms),
+            #[cfg(target_os = "linux")]
             Self::BluetoothCtl(source) => source.poll_signals(now_unix_ms),
             Self::Disabled => Vec::new(),
         }
@@ -315,6 +322,7 @@ impl BleDiscoverySource for DiscoveryAdapter {
     fn poll_signals_with_diagnostics(&mut self, now_unix_ms: u64) -> BleSourcePollReport {
         match self {
             Self::Simulated(source) => source.poll_signals_with_diagnostics(now_unix_ms),
+            #[cfg(target_os = "linux")]
             Self::BluetoothCtl(source) => source.poll_signals_with_diagnostics(now_unix_ms),
             Self::Disabled => BleSourcePollReport::empty(),
         }
@@ -337,7 +345,14 @@ pub fn discovery_adapter_from_env() -> DiscoveryAdapter {
         return DiscoveryAdapter::Disabled;
     }
 
-    DiscoveryAdapter::BluetoothCtl(BluetoothCtlDiscoverySource::default())
+    #[cfg(target_os = "linux")]
+    {
+        DiscoveryAdapter::BluetoothCtl(BluetoothCtlDiscoverySource::default())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        DiscoveryAdapter::Disabled
+    }
 }
 
 // ── Simulated source (v2 — UUID-only matching) ─────────────────────────────
@@ -458,8 +473,9 @@ impl BleDiscoverySource for SimulatedBleDiscoverySource {
     }
 }
 
-// ── BlueZ D-Bus source ─────────────────────────────────────────────────────
+// ── BlueZ D-Bus source (Linux only) ────────────────────────────────────────
 
+#[cfg(target_os = "linux")]
 pub struct BluetoothCtlDiscoverySource {
     poll_interval: Duration,
     last_poll: Option<Instant>,
@@ -469,6 +485,7 @@ pub struct BluetoothCtlDiscoverySource {
     bluez_discovery_requested: bool,
 }
 
+#[cfg(target_os = "linux")]
 impl Default for BluetoothCtlDiscoverySource {
     fn default() -> Self {
         Self {
@@ -485,6 +502,7 @@ impl Default for BluetoothCtlDiscoverySource {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl BleDiscoverySource for BluetoothCtlDiscoverySource {
     fn poll_signals(&mut self, now_unix_ms: u64) -> Vec<DiscoverySignal> {
         self.poll_signals_with_diagnostics(now_unix_ms).accepted
@@ -518,6 +536,7 @@ impl BleDiscoverySource for BluetoothCtlDiscoverySource {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl BluetoothCtlDiscoverySource {
     fn poll_signals_via_bluez_dbus(&mut self, now_unix_ms: u64) -> Option<BleSourcePollReport> {
         if self.bluez.is_none() {
@@ -544,13 +563,15 @@ impl BluetoothCtlDiscoverySource {
     }
 }
 
-// ── BlueZ D-Bus helpers ────────────────────────────────────────────────────
+// ── BlueZ D-Bus helpers (Linux only) ───────────────────────────────────────
 
+#[cfg(target_os = "linux")]
 fn read_bluez_managed_objects(connection: &Connection) -> Option<BluezManagedObjects> {
     let proxy = connection.with_proxy("org.bluez", "/", Duration::from_millis(1200));
     proxy.get_managed_objects().ok()
 }
 
+#[cfg(target_os = "linux")]
 fn find_bluez_adapter_path(managed: &BluezManagedObjects) -> Option<String> {
     managed
         .iter()
@@ -558,6 +579,7 @@ fn find_bluez_adapter_path(managed: &BluezManagedObjects) -> Option<String> {
         .map(|(path, _)| path.to_string())
 }
 
+#[cfg(target_os = "linux")]
 fn request_bluez_start_discovery(connection: &Connection, adapter_path: &str) {
     let proxy = connection.with_proxy("org.bluez", adapter_path, Duration::from_millis(1200));
     let mut filter = PropMap::new();
@@ -572,6 +594,7 @@ fn request_bluez_start_discovery(connection: &Connection, adapter_path: &str) {
 /// Acceptance: device exposes the Aethos UUID in its `UUIDs` property.
 /// The BLE address is used as the `peer_hint` (unstable, for debounce only).
 /// Any service data (0x21) is ignored per v2 §6.3.
+#[cfg(target_os = "linux")]
 fn parse_bluez_managed_objects(
     managed: &BluezManagedObjects,
     now_unix_ms: u64,
@@ -632,17 +655,20 @@ fn parse_bluez_managed_objects(
     report
 }
 
-// ── D-Bus property helpers ─────────────────────────────────────────────────
+// ── D-Bus property helpers (Linux only) ────────────────────────────────────
 
+#[cfg(target_os = "linux")]
 fn prop_string(props: &PropMap, key: &str) -> Option<String> {
     props.get(key)?.0.as_str().map(|value| value.to_string())
 }
 
+#[cfg(target_os = "linux")]
 fn prop_i16(props: &PropMap, key: &str) -> Option<i16> {
     let value = props.get(key)?.0.as_i64()?;
     i16::try_from(value).ok()
 }
 
+#[cfg(target_os = "linux")]
 fn prop_string_array(props: &PropMap, key: &str) -> Vec<String> {
     props
         .get(key)
@@ -654,6 +680,7 @@ fn prop_string_array(props: &PropMap, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+#[cfg(target_os = "linux")]
 #[allow(dead_code)]
 fn prop_service_data(props: &PropMap) -> HashMap<String, Vec<u8>> {
     let mut out = HashMap::new();
@@ -686,6 +713,7 @@ fn prop_service_data(props: &PropMap) -> HashMap<String, Vec<u8>> {
     out
 }
 
+#[cfg(target_os = "linux")]
 fn unwrap_variant(arg: &dyn RefArg) -> &dyn RefArg {
     if arg.arg_type() != ArgType::Variant {
         return arg;
@@ -695,6 +723,7 @@ fn unwrap_variant(arg: &dyn RefArg) -> &dyn RefArg {
         .unwrap_or(arg)
 }
 
+#[cfg(target_os = "linux")]
 fn refarg_bytes(arg: &dyn RefArg) -> Option<Vec<u8>> {
     let iter = arg.as_iter()?;
     let mut out = Vec::new();

@@ -28,6 +28,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 url = "2"
 webbrowser = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
 dbus = "0.9"
 dbus-crossroads = "0.5"
 

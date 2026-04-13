@@ -5,6 +5,7 @@
 
 mod app_body;
 mod app_state;
+#[cfg(target_os = "linux")]
 mod ble_advertiser;
 mod media_v1;
 
@@ -39,6 +40,7 @@ use app_state::{
     OutboundState, PersistedChatState,
 };
 use base64::Engine;
+#[cfg(target_os = "linux")]
 use ble_advertiser::{AdvertiserPollEvent, CanonicalBleAdvertiser};
 use image::{imageops::FilterType, ImageBuffer, Luma, Rgba, RgbaImage};
 use qrcode::QrCode;
@@ -2765,6 +2767,7 @@ fn start_gossip_worker_if_needed(initial_enabled: bool, initial_ble_discovery_en
         let mut ble_discovery_gate = BleDiscoveryGate::new(Duration::from_secs(30));
         let mut ble_activation_windows = ActivationWindowTracker::new(Duration::from_secs(30), 4);
         let mut ble_encounters: HashMap<String, EncounterManager> = HashMap::new();
+        #[cfg(target_os = "linux")]
         let mut ble_advertiser = CanonicalBleAdvertiser::new();
         let mut last_missing_pulse = Instant::now() - Duration::from_millis(500);
         let tcp_listener = match bind_gossip_tcp_listener() {
@@ -2824,6 +2827,7 @@ fn start_gossip_worker_if_needed(initial_enabled: bool, initial_ble_discovery_en
 
             flush_media_control_fastlane(&socket, &peer_addr_by_node);
 
+            #[cfg(target_os = "linux")]
             if let Some(event) = ble_advertiser.poll() {
                 match event {
                     AdvertiserPollEvent::Started(report) => {
