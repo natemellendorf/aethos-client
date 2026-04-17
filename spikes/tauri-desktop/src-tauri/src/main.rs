@@ -3624,10 +3624,12 @@ fn handle_gossip_frame(
                     .finish(EncounterStopReason::ByteBudgetExceeded, "udp_transfer");
             }
 
-            let receipt = GossipSyncFrame::Receipt(ReceiptFrame {
-                received: result.accepted_item_ids,
-            });
-            let _ = send_gossip_frame(socket, &source.ip().to_string(), source.port(), &receipt);
+            if !result.receipt_item_ids.is_empty() {
+                let receipt = GossipSyncFrame::Receipt(ReceiptFrame {
+                    received: result.receipt_item_ids,
+                });
+                let _ = send_gossip_frame(socket, &source.ip().to_string(), source.port(), &receipt);
+            }
             log_verbose(&format!(
                 "gossip_encounter_round: transport=udp trigger=transfer peer={} round={} frame=TRANSFER transfer_objects={} transfer_bytes={} accepted_delta={} accepted_total={} rejected={} bytes_imported={} no_progress_streak={}",
                 interaction.encounter.peer_identity,
@@ -3998,9 +4000,9 @@ fn run_gossip_tcp_encounter_on_stream(
                     break;
                 }
 
-                if !push_only_transfer_mode {
+                if !result.receipt_item_ids.is_empty() {
                     let receipt = GossipSyncFrame::Receipt(ReceiptFrame {
-                        received: result.accepted_item_ids,
+                        received: result.receipt_item_ids.clone(),
                     });
                     if let Err(err) = send_gossip_frame_tcp(stream, &receipt) {
                         log_verbose(&format!(
@@ -4008,6 +4010,8 @@ fn run_gossip_tcp_encounter_on_stream(
                             transport_peer, err
                         ));
                     }
+                }
+                if !push_only_transfer_mode {
                     if let Ok(summary) = build_gossip_summary_frame(now_unix_ms()) {
                         let _ = send_gossip_frame_tcp(stream, &summary);
                     }
