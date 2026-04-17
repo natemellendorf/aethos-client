@@ -836,17 +836,19 @@ fn run_relay_round_on_socket(
                 )?;
                 made_progress = !imported.accepted_item_ids.is_empty();
 
-                let received = imported.accepted_item_ids.clone();
-                send_binary_frame(
-                    socket,
-                    &GossipSyncFrame::Receipt(crate::aethos_core::gossip_sync::ReceiptFrame {
-                        received,
-                    }),
-                )?;
+                let received = imported.receipt_item_ids.clone();
+                if !received.is_empty() {
+                    send_binary_frame(
+                        socket,
+                        &GossipSyncFrame::Receipt(crate::aethos_core::gossip_sync::ReceiptFrame {
+                            received,
+                        }),
+                    )?;
+                }
                 log_verbose(&format!(
                     "relay_encounter_send_receipt: relay_ws={} received_items={} new_messages={}",
                     relay_ws,
-                    imported.accepted_item_ids.len(),
+                    imported.receipt_item_ids.len(),
                     imported.new_messages.len()
                 ));
 

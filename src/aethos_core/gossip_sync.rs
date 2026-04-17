@@ -123,6 +123,7 @@ pub struct ImportedEnvelope {
 #[derive(Debug, Clone)]
 pub struct ImportTransferResult {
     pub accepted_item_ids: Vec<String>,
+    pub receipt_item_ids: Vec<String>,
     pub rejected_items: Vec<RejectedItem>,
     pub new_messages: Vec<ImportedEnvelope>,
 }
@@ -1186,6 +1187,7 @@ pub fn import_transfer_items(
         now_ms
     ));
     let mut accepted_item_ids = Vec::new();
+    let mut receipt_item_ids = Vec::new();
     let mut rejected_items = Vec::new();
     let mut new_messages = Vec::new();
     let mut pending_new_records = BTreeMap::<String, ImportWriteObject>::new();
@@ -1242,6 +1244,7 @@ pub fn import_transfer_items(
                 });
             }
             Some(existing_item) if object.hop_count < existing_item.hop_count => {
+                receipt_item_ids.push(object.item_id.clone());
                 rejected_items.push(RejectedItem {
                     item_id: object.item_id.clone(),
                     code: "HOP_REGRESSION".to_string(),
@@ -1250,6 +1253,7 @@ pub fn import_transfer_items(
             }
             Some(_) => {
                 accepted_item_ids.push(object.item_id.clone());
+                receipt_item_ids.push(object.item_id.clone());
             }
             None => {
                 let insert = ImportWriteObject {
@@ -1262,6 +1266,7 @@ pub fn import_transfer_items(
                 pending_new_records.insert(object.item_id.clone(), insert.clone());
                 pending_new_inserts.push(insert);
                 accepted_item_ids.push(object.item_id.clone());
+                receipt_item_ids.push(object.item_id.clone());
                 if parsed.to_wayfarer_id_hex == local_wayfarer_id {
                     let preview_text = decode_envelope_payload_text_preview(&object.envelope_b64)
                         .unwrap_or_default();
@@ -1287,13 +1292,15 @@ pub fn import_transfer_items(
 
     gossip_store_sqlite::insert_import_items(&pending_new_inserts, now_ms)?;
     log_verbose(&format!(
-        "transfer_import_done: accepted={} rejected={} new_messages={}",
+        "transfer_import_done: accepted={} receipt={} rejected={} new_messages={}",
         accepted_item_ids.len(),
+        receipt_item_ids.len(),
         rejected_items.len(),
         new_messages.len()
     ));
     Ok(ImportTransferResult {
         accepted_item_ids,
+        receipt_item_ids,
         rejected_items,
         new_messages,
     })
@@ -1955,9 +1962,66 @@ mod tests {
         )
         .expect("import mixed objects");
 
-        assert_eq!(imported.accepted_item_ids, vec![valid_item]);
+        assert_eq!(imported.accepted_item_ids, vec![valid_item.clone()]);
+        assert_eq!(imported.receipt_item_ids, vec![valid_item]);
         assert_eq!(imported.rejected_items.len(), 1);
         assert_eq!(imported.rejected_items[0].code, "MALFORMED_OBJECT");
+    }
+
+    #[test]
+    fn import_transfer_acknowledges_known_item_after_hop_regression() {
+        let _lock = test_env_lock().lock().expect("lock test env");
+        let temp_dir = unique_test_state_dir("aethos-gossip-import-hop-regression-ack");
+        let _env_guard = EnvVarGuard::set("XDG_STATE_HOME", &temp_dir);
+
+        let local_wayfarer = item(0x57);
+        let signing_seed = [9u8; 32];
+        let payload = crate::aethos_core::protocol::build_envelope_payload_b64_from_utf8(
+            &local_wayfarer,
+            "hello",
+            &signing_seed,
+        )
+        .expect("payload");
+        let item_id = super::item_id_from_envelope_bytes(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(&payload)
+                .expect("decode payload"),
+        );
+
+        let first_import = import_transfer_items(
+            &local_wayfarer,
+            Some("10.0.0.2:47655"),
+            Some(&item(0x31)),
+            &[TransferObject {
+                item_id: item_id.clone(),
+                envelope_b64: payload.clone(),
+                expiry_unix_ms: now_unix_ms() + 60_000,
+                hop_count: 2,
+            }],
+            now_unix_ms(),
+        )
+        .expect("initial import");
+        assert_eq!(first_import.accepted_item_ids, vec![item_id.clone()]);
+        assert_eq!(first_import.receipt_item_ids, vec![item_id.clone()]);
+
+        let second_import = import_transfer_items(
+            &local_wayfarer,
+            Some("10.0.0.2:47655"),
+            Some(&item(0x31)),
+            &[TransferObject {
+                item_id: item_id.clone(),
+                envelope_b64: payload,
+                expiry_unix_ms: now_unix_ms() + 60_000,
+                hop_count: 1,
+            }],
+            now_unix_ms(),
+        )
+        .expect("followup import");
+
+        assert!(second_import.accepted_item_ids.is_empty());
+        assert_eq!(second_import.receipt_item_ids, vec![item_id]);
+        assert_eq!(second_import.rejected_items.len(), 1);
+        assert_eq!(second_import.rejected_items[0].code, "HOP_REGRESSION");
     }
 
     #[test]

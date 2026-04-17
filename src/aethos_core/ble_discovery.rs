@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
