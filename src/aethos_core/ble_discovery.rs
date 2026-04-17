@@ -9,6 +9,8 @@ use dbus::blocking::stdintf::org_freedesktop_dbus::ObjectManager;
 use dbus::blocking::Connection;
 #[cfg(target_os = "linux")]
 use dbus::Path;
+#[cfg(target_os = "linux")]
+use std::process::Command;
 
 // ── Frozen constants (unchanged across protocol versions) ───────────────────
 
