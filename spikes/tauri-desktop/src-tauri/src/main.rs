@@ -7,6 +7,8 @@ mod app_body;
 mod app_state;
 #[cfg(target_os = "linux")]
 mod ble_advertiser;
+#[cfg(target_os = "linux")]
+mod bonjour_discovery;
 mod media_v1;
 
 #[allow(dead_code)]
@@ -42,6 +44,8 @@ use app_state::{
 use base64::Engine;
 #[cfg(target_os = "linux")]
 use ble_advertiser::{AdvertiserPollEvent, CanonicalBleAdvertiser};
+#[cfg(target_os = "linux")]
+use bonjour_discovery::{BonjourDiscoveryEvent, BonjourLanDiscovery, BonjourResolvedPeer};
 use image::{imageops::FilterType, ImageBuffer, Luma, Rgba, RgbaImage};
 use qrcode::QrCode;
 use serde::{Deserialize, Serialize};
@@ -119,6 +123,7 @@ const LAN_ENCOUNTER_MAX_NO_PROGRESS_STREAK: usize = 2;
 const LAN_ENCOUNTER_MAX_TIME_MS: u64 = 3_000;
 const LAN_ENCOUNTER_MAX_BYTES: u64 = 2_000_000;
 const LAN_ENCOUNTER_IDLE_BACKOFF_MS: u64 = 70;
+const BONJOUR_HELLO_COOLDOWN_MS: u64 = 3_000;
 const GOSSIP_UDP_SOCKET_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const E2E_UDP_TRANSFER_FRAME_MAX_BYTES_DEFAULT: usize = 32 * 1024;
 const UDP_TRANSFER_FRAME_HARD_MAX_BYTES: usize = 65_507;
@@ -528,6 +533,54 @@ fn ensure_udp_peer_interaction<'a>(
         .expect("udp peer interaction must exist");
     interaction.last_seen = Instant::now();
     interaction
+}
+
+fn prune_finished_udp_encounters(
+    peer_node_by_addr: &mut HashMap<String, String>,
+    peer_addr_by_node: &mut HashMap<String, SocketAddr>,
+    peer_tcp_capable_by_ip: &mut HashMap<String, bool>,
+    tcp_backoff_until_by_ip: &mut HashMap<String, Instant>,
+    udp_peer_interactions: &mut HashMap<String, UdpPeerInteraction>,
+    recent_served_request_by_peer: &mut HashMap<String, (u64, Instant)>,
+    recent_outbound_request_by_peer: &mut HashMap<String, (u64, Instant)>,
+) {
+    let now = Instant::now();
+    let mut finished = Vec::new();
+
+    for (peer_ip, interaction) in udp_peer_interactions.iter_mut() {
+        if interaction.encounter.stop_reason.is_none()
+            && (interaction.encounter.elapsed_ms() >= LAN_ENCOUNTER_MAX_TIME_MS as u128
+                || now.saturating_duration_since(interaction.last_seen)
+                    > Duration::from_millis(LAN_ENCOUNTER_MAX_TIME_MS))
+        {
+            interaction
+                .encounter
+                .finish(EncounterStopReason::PeerTimeout, "udp_peer_idle");
+        }
+
+        if interaction.encounter.stop_reason.is_some() {
+            finished.push((peer_ip.clone(), interaction.encounter.peer_identity.clone()));
+        }
+    }
+
+    for (peer_ip, peer_identity) in finished {
+        udp_peer_interactions.remove(&peer_ip);
+        peer_tcp_capable_by_ip.remove(&peer_ip);
+        tcp_backoff_until_by_ip.remove(&peer_ip);
+        recent_served_request_by_peer.remove(&peer_ip);
+        recent_outbound_request_by_peer.remove(&peer_ip);
+
+        peer_node_by_addr.retain(|key, value| {
+            value != &peer_identity && key != &peer_ip && !key.starts_with(&format!("{peer_ip}:"))
+        });
+        peer_addr_by_node
+            .retain(|node_id, addr| node_id != &peer_identity && addr.ip().to_string() != peer_ip);
+
+        log_verbose(&format!(
+            "gossip_encounter_state_pruned peer={} peer_ip={}",
+            peer_identity, peer_ip
+        ));
+    }
 }
 
 struct GossipRuntime {
@@ -2769,6 +2822,15 @@ fn start_gossip_worker_if_needed(initial_enabled: bool, initial_ble_discovery_en
         let mut ble_encounters: HashMap<String, EncounterManager> = HashMap::new();
         #[cfg(target_os = "linux")]
         let mut ble_advertiser = CanonicalBleAdvertiser::new();
+        #[cfg(target_os = "linux")]
+        let mut bonjour_discovery = BonjourLanDiscovery::new(
+            &ensure_local_identity()
+                .map(|identity| identity.wayfarer_id)
+                .unwrap_or_else(|_| "unknown-local-peer".to_string()),
+            gossip_lan_port(),
+        );
+        #[cfg(target_os = "linux")]
+        let mut recent_bonjour_hello_by_peer: HashMap<String, Instant> = HashMap::new();
         let mut last_missing_pulse = Instant::now() - Duration::from_millis(500);
         let tcp_listener = match bind_gossip_tcp_listener() {
             Ok(listener) => Some(listener),
@@ -2784,6 +2846,16 @@ fn start_gossip_worker_if_needed(initial_enabled: bool, initial_ble_discovery_en
                 thread::sleep(Duration::from_millis(120));
                 continue;
             }
+
+            prune_finished_udp_encounters(
+                &mut peer_node_by_addr,
+                &mut peer_addr_by_node,
+                &mut peer_tcp_capable_by_ip,
+                &mut tcp_backoff_until_by_ip,
+                &mut udp_peer_interactions,
+                &mut recent_served_request_by_peer,
+                &mut recent_outbound_request_by_peer,
+            );
 
             let force_announce = runtime.force_announce.swap(false, Ordering::SeqCst);
             if force_announce || last_inventory_broadcast.elapsed() >= Duration::from_secs(3) {
@@ -2838,6 +2910,48 @@ fn start_gossip_worker_if_needed(initial_enabled: bool, initial_ble_discovery_en
                     }
                     AdvertiserPollEvent::Error(err) => {
                         log_error(&format!("ble_advertiser_error: {err}"));
+                    }
+                }
+            }
+
+            #[cfg(target_os = "linux")]
+            for event in bonjour_discovery.poll() {
+                match event {
+                    BonjourDiscoveryEvent::AdvertisementStarted {
+                        service_type,
+                        instance_name,
+                        domain,
+                        port,
+                    } => {
+                        log_info(&format!(
+                            "bonjour_advertisement_started service_type={} instance_name={} domain={} port={}",
+                            service_type, instance_name, domain, port
+                        ));
+                    }
+                    BonjourDiscoveryEvent::PeerDiscovered { fullname } => {
+                        log_info(&format!("bonjour_peer_discovered fullname={}", fullname));
+                    }
+                    BonjourDiscoveryEvent::EndpointResolved(resolved) => {
+                        log_info(&format!(
+                            "bonjour_endpoint_resolved endpoint={} fullname={}",
+                            resolved.endpoint, resolved.fullname
+                        ));
+                        if let Err(err) = maybe_trigger_bonjour_hello(
+                            &socket,
+                            &resolved,
+                            &mut peer_node_by_addr,
+                            &mut peer_addr_by_node,
+                            &udp_peer_interactions,
+                            &mut recent_bonjour_hello_by_peer,
+                        ) {
+                            log_error(&format!(
+                                "bonjour_hello_send_failed endpoint={} error={}",
+                                resolved.endpoint, err
+                            ));
+                        }
+                    }
+                    BonjourDiscoveryEvent::Error(err) => {
+                        log_error(&format!("bonjour_discovery_error: {err}"));
                     }
                 }
             }
@@ -2899,6 +3013,15 @@ fn start_gossip_worker_if_needed(initial_enabled: bool, initial_ble_discovery_en
                     ) {
                         log_info(&format!("gossip_frame_handle_error from {source}: {err}"));
                     }
+                    prune_finished_udp_encounters(
+                        &mut peer_node_by_addr,
+                        &mut peer_addr_by_node,
+                        &mut peer_tcp_capable_by_ip,
+                        &mut tcp_backoff_until_by_ip,
+                        &mut udp_peer_interactions,
+                        &mut recent_served_request_by_peer,
+                        &mut recent_outbound_request_by_peer,
+                    );
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(30));
@@ -3085,6 +3208,102 @@ fn summarize_peer_hint_for_activity(peer_hint: &str) -> String {
         return normalized;
     }
     format!("{}...", &normalized[..16])
+}
+
+#[cfg(target_os = "linux")]
+fn udp_peer_interaction_active_for_identity(
+    udp_peer_interactions: &HashMap<String, UdpPeerInteraction>,
+    peer_identity: &str,
+) -> bool {
+    udp_peer_interactions.values().any(|interaction| {
+        interaction.encounter.peer_identity == peer_identity
+            && interaction.encounter.stop_reason.is_none()
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn udp_peer_interaction_active_for_endpoint(
+    peer_node_by_addr: &HashMap<String, String>,
+    udp_peer_interactions: &HashMap<String, UdpPeerInteraction>,
+    endpoint: SocketAddr,
+) -> bool {
+    let endpoint_key = endpoint.to_string();
+    let ip_key = endpoint.ip().to_string();
+
+    if let Some(peer_identity) = peer_node_by_addr
+        .get(&endpoint_key)
+        .or_else(|| peer_node_by_addr.get(&ip_key))
+    {
+        return udp_peer_interaction_active_for_identity(udp_peer_interactions, peer_identity);
+    }
+
+    udp_peer_interactions
+        .get(&ip_key)
+        .map(|interaction| interaction.encounter.stop_reason.is_none())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn maybe_trigger_bonjour_hello(
+    socket: &UdpSocket,
+    resolved: &BonjourResolvedPeer,
+    peer_node_by_addr: &mut HashMap<String, String>,
+    peer_addr_by_node: &mut HashMap<String, SocketAddr>,
+    udp_peer_interactions: &HashMap<String, UdpPeerInteraction>,
+    recent_bonjour_hello_by_peer: &mut HashMap<String, Instant>,
+) -> Result<bool, String> {
+    let now = Instant::now();
+    recent_bonjour_hello_by_peer.retain(|_, seen_at| {
+        now.saturating_duration_since(*seen_at) < Duration::from_millis(BONJOUR_HELLO_COOLDOWN_MS)
+    });
+
+    if udp_peer_interaction_active_for_endpoint(
+        peer_node_by_addr,
+        udp_peer_interactions,
+        resolved.endpoint,
+    ) {
+        log_verbose(&format!(
+            "bonjour_duplicate_opportunity_suppressed endpoint={} reason=active_encounter",
+            resolved.endpoint
+        ));
+        return Ok(false);
+    }
+
+    let cooldown_key = resolved.endpoint.to_string();
+    if let Some(last_sent) = recent_bonjour_hello_by_peer.get(&cooldown_key) {
+        if now.saturating_duration_since(*last_sent)
+            < Duration::from_millis(BONJOUR_HELLO_COOLDOWN_MS)
+        {
+            log_verbose(&format!(
+                "bonjour_duplicate_opportunity_suppressed endpoint={} reason=cooldown cooldown_ms={}",
+                resolved.endpoint,
+                BONJOUR_HELLO_COOLDOWN_MS
+            ));
+            return Ok(false);
+        }
+    }
+
+    peer_node_by_addr.remove(&resolved.endpoint.to_string());
+    peer_addr_by_node.retain(|_, addr| *addr != resolved.endpoint);
+    let identity = ensure_local_identity()?;
+    let node_pubkey_raw = base64::engine::general_purpose::STANDARD
+        .decode(&identity.verifying_key_b64)
+        .map_err(|err| format!("gossip pubkey decode failed: {err}"))?;
+    let node_pubkey = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(node_pubkey_raw);
+    let hello = build_lan_hello_frame(&identity.wayfarer_id, &node_pubkey)?;
+
+    send_gossip_frame(
+        socket,
+        &resolved.endpoint.ip().to_string(),
+        resolved.endpoint.port(),
+        &hello,
+    )?;
+    recent_bonjour_hello_by_peer.insert(cooldown_key, now);
+    log_info(&format!(
+        "bonjour_hello_sent endpoint={} fullname={}",
+        resolved.endpoint, resolved.fullname
+    ));
+    Ok(true)
 }
 
 fn truncate_activity_message(input: &str, max_chars: usize) -> String {
@@ -3628,7 +3847,8 @@ fn handle_gossip_frame(
                 let receipt = GossipSyncFrame::Receipt(ReceiptFrame {
                     received: result.receipt_item_ids,
                 });
-                let _ = send_gossip_frame(socket, &source.ip().to_string(), source.port(), &receipt);
+                let _ =
+                    send_gossip_frame(socket, &source.ip().to_string(), source.port(), &receipt);
             }
             log_verbose(&format!(
                 "gossip_encounter_round: transport=udp trigger=transfer peer={} round={} frame=TRANSFER transfer_objects={} transfer_bytes={} accepted_delta={} accepted_total={} rejected={} bytes_imported={} no_progress_streak={}",
@@ -6092,6 +6312,208 @@ mod tests {
             }
             other => panic!("expected HELLO, got {other:?}"),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bonjour_route_maps_summary_to_canonical_peer_identity() {
+        let socket = UdpSocket::bind(("127.0.0.1", 0)).expect("bind udp socket");
+        let runtime = GossipRuntime::new(true, true);
+        let resolved = BonjourResolvedPeer {
+            fullname: "peer._aethos._udp.local.".to_string(),
+            endpoint: "127.0.0.1:47655".parse().expect("parse endpoint"),
+        };
+        let summary = GossipSyncFrame::Summary(crate::aethos_core::gossip_sync::SummaryFrame {
+            bloom_filter: vec![0u8; crate::aethos_core::gossip_sync::BLOOM_FILTER_BYTES],
+            item_count: 0,
+            preview_item_ids: None,
+            preview_cursor: None,
+        });
+        let raw = serialize_gossip_frame(&summary).expect("serialize summary");
+
+        let mut peer_node_by_addr = HashMap::new();
+        let mut peer_addr_by_node = HashMap::new();
+        let mut peer_tcp_capable_by_ip = HashMap::new();
+        let mut tcp_backoff_until_by_ip = HashMap::new();
+        let mut udp_peer_interactions = HashMap::new();
+        let mut recent_served_request_by_peer = HashMap::new();
+        let mut recent_outbound_request_by_peer = HashMap::new();
+
+        peer_node_by_addr.insert(
+            resolved.endpoint.to_string(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        );
+        peer_addr_by_node.insert(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            resolved.endpoint,
+        );
+
+        handle_gossip_frame(
+            &socket,
+            &raw,
+            resolved.endpoint,
+            &mut peer_node_by_addr,
+            &mut peer_addr_by_node,
+            &mut peer_tcp_capable_by_ip,
+            &mut tcp_backoff_until_by_ip,
+            &mut udp_peer_interactions,
+            &mut recent_served_request_by_peer,
+            &mut recent_outbound_request_by_peer,
+            &runtime,
+        )
+        .expect("handle summary");
+
+        let interaction = udp_peer_interactions
+            .get(&resolved.endpoint.ip().to_string())
+            .expect("interaction should exist");
+        assert_eq!(
+            interaction.encounter.peer_identity,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bonjour_duplicate_opportunity_is_suppressed_for_active_peer() {
+        let sender = UdpSocket::bind(("127.0.0.1", 0)).expect("bind sender");
+        let mut peer_node_by_addr = HashMap::new();
+        let mut peer_addr_by_node = HashMap::new();
+        let mut udp_peer_interactions = HashMap::new();
+        let mut recent_bonjour_hello_by_peer = HashMap::new();
+        let resolved = BonjourResolvedPeer {
+            fullname: "peer._aethos._udp.local.".to_string(),
+            endpoint: "127.0.0.1:47655".parse().expect("parse endpoint"),
+        };
+
+        udp_peer_interactions.insert(
+            resolved.endpoint.ip().to_string(),
+            new_udp_peer_interaction(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            ),
+        );
+        peer_node_by_addr.insert(
+            resolved.endpoint.ip().to_string(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+        );
+
+        let sent = maybe_trigger_bonjour_hello(
+            &sender,
+            &resolved,
+            &mut peer_node_by_addr,
+            &mut peer_addr_by_node,
+            &udp_peer_interactions,
+            &mut recent_bonjour_hello_by_peer,
+        )
+        .expect("bonjour suppression decision");
+
+        assert!(!sent);
+        assert!(peer_addr_by_node.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bonjour_can_send_hello_after_prior_encounter_closed() {
+        let _lock = shared_test_env_lock().lock().expect("lock");
+        let state_dir = std::env::temp_dir().join(format!(
+            "aethos-tauri-bonjour-hello-{}",
+            rand::random::<u64>()
+        ));
+        let receiver = UdpSocket::bind(("127.0.0.1", 0)).expect("bind receiver");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("receiver timeout");
+        let sender = UdpSocket::bind(("127.0.0.1", 0)).expect("bind sender");
+        let resolved = BonjourResolvedPeer {
+            fullname: "peer._aethos._udp.local.".to_string(),
+            endpoint: receiver.local_addr().expect("receiver addr"),
+        };
+        let mut peer_node_by_addr = HashMap::new();
+        let mut peer_addr_by_node = HashMap::new();
+        let mut udp_peer_interactions = HashMap::new();
+        let mut recent_bonjour_hello_by_peer = HashMap::new();
+        let peer_identity =
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string();
+        let mut closed = new_udp_peer_interaction(peer_identity.clone());
+        closed
+            .encounter
+            .finish(EncounterStopReason::PeerTimeout, "test_closed");
+        udp_peer_interactions.insert(resolved.endpoint.ip().to_string(), closed);
+        peer_node_by_addr.insert(resolved.endpoint.ip().to_string(), peer_identity.clone());
+        peer_addr_by_node.insert(peer_identity.clone(), resolved.endpoint);
+
+        with_state_dir(&state_dir, || {
+            let sent = maybe_trigger_bonjour_hello(
+                &sender,
+                &resolved,
+                &mut peer_node_by_addr,
+                &mut peer_addr_by_node,
+                &udp_peer_interactions,
+                &mut recent_bonjour_hello_by_peer,
+            )
+            .expect("bonjour hello should send");
+            assert!(sent);
+        });
+
+        let mut buf = [0u8; 65_535];
+        let (len, _) = receiver.recv_from(&mut buf).expect("receive bonjour hello");
+        let frame = parse_gossip_frame(&buf[..len]).expect("parse hello");
+        assert!(matches!(frame, GossipSyncFrame::Hello(_)));
+        assert!(!peer_addr_by_node
+            .values()
+            .any(|addr| addr == &resolved.endpoint));
+    }
+
+    #[test]
+    fn finished_udp_encounter_prune_discards_route_and_request_state() {
+        let mut peer_node_by_addr = HashMap::from([
+            (
+                "192.168.1.8".to_string(),
+                "peer-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            ),
+            (
+                "192.168.1.8:47655".to_string(),
+                "peer-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            ),
+        ]);
+        let mut peer_addr_by_node = HashMap::from([(
+            "peer-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            "192.168.1.8:47655".parse().expect("parse addr"),
+        )]);
+        let mut peer_tcp_capable_by_ip = HashMap::from([("192.168.1.8".to_string(), true)]);
+        let mut tcp_backoff_until_by_ip = HashMap::from([(
+            "192.168.1.8".to_string(),
+            Instant::now() + Duration::from_secs(5),
+        )]);
+        let mut udp_peer_interactions = HashMap::new();
+        let mut finished = new_udp_peer_interaction(
+            "peer-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        );
+        finished
+            .encounter
+            .finish(EncounterStopReason::NoMoreWanted, "test_finish");
+        udp_peer_interactions.insert("192.168.1.8".to_string(), finished);
+        let mut recent_served_request_by_peer =
+            HashMap::from([("192.168.1.8".to_string(), (123, Instant::now()))]);
+        let mut recent_outbound_request_by_peer =
+            HashMap::from([("192.168.1.8".to_string(), (456, Instant::now()))]);
+
+        prune_finished_udp_encounters(
+            &mut peer_node_by_addr,
+            &mut peer_addr_by_node,
+            &mut peer_tcp_capable_by_ip,
+            &mut tcp_backoff_until_by_ip,
+            &mut udp_peer_interactions,
+            &mut recent_served_request_by_peer,
+            &mut recent_outbound_request_by_peer,
+        );
+
+        assert!(udp_peer_interactions.is_empty());
+        assert!(peer_node_by_addr.is_empty());
+        assert!(peer_addr_by_node.is_empty());
+        assert!(peer_tcp_capable_by_ip.is_empty());
+        assert!(tcp_backoff_until_by_ip.is_empty());
+        assert!(recent_served_request_by_peer.is_empty());
+        assert!(recent_outbound_request_by_peer.is_empty());
     }
 
     #[test]
