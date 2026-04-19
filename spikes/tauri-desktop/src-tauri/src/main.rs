@@ -42,7 +42,6 @@ use app_state::{
 use base64::Engine;
 #[cfg(target_os = "linux")]
 use ble_advertiser::{AdvertiserPollEvent, CanonicalBleAdvertiser};
-#[cfg(target_os = "linux")]
 use crate::aethos_core::bonjour_discovery::{BonjourDiscoveryEvent, BonjourLanDiscovery, BonjourResolvedPeer};
 use image::{imageops::FilterType, ImageBuffer, Luma, Rgba, RgbaImage};
 use qrcode::QrCode;
@@ -2820,14 +2819,12 @@ fn start_gossip_worker_if_needed(initial_enabled: bool, initial_ble_discovery_en
         let mut ble_encounters: HashMap<String, EncounterManager> = HashMap::new();
         #[cfg(target_os = "linux")]
         let mut ble_advertiser = CanonicalBleAdvertiser::new();
-        #[cfg(target_os = "linux")]
         let mut bonjour_discovery = BonjourLanDiscovery::new(
             &ensure_local_identity()
                 .map(|identity| identity.wayfarer_id)
                 .unwrap_or_else(|_| "unknown-local-peer".to_string()),
             gossip_lan_port(),
         );
-        #[cfg(target_os = "linux")]
         let mut recent_bonjour_hello_by_peer: HashMap<String, Instant> = HashMap::new();
         let mut last_missing_pulse = Instant::now() - Duration::from_millis(500);
         let tcp_listener = match bind_gossip_tcp_listener() {
@@ -2912,7 +2909,6 @@ fn start_gossip_worker_if_needed(initial_enabled: bool, initial_ble_discovery_en
                 }
             }
 
-            #[cfg(target_os = "linux")]
             for event in bonjour_discovery.poll() {
                 match event {
                     BonjourDiscoveryEvent::AdvertisementStarted {
@@ -3208,7 +3204,6 @@ fn summarize_peer_hint_for_activity(peer_hint: &str) -> String {
     format!("{}...", &normalized[..16])
 }
 
-#[cfg(target_os = "linux")]
 fn udp_peer_interaction_active_for_identity(
     udp_peer_interactions: &HashMap<String, UdpPeerInteraction>,
     peer_identity: &str,
@@ -3219,7 +3214,6 @@ fn udp_peer_interaction_active_for_identity(
     })
 }
 
-#[cfg(target_os = "linux")]
 fn udp_peer_interaction_active_for_endpoint(
     peer_node_by_addr: &HashMap<String, String>,
     udp_peer_interactions: &HashMap<String, UdpPeerInteraction>,
@@ -3241,7 +3235,6 @@ fn udp_peer_interaction_active_for_endpoint(
         .unwrap_or(false)
 }
 
-#[cfg(target_os = "linux")]
 fn maybe_trigger_bonjour_hello(
     socket: &UdpSocket,
     resolved: &BonjourResolvedPeer,
@@ -6312,7 +6305,6 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn bonjour_route_maps_summary_to_canonical_peer_identity() {
         let socket = UdpSocket::bind(("127.0.0.1", 0)).expect("bind udp socket");
@@ -6370,7 +6362,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn bonjour_duplicate_opportunity_is_suppressed_for_active_peer() {
         let sender = UdpSocket::bind(("127.0.0.1", 0)).expect("bind sender");
@@ -6408,7 +6399,6 @@ mod tests {
         assert!(peer_addr_by_node.is_empty());
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn bonjour_can_send_hello_after_prior_encounter_closed() {
         let _lock = shared_test_env_lock().lock().expect("lock");

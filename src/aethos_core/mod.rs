@@ -1,5 +1,4 @@
 pub mod ble_discovery;
-#[cfg(target_os = "linux")]
 pub mod bonjour_discovery;
 pub mod encounter_orchestration;
 pub mod encounter_scheduler;

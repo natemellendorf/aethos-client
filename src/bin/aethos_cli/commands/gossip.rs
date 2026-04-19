@@ -13,7 +13,7 @@ pub enum GossipCmd {
     Announce,
     #[command(name = "store-stats")]
     StoreStats,
-    /// Poll LAN for Bonjour/mDNS peers (Linux only)
+    /// Poll LAN for Bonjour/mDNS peers
     Discover {
         /// Seconds to listen for peer advertisements
         #[arg(long, default_value_t = 5)]
@@ -32,13 +32,12 @@ pub fn run(args: &GossipArgs, state: &crate::state::CliState) -> Result<(), Stri
     }
 }
 
-#[cfg(target_os = "linux")]
 fn run_discover(timeout_secs: u64) -> Result<(), String> {
     use crate::aethos_core::bonjour_discovery::{BonjourDiscoveryEvent, BonjourLanDiscovery};
     use crate::aethos_core::gossip_sync::GOSSIP_LAN_PORT;
     use std::time::{Duration, Instant};
 
-    let local_id = crate::aethos_core::identity_store::load_or_create_identity()
+    let local_id = crate::aethos_core::identity_store::ensure_local_identity()
         .map(|id| id.wayfarer_id)
         .unwrap_or_else(|_| "unknown-local-peer".to_string());
 
@@ -97,18 +96,6 @@ fn run_discover(timeout_secs: u64) -> Result<(), String> {
     crate::output::emit_success(
         "gossip_discover_complete",
         json!({ "peers_found": peer_count }),
-    );
-    Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn run_discover(_timeout_secs: u64) -> Result<(), String> {
-    crate::output::emit_success(
-        "gossip_discover_complete",
-        json!({
-            "peers_found": 0,
-            "note": "Bonjour/mDNS discovery is only available on Linux",
-        }),
     );
     Ok(())
 }

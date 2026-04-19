@@ -304,6 +304,32 @@ mod tests {
     }
 
     #[test]
+    fn parses_gossip_discover_command() {
+        let cli = Cli::try_parse_from(["aethos-cli", "gossip", "discover", "--timeout", "10"])
+            .expect("parse gossip discover");
+
+        assert!(matches!(
+            cli.command,
+            Commands::Gossip(commands::gossip::GossipArgs {
+                cmd: commands::gossip::GossipCmd::Discover { timeout: 10 }
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_gossip_discover_default_timeout() {
+        let cli = Cli::try_parse_from(["aethos-cli", "gossip", "discover"])
+            .expect("parse gossip discover default");
+
+        assert!(matches!(
+            cli.command,
+            Commands::Gossip(commands::gossip::GossipArgs {
+                cmd: commands::gossip::GossipCmd::Discover { timeout: 5 }
+            })
+        ));
+    }
+
+    #[test]
     fn parses_chat_clear_command() {
         let cli = Cli::try_parse_from([
             "aethos-cli",
