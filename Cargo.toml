@@ -11,7 +11,12 @@ path = "src/main.rs"
 name = "relay-smoke"
 path = "src/bin/relay-smoke.rs"
 
+[[bin]]
+name = "aethos-cli"
+path = "src/bin/aethos_cli/main.rs"
+
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ciborium = "0.2"
