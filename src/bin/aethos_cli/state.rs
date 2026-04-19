@@ -25,6 +25,7 @@ impl CliState {
 
     pub fn setup_env(&self) {
         crate::output::set_cli_data_dir(&self.data_dir);
+        std::env::set_var("AETHOS_STATE_DIR", &self.data_dir);
     }
 }
 
