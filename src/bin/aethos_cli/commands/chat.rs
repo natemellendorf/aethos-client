@@ -164,6 +164,7 @@ mod tests {
 
     #[test]
     fn snapshot_empty_state_returns_empty_threads() {
+        let _guard = crate::global_test_env_lock().lock().expect("lock env");
         let base_dir = unique_temp_dir("snapshot");
         let state = test_state(&base_dir);
         state.setup_env();
@@ -181,6 +182,7 @@ mod tests {
 
     #[test]
     fn history_empty_state_returns_empty_messages() {
+        let _guard = crate::global_test_env_lock().lock().expect("lock env");
         let base_dir = unique_temp_dir("history-empty");
         let state = test_state(&base_dir);
         state.setup_env();
@@ -201,6 +203,7 @@ mod tests {
 
     #[test]
     fn snapshot_loads_persisted_threads() {
+        let _guard = crate::global_test_env_lock().lock().expect("lock env");
         let base_dir = unique_temp_dir("snapshot-persisted");
         std::fs::create_dir_all(&base_dir).expect("create dir");
         let state = test_state(&base_dir);
@@ -240,6 +243,7 @@ mod tests {
 
     #[test]
     fn history_empty_contact_returns_error() {
+        let _guard = crate::global_test_env_lock().lock().expect("lock env");
         let base_dir = unique_temp_dir("history-empty-contact");
         let state = test_state(&base_dir);
         state.setup_env();
@@ -257,6 +261,7 @@ mod tests {
 
     #[test]
     fn clear_requires_confirmation() {
+        let _guard = crate::global_test_env_lock().lock().expect("lock env");
         let base_dir = unique_temp_dir("clear-confirm");
         let state = test_state(&base_dir);
         state.setup_env();
@@ -275,6 +280,7 @@ mod tests {
 
     #[test]
     fn clear_removes_contact_messages_and_persists() {
+        let _guard = crate::global_test_env_lock().lock().expect("lock env");
         let base_dir = unique_temp_dir("clear-persisted");
         std::fs::create_dir_all(&base_dir).expect("create dir");
         let state = test_state(&base_dir);

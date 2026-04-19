@@ -7,8 +7,6 @@ mod app_body;
 mod app_state;
 #[cfg(target_os = "linux")]
 mod ble_advertiser;
-#[cfg(target_os = "linux")]
-mod bonjour_discovery;
 mod media_v1;
 
 #[allow(dead_code)]
@@ -45,7 +43,7 @@ use base64::Engine;
 #[cfg(target_os = "linux")]
 use ble_advertiser::{AdvertiserPollEvent, CanonicalBleAdvertiser};
 #[cfg(target_os = "linux")]
-use bonjour_discovery::{BonjourDiscoveryEvent, BonjourLanDiscovery, BonjourResolvedPeer};
+use crate::aethos_core::bonjour_discovery::{BonjourDiscoveryEvent, BonjourLanDiscovery, BonjourResolvedPeer};
 use image::{imageops::FilterType, ImageBuffer, Luma, Rgba, RgbaImage};
 use qrcode::QrCode;
 use serde::{Deserialize, Serialize};

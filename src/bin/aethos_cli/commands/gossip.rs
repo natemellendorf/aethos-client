@@ -13,11 +13,103 @@ pub enum GossipCmd {
     Announce,
     #[command(name = "store-stats")]
     StoreStats,
+    /// Poll LAN for Bonjour/mDNS peers (Linux only)
+    Discover {
+        /// Seconds to listen for peer advertisements
+        #[arg(long, default_value_t = 5)]
+        timeout: u64,
+    },
 }
 
 pub fn run(args: &GossipArgs, state: &crate::state::CliState) -> Result<(), String> {
-    let (event_type, data) = execute(args, state)?;
-    crate::output::emit_success(&event_type, data);
+    match &args.cmd {
+        GossipCmd::Discover { timeout } => run_discover(*timeout),
+        _ => {
+            let (event_type, data) = execute(args, state)?;
+            crate::output::emit_success(&event_type, data);
+            Ok(())
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_discover(timeout_secs: u64) -> Result<(), String> {
+    use crate::aethos_core::bonjour_discovery::{BonjourDiscoveryEvent, BonjourLanDiscovery};
+    use crate::aethos_core::gossip_sync::GOSSIP_LAN_PORT;
+    use std::time::{Duration, Instant};
+
+    let local_id = crate::aethos_core::identity_store::load_or_create_identity()
+        .map(|id| id.wayfarer_id)
+        .unwrap_or_else(|_| "unknown-local-peer".to_string());
+
+    let mut discovery = BonjourLanDiscovery::new(&local_id, GOSSIP_LAN_PORT);
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+
+    crate::output::emit_success(
+        "gossip_discover_started",
+        json!({ "timeout_secs": timeout_secs }),
+    );
+
+    let mut peer_count: u64 = 0;
+    while Instant::now() < deadline {
+        for event in discovery.poll() {
+            match event {
+                BonjourDiscoveryEvent::AdvertisementStarted {
+                    service_type,
+                    instance_name,
+                    domain,
+                    port,
+                } => {
+                    crate::output::emit_event(
+                        "bonjour_advertisement_started",
+                        json!({
+                            "service_type": service_type,
+                            "instance_name": instance_name,
+                            "domain": domain,
+                            "port": port,
+                        }),
+                    );
+                }
+                BonjourDiscoveryEvent::PeerDiscovered { fullname } => {
+                    crate::output::emit_event(
+                        "bonjour_peer_discovered",
+                        json!({ "fullname": fullname }),
+                    );
+                }
+                BonjourDiscoveryEvent::EndpointResolved(peer) => {
+                    peer_count += 1;
+                    crate::output::emit_event(
+                        "bonjour_endpoint_resolved",
+                        json!({
+                            "fullname": peer.fullname,
+                            "endpoint": peer.endpoint.to_string(),
+                        }),
+                    );
+                }
+                BonjourDiscoveryEvent::Error(err) => {
+                    crate::output::emit_error(&format!("bonjour_discovery_error: {err}"));
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    crate::output::emit_success(
+        "gossip_discover_complete",
+        json!({ "peers_found": peer_count }),
+    );
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_discover(_timeout_secs: u64) -> Result<(), String> {
+    crate::output::emit_success(
+        "gossip_discover_complete",
+        json!({
+            "peers_found": 0,
+            "note": "Bonjour/mDNS discovery is only available on Linux",
+        }),
+    );
     Ok(())
 }
 
@@ -40,6 +132,9 @@ fn execute(
                 "status": "sent",
             }),
         )),
+        GossipCmd::Discover { .. } => {
+            unreachable!("discover is handled directly in run()")
+        }
         GossipCmd::StoreStats => {
             let store_path = state.data_dir.join("gossip-object-store.sqlite3");
             let item_count = if store_path.exists() {
