@@ -14,15 +14,27 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(name = "aethos-cli", version, about = "Aethos CLI scaffold")]
+#[command(
+    name = "aethos-cli",
+    version,
+    about = "Aethos protocol CLI – send messages, sync gossip, manage identity. All output is JSONL ({ts, event, data}).",
+    long_about = "Aethos protocol CLI for testing and operating the Aethos peer-to-peer messaging protocol.\n\nCapabilities:\n  - Send and receive encrypted messages via relay or direct LAN gossip\n  - Manage local Wayfarer identity (Ed25519 keypair + device profile)\n  - Run gossip sync over UDP LAN broadcast (HELLO/SUMMARY/REQUEST/TRANSFER)\n  - Manage contacts, chat history, settings, and relay connectivity\n\nAll output is JSONL. Each line is a JSON object: {\"ts\": <unix_ms>, \"event\": \"<event_name>\", \"data\": {...}}\n\nExit codes:\n  0  Success\n  1  Error (details in JSONL error event)\n  2  Listen timeout with no messages received"
+)]
 struct Cli {
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Override default relay endpoint (e.g. wss://relay.example.com)"
+    )]
     relay: Option<String>,
 
-    #[arg(long, value_name = "PATH")]
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Isolated data directory for identity and gossip store (enables running multiple instances)"
+    )]
     data_dir: Option<String>,
 
-    #[arg(long)]
+    #[arg(long, help = "Enable verbose logging output")]
     verbose: bool,
 
     #[command(subcommand)]
@@ -31,17 +43,29 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Manage local Wayfarer identity (create, show, rotate, reset)
     Identity(commands::identity::IdentityArgs),
+    /// Compose and record a message to the local gossip store for delivery
     Send(commands::send::SendArgs),
+    /// Connect to relay and stream incoming messages in real time
     Listen(commands::listen::ListenArgs),
+    /// Manage saved contacts (add, remove, list)
     Contacts(commands::contacts::ContactsArgs),
+    /// Relay connectivity operations (health, diagnostics, sync)
     Relay(commands::relay::RelayArgs),
+    /// LAN gossip subsystem operations (status, announce, sync, discover)
     Gossip(commands::gossip::GossipArgs),
+    /// Run full connectivity diagnostics (relay + identity + gossip)
     Diagnostics,
+    /// View, clear, or locate the application log file
     Log(commands::log_cmd::LogArgs),
+    /// Show or update persistent application settings
     Settings(commands::settings::SettingsArgs),
+    /// Chat history operations (snapshot, history, clear)
     Chat(commands::chat::ChatArgs),
+    /// Share your Wayfarer ID (print or generate QR code)
     Share(commands::share::ShareArgs),
+    /// BLE encounter/discovery status (placeholder on non-mobile)
     Encounter(commands::encounter::EncounterArgs),
 }
 

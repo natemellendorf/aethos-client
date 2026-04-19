@@ -4,12 +4,13 @@ use clap::Args;
 use serde_json::json;
 
 #[derive(Debug, Args)]
+/// Compose and record a message to the local gossip store for delivery
 pub struct SendArgs {
-    #[arg(long)]
+    #[arg(long, help = "Recipient wayfarer_id (64 lowercase hex chars)")]
     pub to: String,
-    #[arg(long)]
+    #[arg(long, help = "Message body text")]
     pub text: String,
-    #[arg(long, default_value_t = 3600)]
+    #[arg(long, default_value_t = 3600, help = "Message time-to-live in seconds")]
     pub ttl: u64,
 }
 

@@ -10,6 +10,7 @@ pub struct EncounterArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum EncounterCmd {
+    /// Show BLE encounter/discovery status (placeholder on non-mobile)
     Status,
 }
 

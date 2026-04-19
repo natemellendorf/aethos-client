@@ -16,14 +16,22 @@ static SIGNAL_RECEIVED: AtomicBool = AtomicBool::new(false);
 static REQUESTED_EXIT_CODE: AtomicU8 = AtomicU8::new(EXIT_SUCCESS);
 
 #[derive(Debug, Args, Clone)]
+/// Connect to relay and stream incoming messages in real time. Exits on SIGINT or --timeout.
+/// Exit code 2 if timeout fires with zero messages received; exit code 0 otherwise.
 pub struct ListenArgs {
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Max seconds to listen (exit code 2 if timeout with no messages)"
+    )]
     pub timeout: Option<u64>,
 
-    #[arg(long)]
+    #[arg(long, help = "Override relay endpoint for this session")]
     pub relay: Option<String>,
 
-    #[arg(long = "filter-from")]
+    #[arg(
+        long = "filter-from",
+        help = "Only show messages from this wayfarer_id"
+    )]
     pub filter_from: Option<String>,
 }
 

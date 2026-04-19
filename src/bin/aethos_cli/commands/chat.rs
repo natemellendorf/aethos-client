@@ -30,20 +30,23 @@ pub struct ChatArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ChatCmd {
+    /// Show all chat threads summary
     Snapshot,
+    /// Show message history for a specific contact
     History {
-        #[arg(long)]
+        #[arg(long, help = "Wayfarer ID of the contact")]
         contact: String,
     },
+    /// Delete chat history for a contact (requires --confirm)
     Clear(ChatClearArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct ChatClearArgs {
-    #[arg(long)]
+    #[arg(long, help = "Wayfarer ID of the contact to clear")]
     pub contact: String,
 
-    #[arg(long)]
+    #[arg(long, help = "Required safety flag to confirm deletion")]
     pub confirm: bool,
 }
 

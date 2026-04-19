@@ -9,11 +9,18 @@ pub struct LogArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum LogCmd {
+    /// Show recent log entries
     Show {
-        #[arg(long, default_value_t = 50)]
+        #[arg(
+            long,
+            default_value_t = 50,
+            help = "Number of recent lines to display [default: 50]"
+        )]
         lines: usize,
     },
+    /// Clear the log file
     Clear,
+    /// Print the log file path
     Path,
 }
 

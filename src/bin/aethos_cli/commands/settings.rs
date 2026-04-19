@@ -13,19 +13,28 @@ pub struct SettingsArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum SettingsCmd {
+    /// Display current settings
     Show,
+    /// Update one or more settings
     Update {
-        #[arg(long)]
+        #[arg(long, help = "Relay endpoint URL (e.g. wss://relay.example.com)")]
         relay_endpoint: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Enable or disable verbose logging (true/false)")]
         verbose: Option<bool>,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Enable or disable relay sync background service (true/false)"
+        )]
         relay_sync: Option<bool>,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Enable or disable LAN gossip sync background service (true/false)"
+        )]
         gossip_sync: Option<bool>,
-        #[arg(long)]
+        #[arg(long, help = "Default message time-to-live in seconds")]
         ttl: Option<u64>,
     },
+    /// Reset all settings to defaults
     Reset,
 }
 

@@ -14,9 +14,11 @@ pub struct ShareArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ShareCmd {
+    /// Print local wayfarer_id for sharing
     Id,
+    /// Generate QR code PNG containing the local wayfarer_id
     Qr {
-        #[arg(long)]
+        #[arg(long, help = "Output file path for QR code PNG")]
         output: String,
     },
 }

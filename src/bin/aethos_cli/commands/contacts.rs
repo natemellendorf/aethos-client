@@ -9,16 +9,19 @@ pub struct ContactsArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ContactsCmd {
+    /// Add or update a contact alias for a wayfarer_id
     Add {
-        #[arg(long)]
+        #[arg(long, help = "Wayfarer ID (64 lowercase hex chars)")]
         id: String,
-        #[arg(long)]
+        #[arg(long, help = "Friendly display name for this contact")]
         alias: String,
     },
+    /// Remove a contact by wayfarer_id
     Remove {
-        #[arg(long)]
+        #[arg(long, help = "Wayfarer ID to remove")]
         id: String,
     },
+    /// List all saved contacts
     List,
 }
 

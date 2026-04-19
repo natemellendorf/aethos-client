@@ -9,11 +9,15 @@ pub struct IdentityArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum IdentityCmd {
+    /// Create or load local Wayfarer identity (idempotent)
     Create,
+    /// Display current Wayfarer identity (wayfarer_id, device_id, keys)
     Show,
+    /// Rotate signing keys while keeping the same wayfarer_id
     Rotate,
+    /// Destroy local identity and create a new one (destructive, irreversible)
     Reset {
-        #[arg(long)]
+        #[arg(long, help = "Required safety flag to confirm destructive reset")]
         confirm: bool,
     },
 }

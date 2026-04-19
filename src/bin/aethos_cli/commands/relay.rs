@@ -9,11 +9,14 @@ pub struct RelayArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum RelayCmd {
+    /// Check connectivity to the configured relay endpoint
     Health,
+    /// Show detailed relay connection diagnostics
     Diagnostics {
-        #[arg(long)]
+        #[arg(long, help = "Override relay endpoint for this check")]
         relay: Option<String>,
     },
+    /// Pull pending messages from relay into local gossip store
     Sync,
 }
 

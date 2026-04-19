@@ -19,8 +19,11 @@ pub struct GossipArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum GossipCmd {
+    /// Show gossip subsystem status
     Status,
+    /// Broadcast mDNS/Bonjour service announcement on LAN
     Announce,
+    /// Show local gossip store statistics (item count, data directory)
     #[command(name = "store-stats")]
     StoreStats,
     /// Poll LAN for Bonjour/mDNS peers
@@ -29,10 +32,15 @@ pub enum GossipCmd {
         #[arg(long, default_value_t = 5)]
         timeout: u64,
     },
+    /// One-shot LAN gossip sync over UDP (HELLO/SUMMARY/REQUEST/TRANSFER)
     Sync {
-        #[arg(long, default_value_t = GOSSIP_LAN_PORT)]
+        #[arg(long, default_value_t = GOSSIP_LAN_PORT, help = "UDP port to bind for gossip sync")]
         port: u16,
-        #[arg(long, default_value_t = 10)]
+        #[arg(
+            long,
+            default_value_t = 10,
+            help = "Seconds to run sync before exiting"
+        )]
         timeout: u64,
         /// Use loopback-only mode (127.0.0.1 instead of broadcast)
         #[arg(long)]
