@@ -7,6 +7,7 @@ use ciborium::{de::from_reader, ser::into_writer};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::aethos_core::diagnostics;
 use crate::aethos_core::encounter_scheduler::{
     BudgetProfile as SchedulerBudgetProfile, CargoItem as SchedulerCargoItem, EncounterClass,
     EncounterSchedulerV1, ProximityClass as SchedulerProximityClass,
@@ -1178,6 +1179,12 @@ pub fn import_transfer_items(
     objects: &[TransferObject],
     now_ms: u64,
 ) -> Result<ImportTransferResult, String> {
+    diagnostics::emit_inbox_import(
+        "started",
+        None,
+        objects.len(),
+        Some("transfer import started"),
+    );
     log_verbose(&format!(
         "transfer_import_start: local={} transport_peer={} session_peer={} objects={} now_ms={}",
         local_wayfarer_id,
@@ -1290,7 +1297,10 @@ pub fn import_transfer_items(
         }
     }
 
-    gossip_store_sqlite::insert_import_items(&pending_new_inserts, now_ms)?;
+    if let Err(err) = gossip_store_sqlite::insert_import_items(&pending_new_inserts, now_ms) {
+        diagnostics::emit_inbox_import("failed", None, pending_new_inserts.len(), Some(&err));
+        return Err(err);
+    }
     log_verbose(&format!(
         "transfer_import_done: accepted={} receipt={} rejected={} new_messages={}",
         accepted_item_ids.len(),
@@ -1298,6 +1308,14 @@ pub fn import_transfer_items(
         rejected_items.len(),
         new_messages.len()
     ));
+    for message in &new_messages {
+        diagnostics::emit_inbox_import(
+            "succeeded",
+            Some(&message.item_id),
+            1,
+            Some("transfer import stored message for local inbox"),
+        );
+    }
     Ok(ImportTransferResult {
         accepted_item_ids,
         receipt_item_ids,

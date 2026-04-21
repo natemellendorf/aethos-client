@@ -7,6 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 
+use crate::aethos_core::diagnostics;
+
 const APP_LOG_FILE_NAME: &str = "aethos-linux.log";
 
 static VERBOSE_LOGGING_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -104,24 +106,32 @@ fn append_local_log_inner(level: &str, message: &str) -> Result<(), String> {
         Err(_) => 0,
     };
 
-    if structured_logs_enabled() {
+    let event_name = infer_event_name(message);
+    let fields = extract_kv_fields(message);
+    let write_result = if structured_logs_enabled() {
         let event = json!({
             "ts_unix": now,
             "level": level,
             "run_id": std::env::var("AETHOS_E2E_RUN_ID").ok(),
+            "diagnostics_run_id": diagnostics::current_run_id(),
             "test_case_id": std::env::var("AETHOS_E2E_TEST_CASE_ID").ok(),
             "scenario": std::env::var("AETHOS_E2E_SCENARIO").ok(),
             "node_label": std::env::var("AETHOS_E2E_NODE_LABEL").ok(),
             "message": message,
-            "event": infer_event_name(message),
-            "fields": extract_kv_fields(message),
+            "event": event_name,
+            "fields": fields,
         });
         writeln!(file, "{}", event)
             .map_err(|err| format!("failed writing app log file at {}: {err}", path.display()))
     } else {
         writeln!(file, "[{now}] [{level}] {message}")
             .map_err(|err| format!("failed writing app log file at {}: {err}", path.display()))
+    };
+
+    if write_result.is_ok() {
+        diagnostics::report_from_log(level, message, &event_name, fields);
     }
+    write_result
 }
 
 fn configured_log_level() -> LogLevel {
