@@ -68,16 +68,23 @@ pub fn run(args: &GossipArgs, state: &crate::state::CliState) -> Result<(), Stri
     }
 }
 
+fn configured_lan_port() -> u16 {
+    std::env::var("AETHOS_GOSSIP_LAN_PORT")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u16>().ok())
+        .filter(|port| *port > 0)
+        .unwrap_or(GOSSIP_LAN_PORT)
+}
+
 fn run_discover(timeout_secs: u64) -> Result<(), String> {
     use crate::aethos_core::bonjour_discovery::{BonjourDiscoveryEvent, BonjourLanDiscovery};
-    use crate::aethos_core::gossip_sync::GOSSIP_LAN_PORT;
     use std::time::{Duration, Instant};
 
     let local_id = crate::aethos_core::identity_store::ensure_local_identity()
         .map(|id| id.wayfarer_id)
         .unwrap_or_else(|_| "unknown-local-peer".to_string());
 
-    let mut discovery = BonjourLanDiscovery::new(&local_id, GOSSIP_LAN_PORT);
+    let mut discovery = BonjourLanDiscovery::new(&local_id, configured_lan_port());
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
 
     crate::output::emit_success(
@@ -213,7 +220,11 @@ fn run_sync(
     );
 
     let mut stats = GossipSyncStats::default();
+    let mut latest_summary: Option<gossip_sync::SummaryFrame> = None;
     for target in &targets {
+        if *target == SocketAddr::V4(bind_addr) {
+            continue;
+        }
         send_sync_frame(&socket, *target, &hello, &mut stats)?;
         send_sync_frame(&socket, *target, &summary, &mut stats)?;
     }
@@ -270,6 +281,7 @@ fn run_sync(
                         send_sync_frame(&socket, source, &summary, &mut stats)?;
                     }
                     GossipSyncFrame::Summary(summary) => {
+                        latest_summary = Some(summary.clone());
                         let want =
                             gossip_sync::select_request_item_ids_from_summary_with_candidates(
                                 &summary,
@@ -335,7 +347,16 @@ fn run_sync(
                             }),
                         );
                     }
-                    GossipSyncFrame::RelayIngest(_) => {}
+                    GossipSyncFrame::RelayIngest(ingest) => {
+                        let _ = latest_summary.as_ref();
+                        let want = ingest.item_ids.clone();
+                        if want.is_empty() {
+                            continue;
+                        }
+                        let request = gossip_sync::build_request_frame(want, MAX_WANT_ITEMS)?;
+                        stats.requests_sent = stats.requests_sent.saturating_add(1);
+                        send_sync_frame(&socket, source, &request, &mut stats)?;
+                    }
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
