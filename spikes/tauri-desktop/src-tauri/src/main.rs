@@ -28,6 +28,9 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::aethos_core::bonjour_discovery::{
+    BonjourDiscoveryEvent, BonjourLanDiscovery, BonjourResolvedPeer,
+};
 use app_body::{
     build_wayfarer_chat_body, build_wayfarer_media_manifest_body, classify_wayfarer_app_body,
     ClassificationOutcome, OutboundMediaAsset, OutboundMediaManifestInput,
@@ -42,10 +45,10 @@ use app_state::{
 use base64::Engine;
 #[cfg(target_os = "linux")]
 use ble_advertiser::{AdvertiserPollEvent, CanonicalBleAdvertiser};
-use crate::aethos_core::bonjour_discovery::{BonjourDiscoveryEvent, BonjourLanDiscovery, BonjourResolvedPeer};
 use image::{imageops::FilterType, ImageBuffer, Luma, Rgba, RgbaImage};
 use qrcode::QrCode;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::Digest;
 use socket2::{Domain, Protocol, Socket, Type};
 use tauri::Emitter;
@@ -3420,6 +3423,14 @@ fn handle_gossip_frame(
         return Ok(());
     }
     let frame = parse_gossip_frame(raw)?;
+    crate::aethos_core::diagnostics::emit_protocol_frame(
+        "received",
+        "lan-udp",
+        gossip_frame_type(&frame),
+        Some(&source.to_string()),
+        None,
+        Some(json!({"bytes": raw.len(), "peer": source.to_string()})),
+    );
     let identity = ensure_local_identity()?;
     let local_wayfarer = identity.wayfarer_id;
     let source_key = source.to_string();
@@ -3909,6 +3920,14 @@ fn send_gossip_frame(
             raw.len(),
             addr
         ));
+        crate::aethos_core::diagnostics::emit_protocol_frame(
+            "sent",
+            "lan-udp",
+            gossip_frame_type(frame),
+            Some(&addr),
+            None,
+            Some(json!({"bytes": raw.len(), "addr": addr})),
+        );
     }
     result
 }
@@ -4431,6 +4450,18 @@ fn send_gossip_frame_tcp(stream: &mut TcpStream, frame: &GossipSyncFrame) -> Res
     stream
         .write_all(&payload)
         .map_err(|err| format!("tcp write payload failed: {err}"))?;
+    let peer = stream
+        .peer_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|_| "tcp-peer".to_string());
+    crate::aethos_core::diagnostics::emit_protocol_frame(
+        "sent",
+        "lan-tcp",
+        gossip_frame_type(frame),
+        Some(&peer),
+        None,
+        Some(json!({"bytes": payload.len(), "peer": peer})),
+    );
     Ok(())
 }
 
@@ -4463,7 +4494,20 @@ fn read_gossip_frame_tcp(stream: &mut TcpStream) -> Result<GossipSyncFrame, Stri
             }
             _ => format!("tcp read payload failed: {err}"),
         })?;
-    parse_gossip_frame(&payload)
+    let frame = parse_gossip_frame(&payload)?;
+    let peer = stream
+        .peer_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|_| "tcp-peer".to_string());
+    crate::aethos_core::diagnostics::emit_protocol_frame(
+        "received",
+        "lan-tcp",
+        gossip_frame_type(&frame),
+        Some(&peer),
+        None,
+        Some(json!({"bytes": payload.len(), "peer": peer})),
+    );
+    Ok(frame)
 }
 
 fn frame_transfer_bytes(frame: &GossipSyncFrame) -> u64 {
@@ -5055,10 +5099,22 @@ fn emit_chat_snapshot_event() -> Result<(), String> {
 }
 
 fn emit_chat_snapshot_event_best_effort(context: &str) {
+    crate::aethos_core::diagnostics::emit_ui_projection(
+        context,
+        "started",
+        Some("chat snapshot emit started"),
+    );
     if let Err(err) = emit_chat_snapshot_event() {
+        crate::aethos_core::diagnostics::emit_ui_projection(context, "failed", Some(&err));
         log_verbose(&format!(
             "chat_snapshot_emit_failed context={context}: {err}"
         ));
+    } else {
+        crate::aethos_core::diagnostics::emit_ui_projection(
+            context,
+            "succeeded",
+            Some("chat snapshot emitted"),
+        );
     }
 }
 
@@ -5553,8 +5609,20 @@ pub fn run() {
 
 fn main() {
     apply_cli_state_overrides();
+    std::env::set_var("AETHOS_APP_NAME", "aethos-desktop");
     clear_app_log_if_requested();
+    crate::aethos_core::diagnostics::attach_current_run("desktop-runtime", "aethos-desktop");
+    crate::aethos_core::diagnostics::emit_app_lifecycle(
+        "desktop-runtime",
+        "start",
+        Some("tauri desktop runtime starting"),
+    );
     run();
+    crate::aethos_core::diagnostics::emit_app_lifecycle(
+        "desktop-runtime",
+        "stop",
+        Some("tauri desktop runtime stopped"),
+    );
 }
 
 fn apply_cli_state_overrides() {
@@ -5605,6 +5673,17 @@ fn apply_cli_state_overrides() {
         } else if let Some(value) = arg.strip_prefix("--aethos-e2e-force-gossip=") {
             if !value.trim().is_empty() {
                 std::env::set_var("AETHOS_E2E_FORCE_GOSSIP", value.trim());
+            }
+        } else if let Some(value) = arg.strip_prefix("--aethos-diagnostics-run-id=") {
+            if !value.trim().is_empty() {
+                std::env::set_var("AETHOS_DIAGNOSTICS_RUN_ID", value.trim());
+            }
+        } else if let Some(value) = arg.strip_prefix("--aethos-diagnostics-collector-url=") {
+            if !value.trim().is_empty() {
+                std::env::set_var(
+                    "AETHOS_DIAGNOSTICS_COLLECTOR_URL",
+                    value.trim().trim_end_matches('/'),
+                );
             }
         } else if let Some(value) = arg.strip_prefix("--aethos-disable-ble=") {
             if !value.trim().is_empty() {

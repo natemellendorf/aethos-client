@@ -6,11 +6,13 @@ use std::sync::{Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{connect, Message};
 use url::Url;
 
+use crate::aethos_core::diagnostics;
 use crate::aethos_core::encounter_orchestration::{
     BearerAdapter, EncounterManager, TransitionReason,
 };
@@ -350,6 +352,14 @@ pub fn open_relay_persistent_session(
         }
     };
     lease.transition("hello_sent", "hello_dispatch");
+    diagnostics::emit_protocol_frame(
+        "sent",
+        "relay-ws",
+        "HELLO",
+        Some(relay_ws),
+        None,
+        Some(json!({"relay_ws": relay_ws})),
+    );
     let peer_hello = match complete_hello_handshake(&mut socket, identity) {
         Ok(peer_hello) => {
             lease.transition("active", "hello_validated");
@@ -521,6 +531,14 @@ pub fn run_relay_encounter_gossipv1_for_duration(
         "relay_encounter_hello_ok: relay_ws={} peer_node={} peer_max_want={} peer_max_transfer={}",
         relay_ws, peer_hello.node_id, peer_hello.max_want, peer_hello.max_transfer
     ));
+    diagnostics::emit_protocol_frame(
+        "received",
+        "relay-ws",
+        "HELLO",
+        Some(&peer_hello.node_id),
+        trace_item_id,
+        Some(json!({"relay_ws": relay_ws, "peer_node": peer_hello.node_id})),
+    );
 
     let report = match run_relay_round_on_socket(
         &mut socket,
@@ -592,6 +610,14 @@ fn run_relay_round_on_socket(
             relay_ws
         ));
         send_binary_frame(socket, &build_summary_frame(now_unix_ms())?)?;
+        diagnostics::emit_protocol_frame(
+            "sent",
+            "relay-ws",
+            "SUMMARY",
+            Some(relay_ws),
+            trace_item_id,
+            Some(json!({"relay_ws": relay_ws})),
+        );
         log_verbose(&format!(
             "relay_encounter_post_hello_send_relay_ingest: relay_ws={}",
             relay_ws
@@ -669,6 +695,14 @@ fn run_relay_round_on_socket(
                     summary.item_count,
                     summary.bloom_filter.len()
                 ));
+                diagnostics::emit_protocol_frame(
+                    "received",
+                    "relay-ws",
+                    "SUMMARY",
+                    Some(relay_ws),
+                    trace_item_id,
+                    Some(json!({"item_count": summary.item_count, "relay_ws": relay_ws})),
+                );
                 latest_summary = Some(summary.clone());
                 let want = select_request_item_ids_from_summary_with_candidates(
                     &summary,
@@ -680,6 +714,14 @@ fn run_relay_round_on_socket(
                     socket,
                     &build_request_frame(want, peer_hello.max_want as usize)?,
                 )?;
+                diagnostics::emit_protocol_frame(
+                    "sent",
+                    "relay-ws",
+                    "REQUEST",
+                    Some(relay_ws),
+                    trace_item_id,
+                    Some(json!({"relay_ws": relay_ws})),
+                );
             }
             GossipSyncFrame::RelayIngest(RelayIngestFrame { item_ids }) => {
                 saw_relay_ingest = true;
@@ -770,6 +812,14 @@ fn run_relay_round_on_socket(
                     relay_ws,
                     request.want.len()
                 ));
+                diagnostics::emit_protocol_frame(
+                    "received",
+                    "relay-ws",
+                    "REQUEST",
+                    Some(relay_ws),
+                    trace_item_id,
+                    Some(json!({"want_items": request.want.len(), "relay_ws": relay_ws})),
+                );
                 let selection = transfer_items_for_request_with_shadow_context_and_diagnostics(
                     &request.want,
                     peer_hello.max_transfer as u32,
@@ -806,6 +856,14 @@ fn run_relay_round_on_socket(
                         objects,
                     }),
                 )?;
+                diagnostics::emit_protocol_frame(
+                    "sent",
+                    "relay-ws",
+                    "TRANSFER",
+                    Some(relay_ws),
+                    trace_item_id,
+                    Some(json!({"relay_ws": relay_ws, "transferred_items": transferred_items})),
+                );
                 encounter_manager.record_scheduler_execution(
                     &format!("relay-{}-{}", relay_ws, recv_frame_count),
                     transferred_items,
@@ -827,6 +885,14 @@ fn run_relay_round_on_socket(
                     relay_ws,
                     transfer.objects.len()
                 ));
+                diagnostics::emit_protocol_frame(
+                    "received",
+                    "relay-ws",
+                    "TRANSFER",
+                    Some(relay_ws),
+                    trace_item_id,
+                    Some(json!({"objects": transfer.objects.len(), "relay_ws": relay_ws})),
+                );
                 let imported = import_transfer_items(
                     &identity.wayfarer_id,
                     Some(relay_ws),
@@ -844,6 +910,16 @@ fn run_relay_round_on_socket(
                             received,
                         }),
                     )?;
+                    diagnostics::emit_protocol_frame(
+                        "sent",
+                        "relay-ws",
+                        "RECEIPT",
+                        Some(relay_ws),
+                        trace_item_id,
+                        Some(
+                            json!({"relay_ws": relay_ws, "received_items": imported.receipt_item_ids.len()}),
+                        ),
+                    );
                 }
                 log_verbose(&format!(
                     "relay_encounter_send_receipt: relay_ws={} received_items={} new_messages={}",
@@ -872,6 +948,14 @@ fn run_relay_round_on_socket(
             }
             GossipSyncFrame::Receipt(receipt) => {
                 saw_receipt = true;
+                diagnostics::emit_protocol_frame(
+                    "received",
+                    "relay-ws",
+                    "RECEIPT",
+                    Some(relay_ws),
+                    trace_item_id,
+                    Some(json!({"relay_ws": relay_ws, "received_items": receipt.received.len()})),
+                );
                 if let Some(trace_item_id) = trace_item_id {
                     trace_receipted_by_peer |= receipt
                         .received
