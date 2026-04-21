@@ -26,6 +26,8 @@ fn execute(state: &crate::state::CliState) -> Result<(String, serde_json::Value)
             "data_dir": state.data_dir.display().to_string(),
             "log_file_path": log_file_path.display().to_string(),
             "verbose": state.verbose,
+            "run_id": state.run_id,
+            "diagnostics_collector_url": state.diagnostics_collector_url,
         }),
     ))
 }
@@ -36,7 +38,13 @@ mod tests {
 
     #[test]
     fn diagnostics_payload_includes_required_fields() {
-        let state = crate::state::CliState::from_cli_args(Some("/tmp/aethos-cli-diag"), None, true);
+        let state = crate::state::CliState::from_cli_args_with_diagnostics(
+            Some("/tmp/aethos-cli-diag"),
+            None,
+            true,
+            Some("run-123"),
+            Some("http://127.0.0.1:9774"),
+        );
         let (event_type, data) = execute(&state).expect("diagnostics payload");
 
         assert_eq!(event_type, "app_diagnostics");
@@ -55,5 +63,7 @@ mod tests {
         ));
         assert_eq!(data["data_dir"], "/tmp/aethos-cli-diag");
         assert_eq!(data["verbose"], true);
+        assert_eq!(data["run_id"], "run-123");
+        assert_eq!(data["diagnostics_collector_url"], "http://127.0.0.1:9774");
     }
 }

@@ -37,6 +37,15 @@ struct Cli {
     #[arg(long, help = "Enable verbose logging output")]
     verbose: bool,
 
+    #[arg(long, help = "Attach commands to an existing diagnostics run_id")]
+    run_id: Option<String>,
+
+    #[arg(
+        long,
+        help = "Diagnostics collector base URL (e.g. http://127.0.0.1:9774)"
+    )]
+    diagnostics_collector_url: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -71,8 +80,13 @@ enum Commands {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let state =
-        state::CliState::from_cli_args(cli.data_dir.as_deref(), cli.relay.as_deref(), cli.verbose);
+    let state = state::CliState::from_cli_args_with_diagnostics(
+        cli.data_dir.as_deref(),
+        cli.relay.as_deref(),
+        cli.verbose,
+        cli.run_id.as_deref(),
+        cli.diagnostics_collector_url.as_deref(),
+    );
     state.setup_env();
 
     let result = match cli.command {
@@ -95,6 +109,16 @@ fn main() -> ExitCode {
         Commands::Share(args) => commands::share::run(&args, &state),
         Commands::Encounter(_args) => commands::encounter::run_status(&state),
     };
+
+    crate::aethos_core::diagnostics::emit_app_lifecycle(
+        "cli",
+        "stop",
+        Some(if result.is_ok() {
+            "cli command finished"
+        } else {
+            "cli command failed"
+        }),
+    );
 
     if result.is_ok() {
         ExitCode::SUCCESS

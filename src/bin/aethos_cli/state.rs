@@ -5,6 +5,8 @@ pub struct CliState {
     pub data_dir: PathBuf,
     pub relay_endpoint: String,
     pub verbose: bool,
+    pub run_id: Option<String>,
+    pub diagnostics_collector_url: Option<String>,
 }
 
 impl CliState {
@@ -13,6 +15,16 @@ impl CliState {
         relay_override: Option<&str>,
         verbose: bool,
     ) -> Self {
+        Self::from_cli_args_with_diagnostics(data_dir_override, relay_override, verbose, None, None)
+    }
+
+    pub fn from_cli_args_with_diagnostics(
+        data_dir_override: Option<&str>,
+        relay_override: Option<&str>,
+        verbose: bool,
+        run_id: Option<&str>,
+        diagnostics_collector_url: Option<&str>,
+    ) -> Self {
         Self {
             data_dir: crate::output::cli_data_dir(data_dir_override),
             relay_endpoint: relay_override
@@ -20,12 +32,33 @@ impl CliState {
                 .unwrap_or("wss://aethos-relay.network")
                 .to_string(),
             verbose,
+            run_id: run_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned),
+            diagnostics_collector_url: diagnostics_collector_url
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.trim_end_matches('/').to_string()),
         }
     }
 
     pub fn setup_env(&self) {
         crate::output::set_cli_data_dir(&self.data_dir);
         std::env::set_var("AETHOS_STATE_DIR", &self.data_dir);
+        std::env::set_var("AETHOS_APP_NAME", "aethos-cli");
+        if let Some(run_id) = &self.run_id {
+            std::env::set_var("AETHOS_DIAGNOSTICS_RUN_ID", run_id);
+        }
+        if let Some(url) = &self.diagnostics_collector_url {
+            std::env::set_var("AETHOS_DIAGNOSTICS_COLLECTOR_URL", url);
+        }
+        crate::aethos_core::diagnostics::attach_current_run("cli", "aethos-cli");
+        crate::aethos_core::diagnostics::emit_app_lifecycle(
+            "cli",
+            "start",
+            Some("cli command started"),
+        );
     }
 }
 
