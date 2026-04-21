@@ -1,5 +1,6 @@
 pub mod ble_discovery;
 pub mod bonjour_discovery;
+pub mod diagnostics;
 pub mod encounter_orchestration;
 pub mod encounter_scheduler;
 pub mod gossip_store_sqlite;

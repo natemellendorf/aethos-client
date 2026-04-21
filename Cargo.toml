@@ -15,6 +15,10 @@ path = "src/bin/relay-smoke.rs"
 name = "aethos-cli"
 path = "src/bin/aethos_cli/main.rs"
 
+[[bin]]
+name = "aethos-diagnostics-collector"
+path = "src/bin/aethos_diagnostics_collector.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -36,6 +40,14 @@ socket2 = "0.5"
 
 flume = "0.11"
 mdns-sd = "0.18"
+axum = { version = "0.8", features = ["json"] }
+chrono = { version = "0.4", features = ["serde"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+ureq = { version = "2.12", features = ["json"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 dbus = "0.9"
