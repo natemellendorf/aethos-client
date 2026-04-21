@@ -2819,12 +2819,8 @@ fn start_gossip_worker_if_needed(initial_enabled: bool, initial_ble_discovery_en
         let mut ble_encounters: HashMap<String, EncounterManager> = HashMap::new();
         #[cfg(target_os = "linux")]
         let mut ble_advertiser = CanonicalBleAdvertiser::new();
-        let mut bonjour_discovery = BonjourLanDiscovery::new(
-            &ensure_local_identity()
-                .map(|identity| identity.wayfarer_id)
-                .unwrap_or_else(|_| "unknown-local-peer".to_string()),
-            gossip_lan_port(),
-        );
+        let mut bonjour_discovery = create_bonjour_discovery();
+        let mut bonjour_restart_after: Option<Instant> = None;
         let mut recent_bonjour_hello_by_peer: HashMap<String, Instant> = HashMap::new();
         let mut last_missing_pulse = Instant::now() - Duration::from_millis(500);
         let tcp_listener = match bind_gossip_tcp_listener() {
@@ -2840,6 +2836,14 @@ fn start_gossip_worker_if_needed(initial_enabled: bool, initial_ble_discovery_en
             if !runtime.enabled.load(Ordering::SeqCst) {
                 thread::sleep(Duration::from_millis(120));
                 continue;
+            }
+
+            if let Some(restart_deadline) = bonjour_restart_after {
+                if Instant::now() >= restart_deadline {
+                    bonjour_discovery = create_bonjour_discovery();
+                    bonjour_restart_after = None;
+                    log_info("bonjour_discovery_restarted");
+                }
             }
 
             prune_finished_udp_encounters(
@@ -2946,6 +2950,10 @@ fn start_gossip_worker_if_needed(initial_enabled: bool, initial_ble_discovery_en
                     }
                     BonjourDiscoveryEvent::Error(err) => {
                         log_error(&format!("bonjour_discovery_error: {err}"));
+                        if bonjour_restart_after.is_none() {
+                            bonjour_restart_after = Some(Instant::now() + Duration::from_secs(1));
+                            log_info("bonjour_discovery_restart_scheduled delay_ms=1000");
+                        }
                     }
                 }
             }
@@ -3028,6 +3036,15 @@ fn start_gossip_worker_if_needed(initial_enabled: bool, initial_ble_discovery_en
             }
         }
     });
+}
+
+fn create_bonjour_discovery() -> BonjourLanDiscovery {
+    BonjourLanDiscovery::new(
+        &ensure_local_identity()
+            .map(|identity| identity.wayfarer_id)
+            .unwrap_or_else(|_| "unknown-local-peer".to_string()),
+        gossip_lan_port(),
+    )
 }
 
 fn process_ble_discovery_signals(
