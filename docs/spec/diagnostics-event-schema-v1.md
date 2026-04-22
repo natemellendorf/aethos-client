@@ -1,55 +1,143 @@
 # Diagnostics Event Schema v1
 
-- Version: 1.0.0
-- Status: **Draft**
+- Version: 1
+- Status: Final
+- Date: 2026-04-21
 
-## Overview
+## 1. Overview
 
-This schema defines the structure for diagnostic events collected by aethos-linux clients. It ensures compatibility across different relay implementations and automated triage tools.
+This document defines the canonical diagnostics event contract for Aethos desktop and iOS clients and the Rust diagnostics collector.
 
-## Event Structure
+The schema is run-scoped and designed for agent-driven analysis of protocol progression while avoiding sensitive payload exposure.
 
-### Required Fields
-- `event_id`: UUIDv4 - Unique identifier for the event.
-- `run_id`: UUIDv4 - Reference to the diagnostic run.
-- `timestamp`: ISO8601 (UTC) - When the event occurred.
-- `name`: String - The event type name (see Event Catalog).
+## 2. Required event fields
 
-### Optional Fields
-- `payload`: Object - Arbitrary JSON data specific to the event type.
-- `severity`: Enum (DEBUG, INFO, WARN, ERROR, CRITICAL) - Default: INFO.
-- `subsystem`: String - The component that emitted the event (e.g., "ble", "relay", "gui").
+All events MUST contain the following fields:
 
-## Event Catalog
+| Field | Type | Description |
+|---|---|---|
+| `schema_version` | string | Schema contract version (for v1: `"1"`) |
+| `run_id` | string | Correlates all events in one diagnostic run |
+| `session_id` | string | Correlates a user/app session within a run |
+| `encounter_id` | string | Correlates one encounter lifecycle |
+| `event_id` | string | Unique event identifier |
+| `timestamp_utc` | string | Event time in UTC (RFC3339 recommended) |
+| `platform` | string | E.g. `linux`, `ios` |
+| `app` | string | E.g. `aethos-desktop`, `aethos-ios` |
+| `build_sha` | string | Build/source revision identifier |
+| `component` | string | Subsystem name (`discovery`, `relay`, `ui`, etc.) |
+| `event_type` | string | Canonical event catalog key |
+| `phase` | string | Protocol/app phase marker |
+| `result` | string | Outcome marker (`started`, `succeeded`, `failed`, etc.) |
 
-The following event names are reserved and must be supported by the collector and relay:
+## 3. Optional event fields
 
-- `APP_START`: Client application initialization.
-- `APP_STOP`: Graceful application shutdown.
-- `RELAY_CONNECT`: Successful connection to an Aethos relay.
-- `RELAY_DISCONNECT`: Disconnection (clean or unexpected) from a relay.
-- `HEARTBEAT`: Periodic liveness signal from the client.
-- `GOSSIP_SYNC_START`: Beginning of a LAN gossip encounter.
-- `GOSSIP_SYNC_COMPLETE`: Successful completion of a gossip sync round.
-- `ENVELOPE_SEND`: Attempt to send an Aethos envelope.
-- `ENVELOPE_RECEIVE`: Receipt of an Aethos envelope from a peer or relay.
-- `STALL_DETECTED`: Synthetic event triggered by internal watchdog.
-- `GUI_STALL`: Detection of unresponsive UI thread.
-- `CRASH_REPORT`: Forensics from a previous session crash.
+Events MAY include:
 
-## Stall Detection Rules
+| Field | Type | Description |
+|---|---|---|
+| `peer_id` | string | Local peer identifier |
+| `remote_peer_id` | string | Remote peer identifier |
+| `item_id` | string | Content/item identifier |
+| `bearer` | string | Bearer context (`ble`, `bonjour`, `relay`, etc.) |
+| `reason_code` | string | Stable machine-readable failure/status code |
+| `message` | string | Human-readable diagnostic note (non-sensitive) |
+| `fields` | object | Structured metadata map for event-specific attributes |
 
-- **Interval Watchdog**: Any event with an expected cadence (e.g., `HEARTBEAT`) triggers a `STALL_DETECTED` event if the gap between occurrences exceeds 1.5x the expected interval.
-- **UI Liveness**: The GUI thread must emit a internal heartbeat every 1000ms. If 3 consecutive heartbeats are missed, a `GUI_STALL` event is dispatched.
+## 4. Event catalog v1
 
-## Privacy Rules
+Implementations MUST support these event types:
 
-- **No PII**: Events must never include Wayfarer secret keys, passwords, or personal user data (name, email).
-- **ID Hashing**: Wayfarer IDs in `payload` fields must be truncated or salted-hashed if the run is marked as "Public".
-- **Opt-in**: Diagnostics collection is disabled by default and requires explicit user consent.
+- `app.start`
+- `app.stop`
+- `diag.run.attached`
+- `discovery.started`
+- `discovery.signal.detected`
+- `discovery.signal.ignored`
+- `bearer.selected`
+- `encounter.opened`
+- `encounter.closed`
+- `hello.sent`
+- `hello.received`
+- `summary.sent`
+- `summary.received`
+- `request.planned`
+- `request.sent`
+- `request.received`
+- `transfer.sent`
+- `transfer.received`
+- `receipt.sent`
+- `receipt.received`
+- `inbox.import.started`
+- `inbox.import.succeeded`
+- `inbox.import.failed`
+- `ui.projection.started`
+- `ui.projection.succeeded`
+- `ui.projection.failed`
+- `relay.connected`
+- `relay.disconnected`
+- `error`
 
-## Retention Guidance
+## 5. Canonical phase guidance
 
-- **Standard Runs**: Relays should retain full event timelines for 7 days.
-- **Summary Data**: Aggregated run summaries should be retained for 30 days.
-- **Critical/Crash**: Events with severity `CRITICAL` or `ERROR` may be pinned for 90 days.
+Recommended `phase` values:
+
+- `app`
+- `discovery`
+- `encounter`
+- `hello`
+- `summary`
+- `request`
+- `transfer`
+- `receipt`
+- `import`
+- `ui_projection`
+- `relay`
+- `error`
+
+## 6. Example event
+
+```json
+{
+  "schema_version": "1",
+  "run_id": "run-1775656013003",
+  "session_id": "desktop-a",
+  "encounter_id": "enc-4b4d3e",
+  "event_id": "evt-01J8M9W1YQ5R",
+  "timestamp_utc": "2026-04-21T18:48:32Z",
+  "platform": "linux",
+  "app": "aethos-desktop",
+  "build_sha": "4a3b2c1d",
+  "component": "gossip_sync",
+  "event_type": "transfer.received",
+  "phase": "transfer",
+  "result": "succeeded",
+  "peer_id": "peer-a",
+  "remote_peer_id": "peer-b",
+  "item_id": "item-92c5",
+  "bearer": "bonjour",
+  "fields": {
+    "bytes": 4096,
+    "chunk_count": 4
+  }
+}
+```
+
+## 7. Privacy and security rules
+
+- MUST NOT include private keys, session secrets, or decrypted plaintext message bodies
+- SHOULD prefer IDs, hashes, lengths, counters, timing, and protocol metadata
+- `message` MUST be safe for logs and issue trackers
+- Verbose payload capture MUST be opt-in and local-only debug mode
+
+## 8. Retention guidance
+
+- Keep event retention bounded by TTL (default 7 days recommended for local diagnostics)
+- Purge expired rows periodically
+- Keep summaries derived from retained event data; avoid parallel sensitive caches
+
+## 9. Compatibility and evolution
+
+- Additive fields are allowed; unknown fields MUST be ignored by consumers
+- Breaking changes require a new schema version
+- Producers SHOULD continue to emit v1 until all consumers support a newer version
