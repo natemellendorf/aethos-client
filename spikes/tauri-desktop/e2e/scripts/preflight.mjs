@@ -34,93 +34,35 @@ function ensureExplicitE2ERun() {
   return false;
 }
 
-function ensureTauriDriver() {
-  if (!hasBinary("tauri-driver")) {
-    const shouldAutoInstall = (process.env.AETHOS_E2E_AUTO_INSTALL_TAURI_DRIVER || "1") !== "0";
-    if (!shouldAutoInstall) {
-      throw new Error(
-        "missing required binary 'tauri-driver'. Install manually (cargo install tauri-driver --locked) or set AETHOS_E2E_AUTO_INSTALL_TAURI_DRIVER=1"
-      );
-    }
-    if (!hasBinary("cargo")) {
-      throw new Error(
-        "missing required binary 'tauri-driver'. Automatic install requires cargo in PATH. Install Rust toolchain, then retry."
-      );
-    }
-
-    process.stdout.write("e2e preflight: installing tauri-driver via cargo (binary missing)\n");
-    runCommand("cargo", ["install", "tauri-driver", "--locked"]);
+function ensureCargo() {
+  if (!hasBinary("cargo")) {
+    throw new Error("missing required binary 'cargo'. Install Rust toolchain to build the Tauri desktop app.");
   }
-
-  const tauriDriverProbe = binaryWorks("tauri-driver", ["--help"]);
-  if (!tauriDriverProbe.ok) {
-    const output = tauriDriverProbe.output.toLowerCase();
-    if (output.includes("not supported on this platform")) {
-      throw new Error(
-        "tauri-driver is installed but not supported on this platform. Desktop WebDriver E2E is currently Linux-only."
-      );
-    }
-    throw new Error(`tauri-driver is present but not runnable: ${tauriDriverProbe.output.trim()}`);
-  }
-
-  process.stdout.write("e2e preflight OK: tauri-driver present\n");
+  process.stdout.write("e2e preflight OK: cargo present\n");
 }
 
-function maybeInstallWebKitWebDriver() {
-  if (hasBinary("WebKitWebDriver")) {
-    process.stdout.write("e2e preflight OK: WebKitWebDriver present\n");
+function ensurePlaywrightBrowsers() {
+  const probe = binaryWorks("npx", ["playwright", "--version"]);
+  if (!probe.ok) {
+    throw new Error("Playwright CLI is unavailable. Run npm install in spikes/tauri-desktop/e2e.");
+  }
+
+  const shouldInstall = (process.env.AETHOS_E2E_AUTO_INSTALL_PLAYWRIGHT || "1") !== "0";
+  if (!shouldInstall) {
+    process.stdout.write("e2e preflight: skipping Playwright browser install (AETHOS_E2E_AUTO_INSTALL_PLAYWRIGHT=0)\n");
     return;
   }
 
-  const shouldAutoInstall = (process.env.AETHOS_E2E_AUTO_INSTALL_WEBKIT_DRIVER || "1") !== "0";
-  if (!shouldAutoInstall) {
-    throw new Error(
-      "missing required binary 'WebKitWebDriver'. Install manually (Debian/Ubuntu: apt install webkit2gtk-driver) or set AETHOS_E2E_AUTO_INSTALL_WEBKIT_DRIVER=1"
-    );
-  }
-
-  if (process.platform !== "linux") {
-    throw new Error(
-      "missing required binary 'WebKitWebDriver'. Automatic install is only supported on Linux (Debian/Ubuntu apt-get)."
-    );
-  }
-
-  if (!hasBinary("apt-get")) {
-    throw new Error(
-      "missing required binary 'WebKitWebDriver'. Automatic install requires apt-get (Debian/Ubuntu)."
-    );
-  }
-
-  const installerPrefix = process.getuid?.() === 0 ? [] : hasBinary("sudo") ? ["sudo"] : null;
-  if (!installerPrefix) {
-    throw new Error(
-      "missing required binary 'WebKitWebDriver'. Re-run with root privileges or install manually: apt install webkit2gtk-driver"
-    );
-  }
-
-  process.stdout.write("e2e preflight: installing webkit2gtk-driver via apt-get (WebKitWebDriver missing)\n");
-  runCommand(installerPrefix[0] || "apt-get", installerPrefix.length ? [...installerPrefix.slice(1), "apt-get", "update"] : ["update"], {
-    ...process.env,
-    DEBIAN_FRONTEND: "noninteractive"
-  });
-  runCommand(installerPrefix[0] || "apt-get", installerPrefix.length ? [...installerPrefix.slice(1), "apt-get", "install", "-y", "webkit2gtk-driver"] : ["install", "-y", "webkit2gtk-driver"], {
-    ...process.env,
-    DEBIAN_FRONTEND: "noninteractive"
-  });
-
-  if (!hasBinary("WebKitWebDriver")) {
-    throw new Error("webkit2gtk-driver install completed but 'WebKitWebDriver' is still unavailable");
-  }
-
-  process.stdout.write("e2e preflight OK: WebKitWebDriver installed\n");
+  process.stdout.write("e2e preflight: ensuring Playwright Chromium runtime is installed\n");
+  runCommand("npx", ["playwright", "install", "chromium"]);
 }
 
 try {
   if (!ensureExplicitE2ERun()) {
     process.exit(0);
   }
-  ensureTauriDriver();
-  maybeInstallWebKitWebDriver();
+  ensureCargo();
+  ensurePlaywrightBrowsers();
 } catch (error) {
   process.stderr.write(`${String(error?.message || error)}\n`);
   process.exit(1);

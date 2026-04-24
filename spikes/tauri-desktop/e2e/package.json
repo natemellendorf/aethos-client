@@ -7,12 +7,16 @@
     "doctor": "node scripts/doctor.mjs",
     "test": "npm run preflight && npm run doctor && mocha --timeout 1200000 \"test/**/*.mjs\"",
     "send:wayfarer-media": "npm run preflight && npm run doctor && node scripts/send-wayfarer-media.mjs",
-    "inspect:receiver-media": "npm run preflight && npm run doctor && node scripts/inspect-wayfarer-receiver.mjs"
+    "inspect:receiver-media": "npm run preflight && npm run doctor && node scripts/inspect-wayfarer-receiver.mjs",
+    "playwright:install": "playwright install chromium"
   },
   "dependencies": {
     "chai": "^5.2.1",
     "mocha": "^11.7.4",
-    "pngjs": "^7.0.0",
-    "selenium-webdriver": "^4.34.0"
+    "pngjs": "^7.0.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.59.1",
+    "@srsholmes/tauri-playwright": "^0.2.2"
   }
 }

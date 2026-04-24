@@ -8,8 +8,8 @@ function requireBinary(bin, installHint) {
 }
 
 try {
-  requireBinary("tauri-driver", "Install with: cargo install tauri-driver --locked");
-  requireBinary("WebKitWebDriver", "Install your distro package (example Debian/Ubuntu: apt install webkit2gtk-driver)");
+  requireBinary("cargo", "Install Rust toolchain so the desktop app can be built for E2E.");
+  requireBinary("node", "Install Node.js 18+ so the E2E harness can run.");
   process.stdout.write("e2e doctor OK\n");
 } catch (error) {
   process.stderr.write(`${String(error.message || error)}\n`);
