@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
-import { Builder, By, Capabilities, until } from "selenium-webdriver";
+import { By, launchTauriSession, until } from "../lib/tauri-playwright-driver.mjs";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const E2E_DIR = path.resolve(__dirname, "..");
@@ -19,8 +19,7 @@ if (!/^[0-9a-f]{64}$/.test(TARGET_WAYFARER_ID)) {
 const RUN_ID = `manual-send-${Date.now()}`;
 const STATE_ROOT = path.resolve(DESKTOP_DIR, "e2e", "workdir", RUN_ID, "sender");
 const ARTIFACT_ROOT = path.resolve(DESKTOP_DIR, "e2e", "artifacts", RUN_ID);
-const DRIVER_PORT = Number(process.env.AETHOS_SEND_DRIVER_PORT || 4494);
-const NATIVE_PORT = Number(process.env.AETHOS_SEND_NATIVE_PORT || 4495);
+const SOCKET_PATH = path.resolve(process.env.AETHOS_SEND_SOCKET_PATH || path.join("/tmp", `aethos-pw-${RUN_ID}-sender.sock`));
 const MEDIA_FILE_OVERRIDE = String(process.env.AETHOS_SEND_MEDIA_FILE || "").trim();
 const MEDIA_CAP_B64 = Number(process.env.AETHOS_SEND_MEDIA_MAX_ITEM_PAYLOAD_B64_BYTES || "65536");
 
@@ -215,12 +214,12 @@ async function main() {
   await fs.mkdir(STATE_ROOT, { recursive: true });
   await fs.mkdir(ARTIFACT_ROOT, { recursive: true });
 
-  spawnSync("bash", ["-lc", "pkill -f 'src-tauri/target/debug/aethos' || true; pkill -f tauri-driver || true; pkill -f WebKitWebDriver || true"], {
+  spawnSync("bash", ["-lc", "pkill -f 'src-tauri/target/debug/aethos' || true"], {
     cwd: DESKTOP_DIR,
     stdio: "inherit"
   });
 
-  const build = spawnSync("npx", ["tauri", "build", "--debug", "--no-bundle"], {
+  const build = spawnSync("npx", ["tauri", "build", "--debug", "--no-bundle", "--features", "e2e-testing"], {
     cwd: DESKTOP_DIR,
     stdio: "inherit",
     shell: true
@@ -228,16 +227,6 @@ async function main() {
   if (build.status !== 0) throw new Error("tauri build failed");
 
   await seedCapabilities(STATE_ROOT, TARGET_WAYFARER_ID);
-
-  const driverProc = spawn("tauri-driver", ["--port", String(DRIVER_PORT), "--native-port", String(NATIVE_PORT)], {
-    stdio: ["ignore", "inherit", "inherit"],
-    env: process.env
-  });
-  cleanupFns.push(async () => {
-    if (!driverProc.killed) driverProc.kill("SIGTERM");
-  });
-
-  await new Promise((resolve) => setTimeout(resolve, 1400));
 
   const env = {
     ...process.env,
@@ -253,21 +242,16 @@ async function main() {
       process.env.AETHOS_MEDIA_WIRE_BUCKET_BURST_BYTES || "67108864"
   };
 
-  const capabilities = new Capabilities();
-  capabilities.setBrowserName("wry");
-  capabilities.set("tauri:options", {
+  const driver = await launchTauriSession({
     application: TAURI_BIN,
+    cwd: DESKTOP_DIR,
+    socketPath: SOCKET_PATH,
+    env,
     args: [
       `--aethos-state-dir=${STATE_ROOT}`,
       `--aethos-media-e2e-max-item-payload-b64-bytes=${String(MEDIA_CAP_B64)}`
-    ],
-    env
+    ]
   });
-
-  const driver = await new Builder()
-    .usingServer(`http://127.0.0.1:${DRIVER_PORT}/`)
-    .withCapabilities(capabilities)
-    .build();
   cleanupFns.push(async () => {
     try {
       await driver.quit();
@@ -325,7 +309,7 @@ async function main() {
         // ignore
       }
     }
-    spawnSync("bash", ["-lc", "pkill -f 'src-tauri/target/debug/aethos' || true; pkill -f tauri-driver || true; pkill -f WebKitWebDriver || true"], {
+    spawnSync("bash", ["-lc", "pkill -f 'src-tauri/target/debug/aethos' || true"], {
       cwd: DESKTOP_DIR,
       stdio: "inherit"
     });
