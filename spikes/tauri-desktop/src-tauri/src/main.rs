@@ -5570,7 +5570,7 @@ fn glyph_5x7(ch: char) -> [u8; 7] {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default()
         .setup(|app| {
             let _ = APP_HANDLE.set(app.handle().clone());
             Ok(())
@@ -5602,7 +5602,31 @@ pub fn run() {
             decode_wayfarer_id_from_qr_bytes,
             open_external_url,
             run_relay_diagnostics
-        ])
+        ]);
+
+    #[cfg(feature = "e2e-testing")]
+    {
+        let socket_path = std::env::var("TAURI_PLAYWRIGHT_SOCKET")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let tcp_port = std::env::var("TAURI_PLAYWRIGHT_TCP_PORT")
+            .ok()
+            .and_then(|value| value.trim().parse::<u16>().ok())
+            .filter(|value| *value > 0);
+
+        let mut playwright_config = tauri_plugin_playwright::PluginConfig::new();
+        if let Some(socket_path) = socket_path {
+            playwright_config = playwright_config.socket_path(socket_path);
+        }
+        if let Some(tcp_port) = tcp_port {
+            playwright_config = playwright_config.tcp_port(tcp_port);
+        }
+
+        builder = builder.plugin(tauri_plugin_playwright::init_with_config(playwright_config));
+    }
+
+    builder
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
