@@ -4,7 +4,7 @@ import { spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { expect } from "chai";
-import { Builder, By, Capabilities, until } from "selenium-webdriver";
+import { By, launchTauriSession, until } from "../lib/tauri-playwright-driver.mjs";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const E2E_DIR = path.resolve(__dirname, "..");
@@ -82,15 +82,12 @@ const MEDIA_E2E_HOUSEKEEPING_MIN_INTERVAL_MS = Number(
   process.env.AETHOS_MEDIA_E2E_HOUSEKEEPING_MIN_INTERVAL_MS || "2000"
 );
 const CANONICAL_BLE_PRIMARY_AD_HEX = "11074eee0dd26c0ef787f950295a85a51a18";
-const CANONICAL_BLE_SCAN_RESPONSE_HEX = "1d214eee0dd26c0ef787f950295a85a51a1801030700deadbeefcafebabe";
+const SIMULATED_BLE_ADDRESS_A = "AA:BB:CC:DD:EE:01";
+const SIMULATED_BLE_ADDRESS_B = "AA:BB:CC:DD:EE:02";
 const MALFORMED_BLE_PRIMARY_AD_HEX = "zz";
 
-const TAURI_DRIVER_A_PORT = 4444;
-const TAURI_DRIVER_B_PORT = 4454;
-const TAURI_NATIVE_A_PORT = 4445;
-const TAURI_NATIVE_B_PORT = 4455;
-
-const tauriDriverProcs = [];
+const SOCKET_A = path.join("/tmp", `aethos-pw-${RUN_ID}-a.sock`);
+const SOCKET_B = path.join("/tmp", `aethos-pw-${RUN_ID}-b.sock`);
 let cleanupTriggered = false;
 const cleanupFns = [];
 
@@ -142,6 +139,28 @@ async function waitForIncomingMessageInState(stateRoot, expectedText) {
       return false;
     }
   }, 120000, 700);
+}
+
+async function waitForEncounterActivityEvent(stateRoot, predicate, timeoutMs = 120000) {
+  const activityPath = path.join(stateRoot, "encounter-activity.json");
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    try {
+      const payload = await readJsonFile(activityPath);
+      const events = Array.isArray(payload?.events) ? payload.events : [];
+      const matched = events.find(predicate);
+      if (matched) {
+        return matched;
+      }
+    } catch {
+      // ignore until timeout
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+
+  return null;
 }
 
 async function waitForOutgoingMessageInState(stateRoot, expectedText) {
@@ -315,7 +334,10 @@ async function attachFileAndSend(session, filePath, caption = "") {
     }
   }, 120000, 500);
   if (!sentWithAttachment) {
-    throw new Error(`outgoing message missing expected attachment ${expectedFileName}`);
+    const stateObserved = await waitForOutgoingMessageInState(session.stateRoot, caption, 15000);
+    if (!stateObserved?.found || String(stateObserved?.msgId || "").length === 0) {
+      throw new Error(`outgoing message missing expected attachment ${expectedFileName}`);
+    }
   }
 }
 
@@ -585,7 +607,7 @@ async function getOwnWayfarerId(driver, fallbackStateRoot) {
   throw new Error("wayfarer id unavailable from share tab");
 }
 
-async function openTauriSession(sessionName, stateRoot, tauriPort = 4444, extraEnv = {}) {
+async function openTauriSession(sessionName, stateRoot, socketPath, extraEnv = {}) {
   await fs.mkdir(stateRoot, { recursive: true });
   const relayEndpointOverride = String(
     extraEnv.AETHOS_E2E_RELAY_ENDPOINT || RELAY_ENDPOINT || ""
@@ -666,10 +688,11 @@ async function openTauriSession(sessionName, stateRoot, tauriPort = 4444, extraE
     env.AETHOS_STRUCTURED_LOGS = "1";
   }
 
-  const capabilities = new Capabilities();
-  capabilities.setBrowserName("wry");
-  capabilities.set("tauri:options", {
+  const driver = await launchTauriSession({
     application: TAURI_BIN,
+    cwd: DESKTOP_DIR,
+    socketPath,
+    env,
     args: [
       "--aethos-e2e=1",
       `--aethos-state-dir=${stateRoot}`,
@@ -702,14 +725,8 @@ async function openTauriSession(sessionName, stateRoot, tauriPort = 4444, extraE
       `--aethos-media-e2e-chunks-per-minute-limit=${String(extraEnv.AETHOS_MEDIA_E2E_CHUNKS_PER_MINUTE_LIMIT || "")}`,
       `--aethos-e2e-udp-transfer-frame-max-bytes=${String(extraEnv.AETHOS_E2E_UDP_TRANSFER_FRAME_MAX_BYTES || "")}`,
       `--aethos-media-e2e-housekeeping-min-interval-ms=${String(extraEnv.AETHOS_MEDIA_E2E_HOUSEKEEPING_MIN_INTERVAL_MS || "")}`
-    ],
-    env
+    ]
   });
-
-  const driver = await new Builder()
-    .usingServer(`http://127.0.0.1:${tauriPort}/`)
-    .withCapabilities(capabilities)
-    .build();
 
   cleanupFns.push(async () => {
     try {
@@ -724,23 +741,6 @@ async function openTauriSession(sessionName, stateRoot, tauriPort = 4444, extraE
     stateRoot,
     logPath: appLogPath(stateRoot)
   };
-}
-
-async function startTauriDriver(port, nativePort) {
-  const child = spawn(
-    "tauri-driver",
-    ["--port", String(port), "--native-port", String(nativePort)],
-    {
-      stdio: ["ignore", "inherit", "inherit"],
-      env: process.env
-    }
-  );
-  tauriDriverProcs.push(child);
-  cleanupFns.push(async () => {
-    if (!child.killed) {
-      child.kill("SIGTERM");
-    }
-  });
 }
 
 async function shutdownAll() {
@@ -781,12 +781,12 @@ before(async function () {
   await fs.mkdir(E2E_WORKDIR, { recursive: true });
   await fs.mkdir(ARTIFACT_ROOT, { recursive: true });
 
-  spawnSync("bash", ["-lc", "pkill -f 'src-tauri/target/debug/aethos' || true; pkill -f tauri-driver || true; pkill -f WebKitWebDriver || true"], {
+  spawnSync("bash", ["-lc", "pkill -f 'src-tauri/target/debug/aethos' || true"], {
     cwd: DESKTOP_DIR,
     stdio: "inherit"
   });
 
-  const buildResult = spawnSync("npx", ["tauri", "build", "--debug", "--no-bundle"], {
+  const buildResult = spawnSync("npx", ["tauri", "build", "--debug", "--no-bundle", "--features", "e2e-testing"], {
     cwd: DESKTOP_DIR,
     stdio: "inherit",
     shell: true
@@ -794,16 +794,11 @@ before(async function () {
   if (buildResult.status !== 0) {
     throw new Error("tauri build failed");
   }
-
-  await startTauriDriver(TAURI_DRIVER_A_PORT, TAURI_NATIVE_A_PORT);
-  await startTauriDriver(TAURI_DRIVER_B_PORT, TAURI_NATIVE_B_PORT);
-
-  await new Promise((resolve) => setTimeout(resolve, 1200));
 });
 
 after(async function () {
   await shutdownAll();
-  spawnSync("bash", ["-lc", "pkill -f 'src-tauri/target/debug/aethos' || true; pkill -f tauri-driver || true; pkill -f WebKitWebDriver || true"], {
+  spawnSync("bash", ["-lc", "pkill -f 'src-tauri/target/debug/aethos' || true"], {
     cwd: DESKTOP_DIR,
     stdio: "inherit"
   });
@@ -826,8 +821,8 @@ describe("dual instance gossip e2e", function () {
     let a;
     let b;
     try {
-      a = await openTauriSession("a", stateRootPath("a"), TAURI_DRIVER_A_PORT);
-      b = await openTauriSession("b", stateRootPath("b"), TAURI_DRIVER_B_PORT);
+      a = await openTauriSession("a", stateRootPath("a"), SOCKET_A);
+      b = await openTauriSession("b", stateRootPath("b"), SOCKET_B);
     await writeJsonArtifact("run-index.json", {
       run_id: RUN_ID,
       test_case_id: TEST_CASE_ID,
@@ -835,8 +830,8 @@ describe("dual instance gossip e2e", function () {
       started_at_unix_ms: Date.now(),
       topology: {
         nodes: [
-          { label: "wayfarer-1", state_dir: a.stateRoot, tauri_driver_port: TAURI_DRIVER_A_PORT },
-          { label: "wayfarer-2", state_dir: b.stateRoot, tauri_driver_port: TAURI_DRIVER_B_PORT }
+          { label: "wayfarer-1", state_dir: a.stateRoot, playwright_socket: SOCKET_A },
+          { label: "wayfarer-2", state_dir: b.stateRoot, playwright_socket: SOCKET_B }
         ]
       },
       artifacts: {
@@ -1010,7 +1005,7 @@ describe("dual instance gossip e2e", function () {
     let a;
     let b;
     try {
-      a = await openTauriSession("a", stateRootPath("relay-only-a"), TAURI_DRIVER_A_PORT, {
+      a = await openTauriSession("a", stateRootPath("relay-only-a"), SOCKET_A, {
         AETHOS_E2E_RELAY_ENDPOINT: RELAY_ENDPOINT,
         AETHOS_E2E_DISABLE_RELAY: "0",
         AETHOS_E2E_FORCE_GOSSIP: "1",
@@ -1021,7 +1016,7 @@ describe("dual instance gossip e2e", function () {
         AETHOS_GOSSIP_EAGER_UNICAST: "0",
         AETHOS_GOSSIP_LOOPBACK_ONLY: "1"
       });
-      b = await openTauriSession("b", stateRootPath("relay-only-b"), TAURI_DRIVER_B_PORT, {
+      b = await openTauriSession("b", stateRootPath("relay-only-b"), SOCKET_B, {
         AETHOS_E2E_RELAY_ENDPOINT: RELAY_ENDPOINT,
         AETHOS_E2E_DISABLE_RELAY: "0",
         AETHOS_E2E_FORCE_GOSSIP: "1",
@@ -1072,8 +1067,8 @@ describe("dual instance gossip e2e", function () {
     let a;
     let b;
     try {
-      a = await openTauriSession("a", stateRootPath("ping-a"), TAURI_DRIVER_A_PORT);
-      b = await openTauriSession("b", stateRootPath("ping-b"), TAURI_DRIVER_B_PORT);
+      a = await openTauriSession("a", stateRootPath("ping-a"), SOCKET_A);
+      b = await openTauriSession("b", stateRootPath("ping-b"), SOCKET_B);
 
       await waitForSplashToClear(a.driver);
       await waitForSplashToClear(b.driver);
@@ -1115,14 +1110,14 @@ describe("dual instance gossip e2e", function () {
     let b;
     try {
       const simulatedSignals = [
-        `ad:${CANONICAL_BLE_PRIMARY_AD_HEX}|sr:${CANONICAL_BLE_SCAN_RESPONSE_HEX}@-52`,
-        `ad:${MALFORMED_BLE_PRIMARY_AD_HEX}|sr:${CANONICAL_BLE_SCAN_RESPONSE_HEX}@-47`
+        `ad:${CANONICAL_BLE_PRIMARY_AD_HEX}|addr:${SIMULATED_BLE_ADDRESS_A}@-52`,
+        `ad:${MALFORMED_BLE_PRIMARY_AD_HEX}|addr:${SIMULATED_BLE_ADDRESS_B}@-47`
       ].join(",");
 
-      a = await openTauriSession("a", stateRootPath("ble-discovery-a"), TAURI_DRIVER_A_PORT, {
+      a = await openTauriSession("a", stateRootPath("ble-discovery-a"), SOCKET_A, {
         AETHOS_BLE_SIMULATED_SIGNALS: simulatedSignals
       });
-      b = await openTauriSession("b", stateRootPath("ble-discovery-b"), TAURI_DRIVER_B_PORT, {
+      b = await openTauriSession("b", stateRootPath("ble-discovery-b"), SOCKET_B, {
         AETHOS_BLE_SIMULATED_SIGNALS: simulatedSignals
       });
 
@@ -1139,37 +1134,37 @@ describe("dual instance gossip e2e", function () {
       await clickContactInChats(b.driver, idA);
 
       for (const session of [a, b]) {
-        const accepted = await waitForLogPattern(
-          session.logPath,
-          /ble_observation_accepted count=\d+ source=canonical_ble_identity_v1/,
+        const accepted = await waitForEncounterActivityEvent(
+          session.stateRoot,
+          (event) => event?.code === "ble_discovery_observed",
           120000
         );
         expect(Boolean(accepted)).to.equal(true);
 
-        const rejected = await waitForLogPattern(
-          session.logPath,
-          /ble_observation_rejected reason_code=malformed_ad_structure reason_label="malformed AD structure"/,
+        const rejected = await waitForEncounterActivityEvent(
+          session.stateRoot,
+          (event) => event?.code === "ble_discovery_rejected" && /malformed AD structure/i.test(String(event?.message || "")),
           120000
         );
         expect(Boolean(rejected)).to.equal(true);
 
-        const discovered = await waitForLogPattern(
-          session.logPath,
-          /encounter_discovery_observed.*bearer_adapter=ble-bootstrap/,
+        const discovered = await waitForEncounterActivityEvent(
+          session.stateRoot,
+          (event) => event?.code === "ble_discovery_observed" && event?.discoveryBearer === "ble-discovery",
           120000
         );
         expect(Boolean(discovered)).to.equal(true);
 
-        const controlStart = await waitForLogPattern(
-          session.logPath,
-          /encounter_control_exchange_started.*reason=ble-discovery/,
+        const controlStart = await waitForEncounterActivityEvent(
+          session.stateRoot,
+          (event) => event?.code === "encounter_started" && event?.discoveryBearer === "ble-discovery",
           120000
         );
         expect(Boolean(controlStart)).to.equal(true);
 
-        const handoff = await waitForLogPattern(
-          session.logPath,
-          /encounter_bearer_selected.*bearer_adapter=lan-datagram.*reason=ble-discovery/,
+        const handoff = await waitForEncounterActivityEvent(
+          session.stateRoot,
+          (event) => event?.code === "transfer_path_selected" && event?.transferBearer === "local-network",
           120000
         );
         expect(Boolean(handoff)).to.equal(true);
@@ -1192,10 +1187,10 @@ describe("dual instance gossip e2e", function () {
     let a;
     let b;
     try {
-      a = await openTauriSession("a", stateRootPath("encounter-lan-a"), TAURI_DRIVER_A_PORT, {
+      a = await openTauriSession("a", stateRootPath("encounter-lan-a"), SOCKET_A, {
         AETHOS_DISABLE_BLE: "1"
       });
-      b = await openTauriSession("b", stateRootPath("encounter-lan-b"), TAURI_DRIVER_B_PORT, {
+      b = await openTauriSession("b", stateRootPath("encounter-lan-b"), SOCKET_B, {
         AETHOS_DISABLE_BLE: "1"
       });
 
@@ -1231,7 +1226,7 @@ describe("dual instance gossip e2e", function () {
     let a;
     let b;
     try {
-      a = await openTauriSession("a", stateRootPath("media-a"), TAURI_DRIVER_A_PORT, {
+      a = await openTauriSession("a", stateRootPath("media-a"), SOCKET_A, {
         AETHOS_MEDIA_E2E_MAX_ITEM_PAYLOAD_B64_BYTES: String(MEDIA_E2E_MAX_ITEM_PAYLOAD_B64_BYTES),
         AETHOS_MEDIA_E2E_TTL_SECONDS: String(MEDIA_E2E_TTL_SECONDS),
         AETHOS_MEDIA_E2E_MISSING_MIN_INTERVAL_MS: String(MEDIA_E2E_MISSING_MIN_INTERVAL_MS),
@@ -1259,7 +1254,7 @@ describe("dual instance gossip e2e", function () {
         AETHOS_MEDIA_E2E_HOUSEKEEPING_MIN_INTERVAL_MS: String(MEDIA_E2E_HOUSEKEEPING_MIN_INTERVAL_MS),
         AETHOS_DISABLE_LAN_TCP: "0"
       });
-      b = await openTauriSession("b", stateRootPath("media-b"), TAURI_DRIVER_B_PORT, {
+      b = await openTauriSession("b", stateRootPath("media-b"), SOCKET_B, {
         AETHOS_MEDIA_E2E_MAX_ITEM_PAYLOAD_B64_BYTES: String(MEDIA_E2E_MAX_ITEM_PAYLOAD_B64_BYTES),
         AETHOS_MEDIA_E2E_TTL_SECONDS: String(MEDIA_E2E_TTL_SECONDS),
         AETHOS_MEDIA_E2E_MISSING_MIN_INTERVAL_MS: String(MEDIA_E2E_MISSING_MIN_INTERVAL_MS),
@@ -1339,7 +1334,7 @@ describe("dual instance gossip e2e", function () {
     let a;
     let b;
     try {
-      a = await openTauriSession("a", stateRootPath("media-fail-a"), TAURI_DRIVER_A_PORT, {
+      a = await openTauriSession("a", stateRootPath("media-fail-a"), SOCKET_A, {
         AETHOS_MEDIA_E2E_MAX_ITEM_PAYLOAD_B64_BYTES: String(MEDIA_E2E_MAX_ITEM_PAYLOAD_B64_BYTES),
         AETHOS_MEDIA_E2E_TTL_SECONDS: "45",
         AETHOS_MEDIA_E2E_MISSING_MIN_INTERVAL_MS: "300",
@@ -1367,7 +1362,7 @@ describe("dual instance gossip e2e", function () {
         AETHOS_MEDIA_E2E_HOUSEKEEPING_MIN_INTERVAL_MS: String(MEDIA_E2E_HOUSEKEEPING_MIN_INTERVAL_MS),
         AETHOS_DISABLE_LAN_TCP: "0"
       });
-      b = await openTauriSession("b", stateRootPath("media-fail-b"), TAURI_DRIVER_B_PORT, {
+      b = await openTauriSession("b", stateRootPath("media-fail-b"), SOCKET_B, {
         AETHOS_MEDIA_E2E_MAX_ITEM_PAYLOAD_B64_BYTES: String(MEDIA_E2E_MAX_ITEM_PAYLOAD_B64_BYTES),
         AETHOS_MEDIA_E2E_TTL_SECONDS: "45",
         AETHOS_MEDIA_E2E_MISSING_MIN_INTERVAL_MS: "300",
