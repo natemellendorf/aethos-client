@@ -6,6 +6,7 @@ pub mod encounter_scheduler;
 pub mod gossip_store_sqlite;
 pub mod gossip_sync;
 pub mod identity_store;
+pub mod ipv4_broadcast_discovery;
 pub mod logging;
 pub mod protocol;
 #[cfg(test)]
