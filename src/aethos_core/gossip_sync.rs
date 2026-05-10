@@ -2281,8 +2281,12 @@ mod tests {
 
     #[test]
     fn primary_transfer_scheduler_path_matches_canonical_fixture_outputs() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("test-data/routing/encounter-ranking");
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest_dir
+            .ancestors()
+            .map(|base| base.join("test-data/routing/encounter-ranking"))
+            .find(|candidate| candidate.exists())
+            .unwrap_or_else(|| manifest_dir.join("test-data/routing/encounter-ranking"));
         let manifest_bytes = std::fs::read(root.join("manifest.json")).expect("read manifest");
         let manifest: ShadowFixtureManifest =
             serde_json::from_slice(&manifest_bytes).expect("parse manifest");
@@ -2343,8 +2347,12 @@ mod tests {
 
     #[test]
     fn shadow_comparison_runs_against_canonical_fixture_suite() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("test-data/routing/encounter-ranking");
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest_dir
+            .ancestors()
+            .map(|base| base.join("test-data/routing/encounter-ranking"))
+            .find(|candidate| candidate.exists())
+            .unwrap_or_else(|| manifest_dir.join("test-data/routing/encounter-ranking"));
         let manifest_bytes = std::fs::read(root.join("manifest.json")).expect("read manifest");
         let manifest: ShadowFixtureManifest =
             serde_json::from_slice(&manifest_bytes).expect("parse manifest");

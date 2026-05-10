@@ -398,8 +398,12 @@ mod tests {
 
     #[test]
     fn canonical_fixture_bundle_for_gossip_v1_is_present() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("third_party/aethos/Fixtures/Protocol/gossip-v1");
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest_dir
+            .ancestors()
+            .map(|base| base.join("third_party/aethos/Fixtures/Protocol/gossip-v1"))
+            .find(|candidate| candidate.exists())
+            .unwrap_or_else(|| manifest_dir.join("third_party/aethos/Fixtures/Protocol/gossip-v1"));
         let required = [
             "README.md",
             "hello.json",

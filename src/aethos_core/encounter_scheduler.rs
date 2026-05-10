@@ -1149,12 +1149,18 @@ mod tests {
     }
 
     fn fixture_root() -> PathBuf {
-        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let shared = workspace.join("third_party/aethos/Fixtures/Routing/encounter-ranking");
-        if shared.exists() {
-            return shared;
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for base in manifest_dir.ancestors() {
+            let shared = base.join("third_party/aethos/Fixtures/Routing/encounter-ranking");
+            if shared.exists() {
+                return shared;
+            }
+            let local = base.join("test-data/routing/encounter-ranking");
+            if local.exists() {
+                return local;
+            }
         }
-        workspace.join("test-data/routing/encounter-ranking")
+        manifest_dir.join("test-data/routing/encounter-ranking")
     }
 
     fn load_fixture_manifest() -> EncounterFixtureManifest {
