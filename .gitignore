@@ -12,3 +12,17 @@ btmon*.log
 .dolt/
 *.db
 .beads-credential-key
+.beads/issues.jsonl
+
+# Orchestration / planning artifacts
+.sisyphus/
+.worktrees/
+
+# Runtime diagnostics artifacts
+aethos-diagnostics.sqlite3
+aethos-diagnostics.sqlite3-shm
+aethos-diagnostics.sqlite3-wal
+
+# E2E harness local artifacts
+tests/e2e-harness/docker/
+scripts/e2e/run-linux-ui-e2e.sh
