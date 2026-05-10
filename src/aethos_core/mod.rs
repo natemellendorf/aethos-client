@@ -7,6 +7,7 @@ pub mod gossip_store_sqlite;
 pub mod gossip_sync;
 pub mod identity_store;
 pub mod logging;
+pub mod multicast_discovery;
 pub mod protocol;
 #[cfg(test)]
 pub mod vectors;
