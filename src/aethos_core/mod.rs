@@ -8,6 +8,7 @@ pub mod gossip_sync;
 pub mod identity_store;
 pub mod ipv4_broadcast_discovery;
 pub mod logging;
+pub mod multicast_discovery;
 pub mod protocol;
 #[cfg(test)]
 pub mod vectors;
