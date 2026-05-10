@@ -20,7 +20,7 @@ dependencies = [
 
 [[package]]
 name = "aethos-linux"
-version = "1.4.2"
+version = "1.4.3"
 dependencies = [
  "axum",
  "base64",
