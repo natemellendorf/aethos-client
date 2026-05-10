@@ -124,7 +124,7 @@ impl ActiveMulticastDiscovery {
 
         let multicast_addr: SocketAddr = format!("{}:{port}", AETHOS_MULTICAST_GROUP)
             .parse()
-            .unwrap();
+            .expect("multicast: multicast addr parse is infallible");
 
         let mut pending = VecDeque::new();
         for err_msg in join_errors {
