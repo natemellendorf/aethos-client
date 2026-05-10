@@ -73,6 +73,7 @@ const DONATE_PAYPAL_URL = "https://www.paypal.com/donate/?hosted_button_id=TPTTR
 const MEDIA_PREVIEW_GATE_BYTES = 5 * 1024 * 1024;
 const BLE_ICON_PULSE_WINDOW_MS = 60 * 1000;
 const GOSSIP_ACTIVITY_PULSE_WINDOW_MS = 60 * 1000;
+const SCROLLBAR_FADE_DELAY_MS = 680;
 
 function tinyId(id = "") {
   if (!id) return "-";
@@ -442,6 +443,33 @@ export default function App() {
     rows.sort((a, b) => b.createdAtUnixMs - a.createdAtUnixMs);
     return rows;
   }, [chat.threads, contacts]);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    let fadeTimer = null;
+
+    const showScrollbars = () => {
+      root.classList.add("scrollbars-active");
+      if (fadeTimer) {
+        window.clearTimeout(fadeTimer);
+      }
+      fadeTimer = window.setTimeout(() => {
+        root.classList.remove("scrollbars-active");
+      }, SCROLLBAR_FADE_DELAY_MS);
+    };
+
+    window.addEventListener("wheel", showScrollbars, { passive: true });
+    window.addEventListener("scroll", showScrollbars, { passive: true, capture: true });
+
+    return () => {
+      window.removeEventListener("wheel", showScrollbars);
+      window.removeEventListener("scroll", showScrollbars, true);
+      if (fadeTimer) {
+        window.clearTimeout(fadeTimer);
+      }
+      root.classList.remove("scrollbars-active");
+    };
+  }, []);
 
   useEffect(() => {
     const baseline = new Set(selectedThread.map((message) => message.msgId));
