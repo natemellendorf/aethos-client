@@ -208,18 +208,32 @@ impl DiscoveryBearerSource for BonjourDiscoveryCandidateSource {
 
 struct IPv4BroadcastDiscoveryCandidateSource {
     discovery: IPv4BroadcastDiscovery,
+    port: u16,
+    local_endpoints: Vec<std::net::IpAddr>,
+    restart_after: Option<Instant>,
 }
 
 impl IPv4BroadcastDiscoveryCandidateSource {
     fn new(port: u16, local_endpoints: Vec<std::net::IpAddr>) -> Self {
         Self {
-            discovery: IPv4BroadcastDiscovery::new(port, local_endpoints),
+            discovery: IPv4BroadcastDiscovery::new(port, local_endpoints.clone()),
+            port,
+            local_endpoints,
+            restart_after: None,
         }
     }
 }
 
 impl DiscoveryBearerSource for IPv4BroadcastDiscoveryCandidateSource {
     fn poll_candidates(&mut self) -> Vec<DiscoveryCandidate> {
+        if let Some(restart_deadline) = self.restart_after {
+            if Instant::now() >= restart_deadline {
+                self.discovery = IPv4BroadcastDiscovery::new(self.port, self.local_endpoints.clone());
+                self.restart_after = None;
+                log_info("ipv4_broadcast_discovery_restarted");
+            }
+        }
+
         let mut candidates = Vec::new();
         for event in self.discovery.poll() {
             match event {
@@ -239,6 +253,10 @@ impl DiscoveryBearerSource for IPv4BroadcastDiscoveryCandidateSource {
                 }
                 IPv4BroadcastDiscoveryEvent::Error(err) => {
                     log_error(&format!("ipv4_broadcast_discovery_error: {err}"));
+                    if self.restart_after.is_none() {
+                        self.restart_after = Some(Instant::now() + Duration::from_secs(5));
+                        log_info("ipv4_broadcast_discovery_restart_scheduled delay_ms=5000");
+                    }
                 }
             }
         }
@@ -248,18 +266,32 @@ impl DiscoveryBearerSource for IPv4BroadcastDiscoveryCandidateSource {
 
 struct MulticastDiscoveryCandidateSource {
     discovery: MulticastDiscovery,
+    port: u16,
+    local_endpoints: Vec<std::net::IpAddr>,
+    restart_after: Option<Instant>,
 }
 
 impl MulticastDiscoveryCandidateSource {
     fn new(port: u16, local_endpoints: Vec<std::net::IpAddr>) -> Self {
         Self {
-            discovery: MulticastDiscovery::new(port, local_endpoints),
+            discovery: MulticastDiscovery::new(port, local_endpoints.clone()),
+            port,
+            local_endpoints,
+            restart_after: None,
         }
     }
 }
 
 impl DiscoveryBearerSource for MulticastDiscoveryCandidateSource {
     fn poll_candidates(&mut self) -> Vec<DiscoveryCandidate> {
+        if let Some(restart_deadline) = self.restart_after {
+            if Instant::now() >= restart_deadline {
+                self.discovery = MulticastDiscovery::new(self.port, self.local_endpoints.clone());
+                self.restart_after = None;
+                log_info("multicast_discovery_restarted");
+            }
+        }
+
         let mut candidates = Vec::new();
         for event in self.discovery.poll() {
             match event {
@@ -279,6 +311,10 @@ impl DiscoveryBearerSource for MulticastDiscoveryCandidateSource {
                 }
                 MulticastDiscoveryEvent::Error(err) => {
                     log_error(&format!("multicast_discovery_error: {err}"));
+                    if self.restart_after.is_none() {
+                        self.restart_after = Some(Instant::now() + Duration::from_secs(5));
+                        log_info("multicast_discovery_restart_scheduled delay_ms=5000");
+                    }
                 }
             }
         }
