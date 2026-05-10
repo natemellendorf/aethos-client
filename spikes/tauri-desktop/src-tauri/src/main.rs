@@ -185,7 +185,7 @@ impl DiscoveryBearerSource for BonjourDiscoveryCandidateSource {
                         resolved.endpoint, resolved.fullname
                     ));
                     candidates.push(DiscoveryCandidate {
-                        candidate_id: resolved.fullname,
+                        candidate_id: resolved.endpoint.to_string(),
                         peer_endpoint: resolved.endpoint,
                         peer_identity: None,
                         discovered_via: DiscoveryBearer::Bonjour,
@@ -682,6 +682,7 @@ fn prune_finished_udp_encounters(
     peer_addr_by_node: &mut HashMap<String, SocketAddr>,
     peer_tcp_capable_by_ip: &mut HashMap<String, bool>,
     tcp_backoff_until_by_ip: &mut HashMap<String, Instant>,
+    lan_encounters: &mut HashMap<String, EncounterManager>,
     udp_encounters: &mut HashMap<String, GossipEncounterState>,
     udp_last_seen_by_peer: &mut HashMap<String, Instant>,
     udp_latest_summary_by_peer: &mut HashMap<String, crate::aethos_core::gossip_sync::SummaryFrame>,
@@ -704,11 +705,40 @@ fn prune_finished_udp_encounters(
         }
 
         if encounter.stop_reason.is_some() {
-            finished.push((peer_ip.clone(), encounter.peer_identity.clone()));
+            finished.push((
+                peer_ip.clone(),
+                encounter.peer_identity.clone(),
+                encounter.accepted_item_ids.len(),
+                encounter.bytes_imported,
+            ));
         }
     }
 
-    for (peer_ip, peer_identity) in finished {
+    for (peer_ip, peer_identity, transferred_items, bytes_imported) in finished {
+        if let Some(candidate_id) = peer_addr_by_node
+            .get(&peer_identity)
+            .map(|addr| addr.to_string())
+            .or_else(|| {
+                lan_encounters
+                    .keys()
+                    .find(|candidate_id| candidate_id.starts_with(&format!("{peer_ip}:")))
+                    .cloned()
+            })
+        {
+            if let Some(encounter_manager) = lan_encounters.get_mut(&candidate_id) {
+                let transition_at_unix_ms = now_unix_ms();
+                if bytes_imported > 0 {
+                    encounter_manager.set_transfer_bearer(
+                        BearerAdapter::LanDatagram,
+                        TransitionReason::InitialSelection,
+                        transition_at_unix_ms,
+                    );
+                    encounter_manager
+                        .mark_transfer_completed(transferred_items, transition_at_unix_ms);
+                }
+                encounter_manager.close(transition_at_unix_ms);
+            }
+        }
         udp_encounters.remove(&peer_ip);
         udp_last_seen_by_peer.remove(&peer_ip);
         udp_latest_summary_by_peer.remove(&peer_ip);
@@ -2997,6 +3027,7 @@ fn start_gossip_worker_if_needed(initial_enabled: bool, initial_ble_discovery_en
                 &mut peer_addr_by_node,
                 &mut peer_tcp_capable_by_ip,
                 &mut tcp_backoff_until_by_ip,
+                &mut lan_encounters,
                 &mut udp_encounters,
                 &mut udp_last_seen_by_peer,
                 &mut udp_latest_summary_by_peer,
@@ -3149,6 +3180,7 @@ fn start_gossip_worker_if_needed(initial_enabled: bool, initial_ble_discovery_en
                         &mut peer_addr_by_node,
                         &mut peer_tcp_capable_by_ip,
                         &mut tcp_backoff_until_by_ip,
+                        &mut lan_encounters,
                         &mut udp_encounters,
                         &mut udp_last_seen_by_peer,
                         &mut udp_latest_summary_by_peer,
@@ -3164,6 +3196,7 @@ fn start_gossip_worker_if_needed(initial_enabled: bool, initial_ble_discovery_en
                         &mut peer_addr_by_node,
                         &mut peer_tcp_capable_by_ip,
                         &mut tcp_backoff_until_by_ip,
+                        &mut lan_encounters,
                         &mut udp_encounters,
                         &mut udp_last_seen_by_peer,
                         &mut udp_latest_summary_by_peer,
@@ -3542,6 +3575,7 @@ fn handle_gossip_frame(
     peer_addr_by_node: &mut HashMap<String, SocketAddr>,
     peer_tcp_capable_by_ip: &mut HashMap<String, bool>,
     tcp_backoff_until_by_ip: &mut HashMap<String, Instant>,
+    lan_encounters: &mut HashMap<String, EncounterManager>,
     udp_encounters: &mut HashMap<String, GossipEncounterState>,
     udp_last_seen_by_peer: &mut HashMap<String, Instant>,
     udp_latest_summary_by_peer: &mut HashMap<String, crate::aethos_core::gossip_sync::SummaryFrame>,
@@ -3584,6 +3618,13 @@ fn handle_gossip_frame(
                 &source_ip_key,
                 hello.node_id.clone(),
             );
+            if let Some(encounter_manager) = lan_encounters.get_mut(&source_key) {
+                encounter_manager.start_control_exchange(
+                    BearerAdapter::LanDatagram,
+                    TransitionReason::InitialSelection,
+                    now_unix_ms(),
+                );
+            }
             udp_latest_summary_by_peer.remove(&source_ip_key);
             udp_relay_ingest_candidates_by_peer.remove(&source_ip_key);
             let tcp_capable = hello
@@ -6545,6 +6586,7 @@ mod tests {
         let mut peer_addr_by_node = HashMap::new();
         let mut peer_tcp_capable_by_ip = HashMap::new();
         let mut tcp_backoff_until_by_ip = HashMap::new();
+        let mut lan_encounters = HashMap::new();
         let mut udp_encounters = HashMap::new();
         let mut udp_last_seen_by_peer = HashMap::new();
         let mut udp_latest_summary_by_peer = HashMap::new();
@@ -6569,6 +6611,7 @@ mod tests {
             &mut peer_addr_by_node,
             &mut peer_tcp_capable_by_ip,
             &mut tcp_backoff_until_by_ip,
+            &mut lan_encounters,
             &mut udp_encounters,
             &mut udp_last_seen_by_peer,
             &mut udp_latest_summary_by_peer,
@@ -6680,6 +6723,7 @@ mod tests {
             "192.168.1.8".to_string(),
             Instant::now() + Duration::from_secs(5),
         )]);
+        let mut lan_encounters = HashMap::new();
         let mut udp_encounters = HashMap::new();
         let mut udp_last_seen_by_peer =
             HashMap::from([("192.168.1.8".to_string(), Instant::now())]);
@@ -6709,6 +6753,7 @@ mod tests {
             &mut peer_addr_by_node,
             &mut peer_tcp_capable_by_ip,
             &mut tcp_backoff_until_by_ip,
+            &mut lan_encounters,
             &mut udp_encounters,
             &mut udp_last_seen_by_peer,
             &mut udp_latest_summary_by_peer,

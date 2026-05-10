@@ -81,13 +81,17 @@ impl ActiveIPv4BroadcastDiscovery {
         socket
             .set_nonblocking(true)
             .map_err(|e| format!("ipv4_broadcast: set_nonblocking failed: {e}"))?;
-        let bind_addr: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
+        let bind_addr: SocketAddr = format!("0.0.0.0:{port}")
+            .parse()
+            .expect("ipv4_broadcast: bind addr parse is infallible");
         socket
             .bind(&bind_addr.into())
             .map_err(|e| format!("ipv4_broadcast: bind failed: {e}"))?;
 
         let std_socket: UdpSocket = socket.into();
-        let broadcast_addr: SocketAddr = format!("255.255.255.255:{port}").parse().unwrap();
+        let broadcast_addr: SocketAddr = format!("255.255.255.255:{port}")
+            .parse()
+            .expect("ipv4_broadcast: broadcast addr parse is infallible");
 
         Ok(Self {
             socket: std_socket,
@@ -103,9 +107,12 @@ impl ActiveIPv4BroadcastDiscovery {
 
         // Send beacon every 5th poll.
         if self.poll_count.is_multiple_of(5) {
-            let _ = self
+            if let Err(err) = self
                 .socket
-                .send_to(&AETHOS_BROADCAST_BEACON, self.broadcast_addr);
+                .send_to(&AETHOS_BROADCAST_BEACON, self.broadcast_addr)
+            {
+                eprintln!("ipv4_broadcast: beacon send failed: {err}");
+            }
         }
 
         // Drain inbound packets.

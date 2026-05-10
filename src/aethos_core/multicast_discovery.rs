@@ -79,7 +79,9 @@ impl ActiveMulticastDiscovery {
         socket
             .set_nonblocking(true)
             .map_err(|e| format!("multicast: set_nonblocking failed: {e}"))?;
-        let bind_addr: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
+        let bind_addr: SocketAddr = format!("0.0.0.0:{port}")
+            .parse()
+            .expect("multicast: bind addr parse is infallible");
         socket
             .bind(&bind_addr.into())
             .map_err(|e| format!("multicast: bind failed: {e}"))?;
@@ -146,9 +148,12 @@ impl ActiveMulticastDiscovery {
         self.poll_count = self.poll_count.wrapping_add(1);
 
         if self.poll_count.is_multiple_of(5) {
-            let _ = self
+            if let Err(err) = self
                 .socket
-                .send_to(&AETHOS_MULTICAST_BEACON, self.multicast_addr);
+                .send_to(&AETHOS_MULTICAST_BEACON, self.multicast_addr)
+            {
+                eprintln!("multicast: beacon send failed: {err}");
+            }
         }
 
         let mut buf = [0u8; 1500];
