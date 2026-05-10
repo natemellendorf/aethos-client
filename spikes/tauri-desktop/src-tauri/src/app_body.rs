@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ciborium::value::Value;
 
@@ -196,6 +196,9 @@ pub fn classify_wayfarer_app_body(body: &[u8]) -> ClassificationResult {
     if canonical.as_slice() != body {
         return ClassificationResult::reject("non_deterministic_cbor_encoding");
     }
+    if let Err(err) = validate_nested_map_keys(&decoded, "top_level") {
+        return ClassificationResult::reject(err);
+    }
 
     let top_level_map = match value_as_text_keyed_map(decoded, "top_level") {
         Ok(value) => value,
@@ -366,6 +369,34 @@ fn value_as_text_keyed_map(value: Value, context: &str) -> Result<BTreeMap<Strin
     Ok(out)
 }
 
+fn validate_nested_map_keys(value: &Value, context: &str) -> Result<(), String> {
+    match value {
+        Value::Map(entries) => {
+            let mut seen = BTreeSet::new();
+            for (key, nested) in entries {
+                let Value::Text(key) = key else {
+                    if context == "top_level" {
+                        return Err("top_level_keys_must_be_text".to_string());
+                    }
+                    return Err(format!("{context}_keys_must_be_text"));
+                };
+                if !seen.insert(key.clone()) {
+                    return Err(format!("{context}_duplicate_keys"));
+                }
+                validate_nested_map_keys(nested, key)?;
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                validate_nested_map_keys(item, context)?;
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
 fn required_non_empty_text(map: &BTreeMap<String, Value>, key: &str) -> Result<String, String> {
     let value = map.get(key).ok_or_else(|| format!("{key}_required"))?;
     let Value::Text(text) = value else {
@@ -385,6 +416,9 @@ fn required_u64_integer(map: &BTreeMap<String, Value>, key: &str) -> Result<u64,
     let signed = i128::try_from(integer.clone()).map_err(|_| format!("{key}_invalid_integer"))?;
     if signed < 0 {
         return Err(format!("{key}_must_be_non_negative"));
+    }
+    if signed > i64::MAX as i128 {
+        return Err(format!("{key}_out_of_range"));
     }
     u64::try_from(signed).map_err(|_| format!("{key}_invalid_integer"))
 }
@@ -416,8 +450,14 @@ mod tests {
     }
 
     fn fixtures_dir() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../third_party/aethos/Fixtures/App/wayfarer-payload-taxonomy")
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for base in manifest_dir.ancestors() {
+            let candidate = base.join("third_party/aethos/Fixtures/App/wayfarer-payload-taxonomy");
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+        manifest_dir.join("../../../third_party/aethos/Fixtures/App/wayfarer-payload-taxonomy")
     }
 
     fn decode_hex(input: &str) -> Result<Vec<u8>, String> {

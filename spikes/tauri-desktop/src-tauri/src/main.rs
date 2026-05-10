@@ -630,15 +630,7 @@ impl GossipEncounterState {
     }
 }
 
-#[derive(Debug, Clone)]
-struct UdpPeerInteraction {
-    encounter: GossipEncounterState,
-    latest_summary: Option<crate::aethos_core::gossip_sync::SummaryFrame>,
-    relay_ingest_candidates: Vec<String>,
-    last_seen: Instant,
-}
-
-fn new_udp_peer_interaction(peer_identity: String) -> UdpPeerInteraction {
+fn new_udp_peer_encounter(peer_identity: String) -> GossipEncounterState {
     let encounter = GossipEncounterState::new(peer_identity);
     log_verbose(&format!(
         "gossip_encounter_start: transport=udp trigger=peer_interaction peer={} round_budget={} time_budget_ms={} byte_budget={}",
@@ -647,28 +639,24 @@ fn new_udp_peer_interaction(peer_identity: String) -> UdpPeerInteraction {
         LAN_ENCOUNTER_MAX_TIME_MS,
         LAN_ENCOUNTER_MAX_BYTES
     ));
-    UdpPeerInteraction {
-        encounter,
-        latest_summary: None,
-        relay_ingest_candidates: Vec::new(),
-        last_seen: Instant::now(),
-    }
+    encounter
 }
 
-fn ensure_udp_peer_interaction<'a>(
-    interactions: &'a mut HashMap<String, UdpPeerInteraction>,
+fn ensure_udp_peer_encounter<'a>(
+    encounters: &'a mut HashMap<String, GossipEncounterState>,
+    last_seen_by_peer: &mut HashMap<String, Instant>,
     key: &str,
     peer_identity: String,
-) -> &'a mut UdpPeerInteraction {
-    let should_reset = if let Some(existing) = interactions.get_mut(key) {
-        if existing.encounter.stop_reason.is_some() {
+) -> &'a mut GossipEncounterState {
+    let should_reset = if let Some(existing) = encounters.get_mut(key) {
+        if existing.stop_reason.is_some() {
             true
-        } else if existing.encounter.elapsed_ms() >= LAN_ENCOUNTER_MAX_TIME_MS as u128
-            || existing.last_seen.elapsed() > Duration::from_millis(LAN_ENCOUNTER_MAX_TIME_MS)
+        } else if existing.elapsed_ms() >= LAN_ENCOUNTER_MAX_TIME_MS as u128
+            || last_seen_by_peer.get(key).is_some_and(|last_seen| {
+                last_seen.elapsed() > Duration::from_millis(LAN_ENCOUNTER_MAX_TIME_MS)
+            })
         {
-            existing
-                .encounter
-                .finish(EncounterStopReason::PeerTimeout, "udp_peer_idle");
+            existing.finish(EncounterStopReason::PeerTimeout, "udp_peer_idle");
             true
         } else {
             false
@@ -678,16 +666,15 @@ fn ensure_udp_peer_interaction<'a>(
     };
 
     if should_reset {
-        interactions.insert(key.to_string(), new_udp_peer_interaction(peer_identity));
-    } else if let Some(existing) = interactions.get_mut(key) {
-        existing.encounter.peer_identity = peer_identity;
+        encounters.insert(key.to_string(), new_udp_peer_encounter(peer_identity));
+    } else if let Some(existing) = encounters.get_mut(key) {
+        existing.peer_identity = peer_identity;
     }
 
-    let interaction = interactions
+    last_seen_by_peer.insert(key.to_string(), Instant::now());
+    encounters
         .get_mut(key)
-        .expect("udp peer interaction must exist");
-    interaction.last_seen = Instant::now();
-    interaction
+        .expect("udp peer encounter must exist")
 }
 
 fn prune_finished_udp_encounters(
@@ -695,31 +682,37 @@ fn prune_finished_udp_encounters(
     peer_addr_by_node: &mut HashMap<String, SocketAddr>,
     peer_tcp_capable_by_ip: &mut HashMap<String, bool>,
     tcp_backoff_until_by_ip: &mut HashMap<String, Instant>,
-    udp_peer_interactions: &mut HashMap<String, UdpPeerInteraction>,
+    udp_encounters: &mut HashMap<String, GossipEncounterState>,
+    udp_last_seen_by_peer: &mut HashMap<String, Instant>,
+    udp_latest_summary_by_peer: &mut HashMap<String, crate::aethos_core::gossip_sync::SummaryFrame>,
+    udp_relay_ingest_candidates_by_peer: &mut HashMap<String, Vec<String>>,
     recent_served_request_by_peer: &mut HashMap<String, (u64, Instant)>,
     recent_outbound_request_by_peer: &mut HashMap<String, (u64, Instant)>,
 ) {
     let now = Instant::now();
     let mut finished = Vec::new();
 
-    for (peer_ip, interaction) in udp_peer_interactions.iter_mut() {
-        if interaction.encounter.stop_reason.is_none()
-            && (interaction.encounter.elapsed_ms() >= LAN_ENCOUNTER_MAX_TIME_MS as u128
-                || now.saturating_duration_since(interaction.last_seen)
-                    > Duration::from_millis(LAN_ENCOUNTER_MAX_TIME_MS))
+    for (peer_ip, encounter) in udp_encounters.iter_mut() {
+        if encounter.stop_reason.is_none()
+            && (encounter.elapsed_ms() >= LAN_ENCOUNTER_MAX_TIME_MS as u128
+                || udp_last_seen_by_peer.get(peer_ip).is_some_and(|last_seen| {
+                    now.saturating_duration_since(*last_seen)
+                        > Duration::from_millis(LAN_ENCOUNTER_MAX_TIME_MS)
+                }))
         {
-            interaction
-                .encounter
-                .finish(EncounterStopReason::PeerTimeout, "udp_peer_idle");
+            encounter.finish(EncounterStopReason::PeerTimeout, "udp_peer_idle");
         }
 
-        if interaction.encounter.stop_reason.is_some() {
-            finished.push((peer_ip.clone(), interaction.encounter.peer_identity.clone()));
+        if encounter.stop_reason.is_some() {
+            finished.push((peer_ip.clone(), encounter.peer_identity.clone()));
         }
     }
 
     for (peer_ip, peer_identity) in finished {
-        udp_peer_interactions.remove(&peer_ip);
+        udp_encounters.remove(&peer_ip);
+        udp_last_seen_by_peer.remove(&peer_ip);
+        udp_latest_summary_by_peer.remove(&peer_ip);
+        udp_relay_ingest_candidates_by_peer.remove(&peer_ip);
         peer_tcp_capable_by_ip.remove(&peer_ip);
         tcp_backoff_until_by_ip.remove(&peer_ip);
         recent_served_request_by_peer.remove(&peer_ip);
@@ -2968,7 +2961,10 @@ fn start_gossip_worker_if_needed(initial_enabled: bool, initial_ble_discovery_en
         let mut peer_addr_by_node: HashMap<String, SocketAddr> = HashMap::new();
         let mut peer_tcp_capable_by_ip: HashMap<String, bool> = HashMap::new();
         let mut tcp_backoff_until_by_ip: HashMap<String, Instant> = HashMap::new();
-        let mut udp_peer_interactions: HashMap<String, UdpPeerInteraction> = HashMap::new();
+        let mut udp_encounters: HashMap<String, GossipEncounterState> = HashMap::new();
+        let mut udp_last_seen_by_peer: HashMap<String, Instant> = HashMap::new();
+        let mut udp_latest_summary_by_peer = HashMap::new();
+        let mut udp_relay_ingest_candidates_by_peer = HashMap::new();
         let mut recent_served_request_by_peer: HashMap<String, (u64, Instant)> = HashMap::new();
         let mut recent_outbound_request_by_peer: HashMap<String, (u64, Instant)> = HashMap::new();
         let mut ble_discovery_adapter = discovery_adapter_from_env();
@@ -3001,7 +2997,10 @@ fn start_gossip_worker_if_needed(initial_enabled: bool, initial_ble_discovery_en
                 &mut peer_addr_by_node,
                 &mut peer_tcp_capable_by_ip,
                 &mut tcp_backoff_until_by_ip,
-                &mut udp_peer_interactions,
+                &mut udp_encounters,
+                &mut udp_last_seen_by_peer,
+                &mut udp_latest_summary_by_peer,
+                &mut udp_relay_ingest_candidates_by_peer,
                 &mut recent_served_request_by_peer,
                 &mut recent_outbound_request_by_peer,
             );
@@ -3089,7 +3088,6 @@ fn start_gossip_worker_if_needed(initial_enabled: bool, initial_ble_discovery_en
                     &resolved,
                     &mut peer_node_by_addr,
                     &mut peer_addr_by_node,
-                    &udp_peer_interactions,
                     &mut recent_bonjour_hello_by_peer,
                 ) {
                     log_error(&format!(
@@ -3151,7 +3149,10 @@ fn start_gossip_worker_if_needed(initial_enabled: bool, initial_ble_discovery_en
                         &mut peer_addr_by_node,
                         &mut peer_tcp_capable_by_ip,
                         &mut tcp_backoff_until_by_ip,
-                        &mut udp_peer_interactions,
+                        &mut udp_encounters,
+                        &mut udp_last_seen_by_peer,
+                        &mut udp_latest_summary_by_peer,
+                        &mut udp_relay_ingest_candidates_by_peer,
                         &mut recent_served_request_by_peer,
                         &mut recent_outbound_request_by_peer,
                         runtime,
@@ -3163,7 +3164,10 @@ fn start_gossip_worker_if_needed(initial_enabled: bool, initial_ble_discovery_en
                         &mut peer_addr_by_node,
                         &mut peer_tcp_capable_by_ip,
                         &mut tcp_backoff_until_by_ip,
-                        &mut udp_peer_interactions,
+                        &mut udp_encounters,
+                        &mut udp_last_seen_by_peer,
+                        &mut udp_latest_summary_by_peer,
+                        &mut udp_relay_ingest_candidates_by_peer,
                         &mut recent_served_request_by_peer,
                         &mut recent_outbound_request_by_peer,
                     );
@@ -3397,61 +3401,17 @@ fn summarize_peer_hint_for_activity(peer_hint: &str) -> String {
     format!("{}...", &normalized[..16])
 }
 
-fn udp_peer_interaction_active_for_identity(
-    udp_peer_interactions: &HashMap<String, UdpPeerInteraction>,
-    peer_identity: &str,
-) -> bool {
-    udp_peer_interactions.values().any(|interaction| {
-        interaction.encounter.peer_identity == peer_identity
-            && interaction.encounter.stop_reason.is_none()
-    })
-}
-
-fn udp_peer_interaction_active_for_endpoint(
-    peer_node_by_addr: &HashMap<String, String>,
-    udp_peer_interactions: &HashMap<String, UdpPeerInteraction>,
-    endpoint: SocketAddr,
-) -> bool {
-    let endpoint_key = endpoint.to_string();
-    let ip_key = endpoint.ip().to_string();
-
-    if let Some(peer_identity) = peer_node_by_addr
-        .get(&endpoint_key)
-        .or_else(|| peer_node_by_addr.get(&ip_key))
-    {
-        return udp_peer_interaction_active_for_identity(udp_peer_interactions, peer_identity);
-    }
-
-    udp_peer_interactions
-        .get(&ip_key)
-        .map(|interaction| interaction.encounter.stop_reason.is_none())
-        .unwrap_or(false)
-}
-
 fn maybe_trigger_bonjour_hello(
     socket: &UdpSocket,
     resolved: &BonjourResolvedPeer,
     peer_node_by_addr: &mut HashMap<String, String>,
     peer_addr_by_node: &mut HashMap<String, SocketAddr>,
-    udp_peer_interactions: &HashMap<String, UdpPeerInteraction>,
     recent_bonjour_hello_by_peer: &mut HashMap<String, Instant>,
 ) -> Result<bool, String> {
     let now = Instant::now();
     recent_bonjour_hello_by_peer.retain(|_, seen_at| {
         now.saturating_duration_since(*seen_at) < Duration::from_millis(BONJOUR_HELLO_COOLDOWN_MS)
     });
-
-    if udp_peer_interaction_active_for_endpoint(
-        peer_node_by_addr,
-        udp_peer_interactions,
-        resolved.endpoint,
-    ) {
-        log_verbose(&format!(
-            "bonjour_duplicate_opportunity_suppressed endpoint={} reason=active_encounter",
-            resolved.endpoint
-        ));
-        return Ok(false);
-    }
 
     let cooldown_key = resolved.endpoint.to_string();
     if let Some(last_sent) = recent_bonjour_hello_by_peer.get(&cooldown_key) {
@@ -3582,7 +3542,10 @@ fn handle_gossip_frame(
     peer_addr_by_node: &mut HashMap<String, SocketAddr>,
     peer_tcp_capable_by_ip: &mut HashMap<String, bool>,
     tcp_backoff_until_by_ip: &mut HashMap<String, Instant>,
-    udp_peer_interactions: &mut HashMap<String, UdpPeerInteraction>,
+    udp_encounters: &mut HashMap<String, GossipEncounterState>,
+    udp_last_seen_by_peer: &mut HashMap<String, Instant>,
+    udp_latest_summary_by_peer: &mut HashMap<String, crate::aethos_core::gossip_sync::SummaryFrame>,
+    udp_relay_ingest_candidates_by_peer: &mut HashMap<String, Vec<String>>,
     recent_served_request_by_peer: &mut HashMap<String, (u64, Instant)>,
     recent_outbound_request_by_peer: &mut HashMap<String, (u64, Instant)>,
     runtime: &GossipRuntime,
@@ -3615,13 +3578,14 @@ fn handle_gossip_frame(
             peer_node_by_addr.insert(source_key.clone(), node_id.clone());
             peer_node_by_addr.insert(source_ip_key.clone(), node_id.clone());
             peer_addr_by_node.insert(node_id, source);
-            let interaction = ensure_udp_peer_interaction(
-                udp_peer_interactions,
+            let _encounter = ensure_udp_peer_encounter(
+                udp_encounters,
+                udp_last_seen_by_peer,
                 &source_ip_key,
                 hello.node_id.clone(),
             );
-            interaction.latest_summary = None;
-            interaction.relay_ingest_candidates.clear();
+            udp_latest_summary_by_peer.remove(&source_ip_key);
+            udp_relay_ingest_candidates_by_peer.remove(&source_ip_key);
             let tcp_capable = hello
                 .capabilities
                 .iter()
@@ -3643,8 +3607,9 @@ fn handle_gossip_frame(
             }
         }
         GossipSyncFrame::Summary(summary) => {
-            let interaction = ensure_udp_peer_interaction(
-                udp_peer_interactions,
+            let encounter = ensure_udp_peer_encounter(
+                udp_encounters,
+                udp_last_seen_by_peer,
                 &source_ip_key,
                 peer_node_by_addr
                     .get(&source_key)
@@ -3652,7 +3617,7 @@ fn handle_gossip_frame(
                     .cloned()
                     .unwrap_or_else(|| source_ip_key.clone()),
             );
-            interaction.latest_summary = Some(summary.clone());
+            udp_latest_summary_by_peer.insert(source_ip_key.clone(), summary.clone());
             log_verbose(&format!(
                 "gossip_recv_summary: from={} item_count={} preview_items={}",
                 source,
@@ -3669,14 +3634,15 @@ fn handle_gossip_frame(
                 &summary,
                 summary.preview_item_ids.as_deref().unwrap_or(&[]),
                 recent_outbound_request_by_peer,
-                &mut interaction.encounter,
+                encounter,
                 runtime,
                 "udp_summary",
             );
         }
         GossipSyncFrame::RelayIngest(ingest) => {
-            let interaction = ensure_udp_peer_interaction(
-                udp_peer_interactions,
+            let encounter = ensure_udp_peer_encounter(
+                udp_encounters,
+                udp_last_seen_by_peer,
                 &source_ip_key,
                 peer_node_by_addr
                     .get(&source_key)
@@ -3703,42 +3669,33 @@ fn handle_gossip_frame(
                 .item_ids
                 .into_iter()
                 .filter(|item_id| {
-                    !interaction.encounter.requested_item_ids.contains(item_id)
+                    !encounter.requested_item_ids.contains(item_id)
                         && missing_from_store.iter().any(|missing| missing == item_id)
                 })
                 .collect::<Vec<_>>();
             missing_item_ids.sort();
-            interaction.relay_ingest_candidates = missing_item_ids;
-            if interaction.relay_ingest_candidates.is_empty() {
-                interaction
-                    .encounter
-                    .finish(EncounterStopReason::NoMoreWanted, "udp_relay_ingest");
+            udp_relay_ingest_candidates_by_peer
+                .insert(source_ip_key.clone(), missing_item_ids.clone());
+            if missing_item_ids.is_empty() {
+                encounter.finish(EncounterStopReason::NoMoreWanted, "udp_relay_ingest");
                 return Ok(());
             }
-            if let Some(stop_reason) = interaction.encounter.should_stop(runtime, false) {
-                interaction
-                    .encounter
-                    .finish(stop_reason, "udp_relay_ingest");
+            if let Some(stop_reason) = encounter.should_stop(runtime, false) {
+                encounter.finish(stop_reason, "udp_relay_ingest");
                 return Ok(());
             }
 
-            let request = if let Some(summary) = interaction.latest_summary.as_ref() {
+            let request = if let Some(summary) = udp_latest_summary_by_peer.get(&source_ip_key) {
                 build_gossip_request_frame(
-                    gossip_select_request_item_ids_from_summary(
-                        summary,
-                        256,
-                        &interaction.relay_ingest_candidates,
-                    )?,
+                    gossip_select_request_item_ids_from_summary(summary, 256, &missing_item_ids)?,
                     256,
                 )?
             } else {
-                build_gossip_request_frame(interaction.relay_ingest_candidates.clone(), 256)?
+                build_gossip_request_frame(missing_item_ids.clone(), 256)?
             };
             if let GossipSyncFrame::Request(request_frame) = &request {
                 if request_frame.want.is_empty() {
-                    interaction
-                        .encounter
-                        .finish(EncounterStopReason::NoMoreWanted, "udp_relay_ingest");
+                    encounter.finish(EncounterStopReason::NoMoreWanted, "udp_relay_ingest");
                     return Ok(());
                 }
                 let peer_key = source.ip().to_string();
@@ -3760,25 +3717,22 @@ fn handle_gossip_frame(
                     }
                 }
                 for item_id in &request_frame.want {
-                    interaction
-                        .encounter
-                        .requested_item_ids
-                        .insert(item_id.clone());
+                    encounter.requested_item_ids.insert(item_id.clone());
                 }
-                interaction.encounter.rounds = interaction.encounter.rounds.saturating_add(1);
+                encounter.rounds = encounter.rounds.saturating_add(1);
                 log_verbose(&format!(
                     "gossip_send_request_from_relay_ingest: to={} want_items={} rounds={} requested={} accepted={} bytes_imported={}",
                     source,
                     request_frame.want.len(),
-                    interaction.encounter.rounds,
-                    interaction.encounter.requested_item_ids.len(),
-                    interaction.encounter.accepted_item_ids.len(),
-                    interaction.encounter.bytes_imported
+                    encounter.rounds,
+                    encounter.requested_item_ids.len(),
+                    encounter.accepted_item_ids.len(),
+                    encounter.bytes_imported
                 ));
                 recent_outbound_request_by_peer.insert(peer_key, (fingerprint, Instant::now()));
             }
             let _ = send_gossip_frame(socket, &source.ip().to_string(), source.port(), &request);
-            interaction.encounter.mark_progress();
+            encounter.mark_progress();
         }
         GossipSyncFrame::Request(_req) => {
             if _req.want.is_empty() {
@@ -3862,8 +3816,9 @@ fn handle_gossip_frame(
                 .cloned()
                 .unwrap_or_else(|| source.ip().to_string());
             peer_addr_by_node.insert(peer_node_id.clone(), source);
-            let interaction = ensure_udp_peer_interaction(
-                udp_peer_interactions,
+            let encounter = ensure_udp_peer_encounter(
+                udp_encounters,
+                udp_last_seen_by_peer,
                 &source_ip_key,
                 peer_node_id.clone(),
             );
@@ -3882,19 +3837,13 @@ fn handle_gossip_frame(
             )?;
             let import_elapsed_ms = transfer_handle_started.elapsed().as_millis();
             let imported_count = result.new_messages.len();
-            let accepted_before = interaction.encounter.accepted_item_ids.len();
+            let accepted_before = encounter.accepted_item_ids.len();
             for item_id in &result.accepted_item_ids {
-                interaction
-                    .encounter
-                    .accepted_item_ids
-                    .insert(item_id.clone());
+                encounter.accepted_item_ids.insert(item_id.clone());
             }
-            let accepted_after = interaction.encounter.accepted_item_ids.len();
+            let accepted_after = encounter.accepted_item_ids.len();
             let accepted_delta = accepted_after.saturating_sub(accepted_before);
-            interaction.encounter.bytes_imported = interaction
-                .encounter
-                .bytes_imported
-                .saturating_add(transfer_bytes);
+            encounter.bytes_imported = encounter.bytes_imported.saturating_add(transfer_bytes);
 
             if !result.rejected_items.is_empty() {
                 let mut reasons = std::collections::BTreeMap::<String, usize>::new();
@@ -3994,33 +3943,37 @@ fn handle_gossip_frame(
             }
 
             if accepted_delta > 0 {
-                interaction.encounter.mark_progress();
-                let summary_ref = interaction.latest_summary.as_ref().cloned().unwrap_or(
-                    crate::aethos_core::gossip_sync::SummaryFrame {
+                encounter.mark_progress();
+                let relay_ingest_candidates = udp_relay_ingest_candidates_by_peer
+                    .get(&source_ip_key)
+                    .cloned()
+                    .unwrap_or_default();
+                let summary_ref = udp_latest_summary_by_peer
+                    .get(&source_ip_key)
+                    .cloned()
+                    .unwrap_or(crate::aethos_core::gossip_sync::SummaryFrame {
                         bloom_filter: vec![
                             0u8;
                             crate::aethos_core::gossip_sync::BLOOM_FILTER_BYTES
                         ],
-                        item_count: interaction.relay_ingest_candidates.len() as u64,
-                        preview_item_ids: Some(interaction.relay_ingest_candidates.clone()),
-                        preview_cursor: interaction.relay_ingest_candidates.last().cloned(),
-                    },
-                );
+                        item_count: relay_ingest_candidates.len() as u64,
+                        preview_item_ids: Some(relay_ingest_candidates.clone()),
+                        preview_cursor: relay_ingest_candidates.last().cloned(),
+                    });
                 let _ = drain_udp_peer_reconciliation_round(
                     socket,
                     source,
                     &summary_ref,
                     summary_ref.preview_item_ids.as_deref().unwrap_or(&[]),
                     recent_outbound_request_by_peer,
-                    &mut interaction.encounter,
+                    encounter,
                     runtime,
                     "udp_transfer_followup",
                 );
             } else {
-                interaction.encounter.mark_no_progress();
-                if interaction.encounter.no_progress_streak >= LAN_ENCOUNTER_MAX_NO_PROGRESS_STREAK
-                {
-                    interaction.encounter.finish(
+                encounter.mark_no_progress();
+                if encounter.no_progress_streak >= LAN_ENCOUNTER_MAX_NO_PROGRESS_STREAK {
+                    encounter.finish(
                         EncounterStopReason::PeerReturnedNoUsefulItems,
                         "udp_transfer",
                     );
@@ -4029,10 +3982,8 @@ fn handle_gossip_frame(
                 }
             }
 
-            if interaction.encounter.bytes_imported >= LAN_ENCOUNTER_MAX_BYTES {
-                interaction
-                    .encounter
-                    .finish(EncounterStopReason::ByteBudgetExceeded, "udp_transfer");
+            if encounter.bytes_imported >= LAN_ENCOUNTER_MAX_BYTES {
+                encounter.finish(EncounterStopReason::ByteBudgetExceeded, "udp_transfer");
             }
 
             if !result.receipt_item_ids.is_empty() {
@@ -4044,15 +3995,15 @@ fn handle_gossip_frame(
             }
             log_verbose(&format!(
                 "gossip_encounter_round: transport=udp trigger=transfer peer={} round={} frame=TRANSFER transfer_objects={} transfer_bytes={} accepted_delta={} accepted_total={} rejected={} bytes_imported={} no_progress_streak={}",
-                interaction.encounter.peer_identity,
-                interaction.encounter.rounds,
+                encounter.peer_identity,
+                encounter.rounds,
                 transfer.objects.len(),
                 transfer_bytes,
                 accepted_delta,
-                interaction.encounter.accepted_item_ids.len(),
+                encounter.accepted_item_ids.len(),
                 result.rejected_items.len(),
-                interaction.encounter.bytes_imported,
-                interaction.encounter.no_progress_streak
+                encounter.bytes_imported,
+                encounter.no_progress_streak
             ));
         }
         GossipSyncFrame::Receipt(_receipt) => {}
@@ -6594,7 +6545,10 @@ mod tests {
         let mut peer_addr_by_node = HashMap::new();
         let mut peer_tcp_capable_by_ip = HashMap::new();
         let mut tcp_backoff_until_by_ip = HashMap::new();
-        let mut udp_peer_interactions = HashMap::new();
+        let mut udp_encounters = HashMap::new();
+        let mut udp_last_seen_by_peer = HashMap::new();
+        let mut udp_latest_summary_by_peer = HashMap::new();
+        let mut udp_relay_ingest_candidates_by_peer = HashMap::new();
         let mut recent_served_request_by_peer = HashMap::new();
         let mut recent_outbound_request_by_peer = HashMap::new();
 
@@ -6615,51 +6569,43 @@ mod tests {
             &mut peer_addr_by_node,
             &mut peer_tcp_capable_by_ip,
             &mut tcp_backoff_until_by_ip,
-            &mut udp_peer_interactions,
+            &mut udp_encounters,
+            &mut udp_last_seen_by_peer,
+            &mut udp_latest_summary_by_peer,
+            &mut udp_relay_ingest_candidates_by_peer,
             &mut recent_served_request_by_peer,
             &mut recent_outbound_request_by_peer,
             &runtime,
         )
         .expect("handle summary");
 
-        let interaction = udp_peer_interactions
+        let encounter = udp_encounters
             .get(&resolved.endpoint.ip().to_string())
-            .expect("interaction should exist");
+            .expect("encounter should exist");
         assert_eq!(
-            interaction.encounter.peer_identity,
+            encounter.peer_identity,
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
     }
 
     #[test]
-    fn bonjour_duplicate_opportunity_is_suppressed_for_active_peer() {
+    fn bonjour_duplicate_opportunity_is_suppressed_during_cooldown() {
         let sender = UdpSocket::bind(("127.0.0.1", 0)).expect("bind sender");
         let mut peer_node_by_addr = HashMap::new();
         let mut peer_addr_by_node = HashMap::new();
-        let mut udp_peer_interactions = HashMap::new();
         let mut recent_bonjour_hello_by_peer = HashMap::new();
         let resolved = BonjourResolvedPeer {
             fullname: "peer._aethos._udp.local.".to_string(),
             endpoint: "127.0.0.1:47655".parse().expect("parse endpoint"),
         };
 
-        udp_peer_interactions.insert(
-            resolved.endpoint.ip().to_string(),
-            new_udp_peer_interaction(
-                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
-            ),
-        );
-        peer_node_by_addr.insert(
-            resolved.endpoint.ip().to_string(),
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
-        );
+        recent_bonjour_hello_by_peer.insert(resolved.endpoint.to_string(), Instant::now());
 
         let sent = maybe_trigger_bonjour_hello(
             &sender,
             &resolved,
             &mut peer_node_by_addr,
             &mut peer_addr_by_node,
-            &udp_peer_interactions,
             &mut recent_bonjour_hello_by_peer,
         )
         .expect("bonjour suppression decision");
@@ -6686,15 +6632,9 @@ mod tests {
         };
         let mut peer_node_by_addr = HashMap::new();
         let mut peer_addr_by_node = HashMap::new();
-        let mut udp_peer_interactions = HashMap::new();
         let mut recent_bonjour_hello_by_peer = HashMap::new();
         let peer_identity =
             "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string();
-        let mut closed = new_udp_peer_interaction(peer_identity.clone());
-        closed
-            .encounter
-            .finish(EncounterStopReason::PeerTimeout, "test_closed");
-        udp_peer_interactions.insert(resolved.endpoint.ip().to_string(), closed);
         peer_node_by_addr.insert(resolved.endpoint.ip().to_string(), peer_identity.clone());
         peer_addr_by_node.insert(peer_identity.clone(), resolved.endpoint);
 
@@ -6704,7 +6644,6 @@ mod tests {
                 &resolved,
                 &mut peer_node_by_addr,
                 &mut peer_addr_by_node,
-                &udp_peer_interactions,
                 &mut recent_bonjour_hello_by_peer,
             )
             .expect("bonjour hello should send");
@@ -6741,14 +6680,25 @@ mod tests {
             "192.168.1.8".to_string(),
             Instant::now() + Duration::from_secs(5),
         )]);
-        let mut udp_peer_interactions = HashMap::new();
-        let mut finished = new_udp_peer_interaction(
+        let mut udp_encounters = HashMap::new();
+        let mut udp_last_seen_by_peer =
+            HashMap::from([("192.168.1.8".to_string(), Instant::now())]);
+        let mut udp_latest_summary_by_peer = HashMap::from([(
+            "192.168.1.8".to_string(),
+            crate::aethos_core::gossip_sync::SummaryFrame {
+                bloom_filter: vec![0u8; crate::aethos_core::gossip_sync::BLOOM_FILTER_BYTES],
+                item_count: 1,
+                preview_item_ids: Some(vec!["item-1".to_string()]),
+                preview_cursor: Some("item-1".to_string()),
+            },
+        )]);
+        let mut udp_relay_ingest_candidates_by_peer =
+            HashMap::from([("192.168.1.8".to_string(), vec!["item-1".to_string()])]);
+        let mut finished = new_udp_peer_encounter(
             "peer-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
         );
-        finished
-            .encounter
-            .finish(EncounterStopReason::NoMoreWanted, "test_finish");
-        udp_peer_interactions.insert("192.168.1.8".to_string(), finished);
+        finished.finish(EncounterStopReason::NoMoreWanted, "test_finish");
+        udp_encounters.insert("192.168.1.8".to_string(), finished);
         let mut recent_served_request_by_peer =
             HashMap::from([("192.168.1.8".to_string(), (123, Instant::now()))]);
         let mut recent_outbound_request_by_peer =
@@ -6759,12 +6709,18 @@ mod tests {
             &mut peer_addr_by_node,
             &mut peer_tcp_capable_by_ip,
             &mut tcp_backoff_until_by_ip,
-            &mut udp_peer_interactions,
+            &mut udp_encounters,
+            &mut udp_last_seen_by_peer,
+            &mut udp_latest_summary_by_peer,
+            &mut udp_relay_ingest_candidates_by_peer,
             &mut recent_served_request_by_peer,
             &mut recent_outbound_request_by_peer,
         );
 
-        assert!(udp_peer_interactions.is_empty());
+        assert!(udp_encounters.is_empty());
+        assert!(udp_last_seen_by_peer.is_empty());
+        assert!(udp_latest_summary_by_peer.is_empty());
+        assert!(udp_relay_ingest_candidates_by_peer.is_empty());
         assert!(peer_node_by_addr.is_empty());
         assert!(peer_addr_by_node.is_empty());
         assert!(peer_tcp_capable_by_ip.is_empty());
