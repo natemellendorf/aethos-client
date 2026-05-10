@@ -36,7 +36,7 @@ impl DiscoveryCandidatePipeline {
         Self::new_inner(bearers, local_endpoints, lan_discovery_is_disabled())
     }
 
-    fn new_inner(
+    pub fn new_inner(
         bearers: Vec<Box<dyn DiscoveryBearerSource>>,
         local_endpoints: Vec<IpAddr>,
         disabled: bool,
@@ -184,6 +184,36 @@ mod tests {
         let mut pipeline = DiscoveryCandidatePipeline::new(bearers, vec![]);
         let results = pipeline.poll();
         assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn bonjour_bearer_emits_bonjour_candidate() {
+        let c = make_candidate("192.168.1.20", 47655, DiscoveryBearer::Bonjour);
+        let bearers: Vec<Box<dyn DiscoveryBearerSource>> = vec![Box::new(StubBearer::new(vec![c]))];
+        let mut pipeline = DiscoveryCandidatePipeline::new(bearers, vec![]);
+        let results = pipeline.poll();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].discovered_via, DiscoveryBearer::Bonjour);
+    }
+
+    #[test]
+    fn ipv4broadcast_bearer_emits_ipv4broadcast_candidate() {
+        let c = make_candidate("192.168.1.20", 47655, DiscoveryBearer::IPv4Broadcast);
+        let bearers: Vec<Box<dyn DiscoveryBearerSource>> = vec![Box::new(StubBearer::new(vec![c]))];
+        let mut pipeline = DiscoveryCandidatePipeline::new(bearers, vec![]);
+        let results = pipeline.poll();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].discovered_via, DiscoveryBearer::IPv4Broadcast);
+    }
+
+    #[test]
+    fn multicast_bearer_emits_multicast_candidate() {
+        let c = make_candidate("192.168.1.20", 47655, DiscoveryBearer::Multicast);
+        let bearers: Vec<Box<dyn DiscoveryBearerSource>> = vec![Box::new(StubBearer::new(vec![c]))];
+        let mut pipeline = DiscoveryCandidatePipeline::new(bearers, vec![]);
+        let results = pipeline.poll();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].discovered_via, DiscoveryBearer::Multicast);
     }
 
     #[test]
