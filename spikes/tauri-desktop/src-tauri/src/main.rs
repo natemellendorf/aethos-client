@@ -58,6 +58,9 @@ use crate::aethos_core::ble_discovery::{
     discovery_adapter_from_env, ActivationWindowTracker, BleDiscoveryGate, BleDiscoverySource,
     DiscoverySignal,
 };
+use crate::aethos_core::discovery_candidate_pipeline::{
+    DiscoveryBearer, DiscoveryBearerSource, DiscoveryCandidate, DiscoveryCandidatePipeline,
+};
 use crate::aethos_core::encounter_orchestration::{
     BearerAdapter, EncounterManager, TransitionReason,
 };
@@ -77,10 +80,14 @@ use crate::aethos_core::identity_store::{
     delete_wayfarer_id, ensure_local_identity, load_contact_aliases, load_local_signing_key_seed,
     regenerate_local_identity, save_contact_aliases,
 };
+use crate::aethos_core::ipv4_broadcast_discovery::{
+    local_ipv4_addrs, IPv4BroadcastDiscovery, IPv4BroadcastDiscoveryEvent,
+};
 use crate::aethos_core::logging::{
     app_log_file_path, clear_app_log_if_requested, log_error, log_info, log_verbose,
     set_verbose_logging_enabled, verbose_logging_enabled,
 };
+use crate::aethos_core::multicast_discovery::{MulticastDiscovery, MulticastDiscoveryEvent};
 use crate::aethos_core::protocol::{
     build_envelope_payload_b64, bytes_to_hex_lower, is_valid_wayfarer_id,
 };
@@ -130,6 +137,154 @@ const UDP_TRANSFER_FRAME_HARD_MAX_BYTES: usize = 65_507;
 const E2E_MEDIA_HOUSEKEEPING_MIN_INTERVAL_MS_DEFAULT: u64 = 2_000;
 const RECENT_BLE_SIGHTINGS_WINDOW_MS: u64 = 10 * 60 * 1000;
 const RECENT_ENCOUNTER_ACTIVITY_LIMIT: usize = 20;
+
+struct BonjourDiscoveryCandidateSource {
+    discovery: BonjourLanDiscovery,
+    restart_after: Option<Instant>,
+}
+
+impl BonjourDiscoveryCandidateSource {
+    fn new() -> Self {
+        Self {
+            discovery: create_bonjour_discovery(),
+            restart_after: None,
+        }
+    }
+}
+
+impl DiscoveryBearerSource for BonjourDiscoveryCandidateSource {
+    fn poll_candidates(&mut self) -> Vec<DiscoveryCandidate> {
+        if let Some(restart_deadline) = self.restart_after {
+            if Instant::now() >= restart_deadline {
+                self.discovery = create_bonjour_discovery();
+                self.restart_after = None;
+                log_info("bonjour_discovery_restarted");
+            }
+        }
+
+        let mut candidates = Vec::new();
+        for event in self.discovery.poll() {
+            match event {
+                BonjourDiscoveryEvent::AdvertisementStarted {
+                    service_type,
+                    instance_name,
+                    domain,
+                    port,
+                } => {
+                    log_info(&format!(
+                        "bonjour_advertisement_started service_type={} instance_name={} domain={} port={}",
+                        service_type, instance_name, domain, port
+                    ));
+                }
+                BonjourDiscoveryEvent::PeerDiscovered { fullname } => {
+                    log_info(&format!("bonjour_peer_discovered fullname={fullname}"));
+                }
+                BonjourDiscoveryEvent::EndpointResolved(resolved) => {
+                    log_info(&format!(
+                        "bonjour_endpoint_resolved endpoint={} fullname={}",
+                        resolved.endpoint, resolved.fullname
+                    ));
+                    candidates.push(DiscoveryCandidate {
+                        candidate_id: resolved.fullname,
+                        peer_endpoint: resolved.endpoint,
+                        peer_identity: None,
+                        discovered_via: DiscoveryBearer::Bonjour,
+                        observed_at_unix_ms: now_unix_ms(),
+                        signal_quality_hint: None,
+                    });
+                }
+                BonjourDiscoveryEvent::Error(err) => {
+                    log_error(&format!("bonjour_discovery_error: {err}"));
+                    if self.restart_after.is_none() {
+                        self.restart_after = Some(Instant::now() + Duration::from_secs(1));
+                        log_info("bonjour_discovery_restart_scheduled delay_ms=1000");
+                    }
+                }
+            }
+        }
+        candidates
+    }
+}
+
+struct IPv4BroadcastDiscoveryCandidateSource {
+    discovery: IPv4BroadcastDiscovery,
+}
+
+impl IPv4BroadcastDiscoveryCandidateSource {
+    fn new(port: u16, local_endpoints: Vec<std::net::IpAddr>) -> Self {
+        Self {
+            discovery: IPv4BroadcastDiscovery::new(port, local_endpoints),
+        }
+    }
+}
+
+impl DiscoveryBearerSource for IPv4BroadcastDiscoveryCandidateSource {
+    fn poll_candidates(&mut self) -> Vec<DiscoveryCandidate> {
+        let mut candidates = Vec::new();
+        for event in self.discovery.poll() {
+            match event {
+                IPv4BroadcastDiscoveryEvent::ListenerStarted { .. } => {
+                    log_info("LAN discovery bearer active: IPv4Broadcast");
+                }
+                IPv4BroadcastDiscoveryEvent::PeerDiscovered { .. } => {}
+                IPv4BroadcastDiscoveryEvent::EndpointResolved(resolved) => {
+                    candidates.push(DiscoveryCandidate {
+                        candidate_id: resolved.peer_addr.to_string(),
+                        peer_endpoint: resolved.peer_addr,
+                        peer_identity: None,
+                        discovered_via: DiscoveryBearer::IPv4Broadcast,
+                        observed_at_unix_ms: now_unix_ms(),
+                        signal_quality_hint: None,
+                    });
+                }
+                IPv4BroadcastDiscoveryEvent::Error(err) => {
+                    log_error(&format!("ipv4_broadcast_discovery_error: {err}"));
+                }
+            }
+        }
+        candidates
+    }
+}
+
+struct MulticastDiscoveryCandidateSource {
+    discovery: MulticastDiscovery,
+}
+
+impl MulticastDiscoveryCandidateSource {
+    fn new(port: u16, local_endpoints: Vec<std::net::IpAddr>) -> Self {
+        Self {
+            discovery: MulticastDiscovery::new(port, local_endpoints),
+        }
+    }
+}
+
+impl DiscoveryBearerSource for MulticastDiscoveryCandidateSource {
+    fn poll_candidates(&mut self) -> Vec<DiscoveryCandidate> {
+        let mut candidates = Vec::new();
+        for event in self.discovery.poll() {
+            match event {
+                MulticastDiscoveryEvent::ListenerStarted { .. } => {
+                    log_info("LAN discovery bearer active: Multicast");
+                }
+                MulticastDiscoveryEvent::PeerDiscovered { .. } => {}
+                MulticastDiscoveryEvent::EndpointResolved(resolved) => {
+                    candidates.push(DiscoveryCandidate {
+                        candidate_id: resolved.peer_addr.to_string(),
+                        peer_endpoint: resolved.peer_addr,
+                        peer_identity: None,
+                        discovered_via: DiscoveryBearer::Multicast,
+                        observed_at_unix_ms: now_unix_ms(),
+                        signal_quality_hint: None,
+                    });
+                }
+                MulticastDiscoveryEvent::Error(err) => {
+                    log_error(&format!("multicast_discovery_error: {err}"));
+                }
+            }
+        }
+        candidates
+    }
+}
 
 fn lan_fallback_transfer_max_bytes() -> u64 {
     std::env::var("AETHOS_LAN_FALLBACK_TRANSFER_MAX_BYTES")
@@ -2822,8 +2977,7 @@ fn start_gossip_worker_if_needed(initial_enabled: bool, initial_ble_discovery_en
         let mut ble_encounters: HashMap<String, EncounterManager> = HashMap::new();
         #[cfg(target_os = "linux")]
         let mut ble_advertiser = CanonicalBleAdvertiser::new();
-        let mut bonjour_discovery = create_bonjour_discovery();
-        let mut bonjour_restart_after: Option<Instant> = None;
+        let mut discovery_candidate_pipeline = create_discovery_candidate_pipeline();
         let mut recent_bonjour_hello_by_peer: HashMap<String, Instant> = HashMap::new();
         let mut last_missing_pulse = Instant::now() - Duration::from_millis(500);
         let tcp_listener = match bind_gossip_tcp_listener() {
@@ -2839,14 +2993,6 @@ fn start_gossip_worker_if_needed(initial_enabled: bool, initial_ble_discovery_en
             if !runtime.enabled.load(Ordering::SeqCst) {
                 thread::sleep(Duration::from_millis(120));
                 continue;
-            }
-
-            if let Some(restart_deadline) = bonjour_restart_after {
-                if Instant::now() >= restart_deadline {
-                    bonjour_discovery = create_bonjour_discovery();
-                    bonjour_restart_after = None;
-                    log_info("bonjour_discovery_restarted");
-                }
             }
 
             prune_finished_udp_encounters(
@@ -2916,48 +3062,25 @@ fn start_gossip_worker_if_needed(initial_enabled: bool, initial_ble_discovery_en
                 }
             }
 
-            for event in bonjour_discovery.poll() {
-                match event {
-                    BonjourDiscoveryEvent::AdvertisementStarted {
-                        service_type,
-                        instance_name,
-                        domain,
-                        port,
-                    } => {
-                        log_info(&format!(
-                            "bonjour_advertisement_started service_type={} instance_name={} domain={} port={}",
-                            service_type, instance_name, domain, port
-                        ));
-                    }
-                    BonjourDiscoveryEvent::PeerDiscovered { fullname } => {
-                        log_info(&format!("bonjour_peer_discovered fullname={}", fullname));
-                    }
-                    BonjourDiscoveryEvent::EndpointResolved(resolved) => {
-                        log_info(&format!(
-                            "bonjour_endpoint_resolved endpoint={} fullname={}",
-                            resolved.endpoint, resolved.fullname
-                        ));
-                        if let Err(err) = maybe_trigger_bonjour_hello(
-                            &socket,
-                            &resolved,
-                            &mut peer_node_by_addr,
-                            &mut peer_addr_by_node,
-                            &udp_peer_interactions,
-                            &mut recent_bonjour_hello_by_peer,
-                        ) {
-                            log_error(&format!(
-                                "bonjour_hello_send_failed endpoint={} error={}",
-                                resolved.endpoint, err
-                            ));
-                        }
-                    }
-                    BonjourDiscoveryEvent::Error(err) => {
-                        log_error(&format!("bonjour_discovery_error: {err}"));
-                        if bonjour_restart_after.is_none() {
-                            bonjour_restart_after = Some(Instant::now() + Duration::from_secs(1));
-                            log_info("bonjour_discovery_restart_scheduled delay_ms=1000");
-                        }
-                    }
+            for candidate in discovery_candidate_pipeline.poll() {
+                let resolved = BonjourResolvedPeer {
+                    fullname: candidate.candidate_id.clone(),
+                    endpoint: candidate.peer_endpoint,
+                };
+                if let Err(err) = maybe_trigger_bonjour_hello(
+                    &socket,
+                    &resolved,
+                    &mut peer_node_by_addr,
+                    &mut peer_addr_by_node,
+                    &udp_peer_interactions,
+                    &mut recent_bonjour_hello_by_peer,
+                ) {
+                    log_error(&format!(
+                        "lan_discovery_hello_send_failed bearer={} endpoint={} error={}",
+                        discovery_bearer_label(&candidate.discovered_via),
+                        candidate.peer_endpoint,
+                        err
+                    ));
                 }
             }
 
@@ -3048,6 +3171,31 @@ fn create_bonjour_discovery() -> BonjourLanDiscovery {
             .unwrap_or_else(|_| "unknown-local-peer".to_string()),
         gossip_lan_port(),
     )
+}
+
+fn create_discovery_candidate_pipeline() -> DiscoveryCandidatePipeline {
+    let local_endpoints = local_ipv4_addrs();
+    let gossip_port = gossip_lan_port();
+    let bearers: Vec<Box<dyn DiscoveryBearerSource>> = vec![
+        Box::new(BonjourDiscoveryCandidateSource::new()),
+        Box::new(IPv4BroadcastDiscoveryCandidateSource::new(
+            gossip_port,
+            local_endpoints.clone(),
+        )),
+        Box::new(MulticastDiscoveryCandidateSource::new(
+            gossip_port,
+            local_endpoints.clone(),
+        )),
+    ];
+    DiscoveryCandidatePipeline::new(bearers, local_endpoints)
+}
+
+fn discovery_bearer_label(bearer: &DiscoveryBearer) -> &'static str {
+    match bearer {
+        DiscoveryBearer::Bonjour => "Bonjour",
+        DiscoveryBearer::IPv4Broadcast => "IPv4Broadcast",
+        DiscoveryBearer::Multicast => "Multicast",
+    }
 }
 
 fn process_ble_discovery_signals(

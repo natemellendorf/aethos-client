@@ -6,6 +6,8 @@ use crate::aethos_core::logging::log_verbose;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BearerAdapter {
     LanDatagram,
+    LanBroadcast,
+    LanMulticast,
     RelayWebSocket,
     BleBootstrap,
 }
@@ -14,6 +16,8 @@ impl BearerAdapter {
     fn as_str(self) -> &'static str {
         match self {
             Self::LanDatagram => "lan-datagram",
+            Self::LanBroadcast => "lan-broadcast",
+            Self::LanMulticast => "lan-multicast",
             Self::RelayWebSocket => "relay-websocket",
             Self::BleBootstrap => "ble-bootstrap",
         }
