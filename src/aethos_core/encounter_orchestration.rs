@@ -456,4 +456,139 @@ mod tests {
         manager.record_scheduler_execution("plan-1", 2, 1020);
         assert_eq!(manager.state, EncounterLifecycleState::TransferExecuting);
     }
+
+    #[test]
+    fn mb_01_bonjour_only_lifecycle_to_transfer_completed() {
+        let mut enc = EncounterManager::new("mb-01", "local", Some("peer".to_string()));
+        enc.observe_discovery(BearerAdapter::LanDatagram, 1000);
+        assert_eq!(enc.state, EncounterLifecycleState::DiscoveryObserved);
+        enc.start_control_exchange(
+            BearerAdapter::LanDatagram,
+            TransitionReason::InitialSelection,
+            1100,
+        );
+        assert_eq!(enc.state, EncounterLifecycleState::ControlExchangeStarted);
+        enc.set_transfer_bearer(
+            BearerAdapter::LanDatagram,
+            TransitionReason::InitialSelection,
+            1200,
+        );
+        assert_eq!(enc.state, EncounterLifecycleState::TransferExecuting);
+        enc.mark_transfer_completed(5, 1300);
+        assert_eq!(enc.state, EncounterLifecycleState::TransferCompleted);
+    }
+
+    #[test]
+    fn mb_02_ipv4broadcast_only_lifecycle_to_transfer_completed() {
+        let mut enc = EncounterManager::new("mb-02", "local", Some("peer".to_string()));
+        enc.observe_discovery(BearerAdapter::LanBroadcast, 1000);
+        assert_eq!(enc.state, EncounterLifecycleState::DiscoveryObserved);
+        enc.start_control_exchange(
+            BearerAdapter::LanBroadcast,
+            TransitionReason::InitialSelection,
+            1100,
+        );
+        enc.set_transfer_bearer(
+            BearerAdapter::LanBroadcast,
+            TransitionReason::InitialSelection,
+            1200,
+        );
+        enc.mark_transfer_completed(3, 1300);
+        assert_eq!(enc.state, EncounterLifecycleState::TransferCompleted);
+    }
+
+    #[test]
+    fn mb_03_multicast_only_lifecycle_to_transfer_completed() {
+        let mut enc = EncounterManager::new("mb-03", "local", Some("peer".to_string()));
+        enc.observe_discovery(BearerAdapter::LanMulticast, 1000);
+        assert_eq!(enc.state, EncounterLifecycleState::DiscoveryObserved);
+        enc.start_control_exchange(
+            BearerAdapter::LanMulticast,
+            TransitionReason::InitialSelection,
+            1100,
+        );
+        enc.set_transfer_bearer(
+            BearerAdapter::LanMulticast,
+            TransitionReason::InitialSelection,
+            1200,
+        );
+        enc.mark_transfer_completed(7, 1300);
+        assert_eq!(enc.state, EncounterLifecycleState::TransferCompleted);
+    }
+
+    #[test]
+    fn mb_04_rediscovery_via_second_bearer_no_duplicate_encounter() {
+        use std::collections::HashMap;
+        let mut lan_encounters: HashMap<String, EncounterManager> = HashMap::new();
+        let peer_id = "peer-alpha".to_string();
+
+        let enc = lan_encounters
+            .entry(peer_id.clone())
+            .or_insert_with(|| EncounterManager::new(&peer_id, "local", Some(peer_id.clone())));
+        enc.observe_discovery(BearerAdapter::LanDatagram, 1000);
+
+        let enc2 = lan_encounters
+            .entry(peer_id.clone())
+            .or_insert_with(|| EncounterManager::new(&peer_id, "local", Some(peer_id.clone())));
+        enc2.observe_discovery(BearerAdapter::LanBroadcast, 1100);
+
+        assert_eq!(
+            lan_encounters.len(),
+            1,
+            "must have exactly one EncounterManager for the peer"
+        );
+        assert_eq!(
+            lan_encounters[&peer_id].discovery_bearer,
+            Some(BearerAdapter::LanBroadcast)
+        );
+    }
+
+    #[test]
+    fn mb_05_bearer_drop_mid_transfer_marks_interrupted_resumes() {
+        let mut enc = EncounterManager::new("mb-05", "local", Some("peer".to_string()));
+        enc.observe_discovery(BearerAdapter::LanBroadcast, 1000);
+        enc.start_control_exchange(
+            BearerAdapter::LanBroadcast,
+            TransitionReason::InitialSelection,
+            1100,
+        );
+        enc.set_transfer_bearer(
+            BearerAdapter::LanBroadcast,
+            TransitionReason::InitialSelection,
+            1200,
+        );
+        enc.mark_interrupted(TransitionReason::NoProgress, 1300);
+        assert_eq!(enc.state, EncounterLifecycleState::TransferInterrupted);
+        enc.mark_resumed(1400);
+        assert_eq!(enc.state, EncounterLifecycleState::TransferResumed);
+    }
+
+    #[test]
+    fn mb_06_two_distinct_peers_yield_two_independent_encounters() {
+        use std::collections::HashMap;
+        let mut lan_encounters: HashMap<String, EncounterManager> = HashMap::new();
+
+        let peer_a = "peer-a".to_string();
+        let peer_b = "peer-b".to_string();
+
+        let enc_a = lan_encounters
+            .entry(peer_a.clone())
+            .or_insert_with(|| EncounterManager::new(&peer_a, "local", Some(peer_a.clone())));
+        enc_a.observe_discovery(BearerAdapter::LanBroadcast, 1000);
+
+        let enc_b = lan_encounters
+            .entry(peer_b.clone())
+            .or_insert_with(|| EncounterManager::new(&peer_b, "local", Some(peer_b.clone())));
+        enc_b.observe_discovery(BearerAdapter::LanMulticast, 1000);
+
+        assert_eq!(lan_encounters.len(), 2);
+        assert_eq!(
+            lan_encounters[&peer_a].discovery_bearer,
+            Some(BearerAdapter::LanBroadcast)
+        );
+        assert_eq!(
+            lan_encounters[&peer_b].discovery_bearer,
+            Some(BearerAdapter::LanMulticast)
+        );
+    }
 }
