@@ -33,6 +33,7 @@ pub const BLOOM_FILTER_BYTES: usize = 2048;
 pub const BLOOM_HASH_COUNT: u8 = 4;
 pub const CLOCK_SKEW_TOLERANCE_MS: u64 = 30_000;
 pub const MAX_SUMMARY_PREVIEW_ITEMS: usize = 64;
+const FRESH_LOCAL_SUMMARY_PREVIEW_SLOTS: usize = 8;
 const RELAY_INGEST_MAX_ITEMS_DEFAULT: usize = MAX_WANT_ITEMS;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1427,16 +1428,43 @@ fn build_summary_preview_item_ids(now_ms: u64) -> Result<Vec<String>, String> {
     let local_wayfarer_id = ensure_local_identity()
         .ok()
         .map(|identity| identity.wayfarer_id);
-    let mut ranked = gossip_store_sqlite::summary_preview_candidates(now_ms)?
+    let candidates = gossip_store_sqlite::summary_preview_candidates(now_ms)?
+        .into_iter()
+        .collect::<Vec<_>>();
+    Ok(build_summary_preview_item_ids_from_candidates(
+        candidates,
+        local_wayfarer_id.as_deref(),
+    ))
+}
+
+fn build_summary_preview_item_ids_from_candidates(
+    candidates: Vec<gossip_store_sqlite::StoredItemRecord>,
+    local_wayfarer_id: Option<&str>,
+) -> Vec<String> {
+    let candidates = candidates
         .into_iter()
         .filter(|item| {
-            let Some(local_wayfarer_id) = local_wayfarer_id.as_deref() else {
+            let Some(local_wayfarer_id) = local_wayfarer_id else {
                 return true;
             };
             decode_envelope_payload_b64(&item.envelope_b64)
                 .map(|decoded| decoded.to_wayfarer_id_hex != local_wayfarer_id)
                 .unwrap_or(true)
         })
+        .collect::<Vec<_>>();
+    let fresh_local_ids = candidates
+        .iter()
+        .filter(|item| item.hop_count == 0)
+        .map(|item| {
+            (
+                std::cmp::Reverse(item.recorded_at_unix_ms),
+                decode_item_id(&item.item_id).unwrap_or_default(),
+                item.item_id.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut ranked = candidates
+        .iter()
         .map(|item| {
             (
                 item.hop_count,
@@ -1455,14 +1483,29 @@ fn build_summary_preview_item_ids(now_ms: u64) -> Result<Vec<String>, String> {
             .then_with(|| left.3.cmp(&right.3))
     });
 
-    let mut preview_item_ids = ranked
+    let mut preview_item_ids = Vec::with_capacity(MAX_SUMMARY_PREVIEW_ITEMS);
+    let mut seen = BTreeSet::new();
+
+    for (_, _, item_id) in fresh_local_ids
         .into_iter()
-        .take(MAX_SUMMARY_PREVIEW_ITEMS)
-        .map(|(_, _, _, _, item_id)| item_id)
-        .collect::<Vec<_>>();
+        .take(FRESH_LOCAL_SUMMARY_PREVIEW_SLOTS.min(MAX_SUMMARY_PREVIEW_ITEMS))
+    {
+        if seen.insert(item_id.clone()) {
+            preview_item_ids.push(item_id);
+        }
+    }
+
+    for (_, _, _, _, item_id) in ranked.into_iter() {
+        if preview_item_ids.len() >= MAX_SUMMARY_PREVIEW_ITEMS {
+            break;
+        }
+        if seen.insert(item_id.clone()) {
+            preview_item_ids.push(item_id);
+        }
+    }
+
     preview_item_ids.sort_by_key(|item_id| decode_item_id(item_id).unwrap_or_default());
-    preview_item_ids.dedup();
-    Ok(preview_item_ids)
+    preview_item_ids
 }
 
 fn validate_transfer(frame: &TransferFrame) -> Result<(), String> {
@@ -1761,6 +1804,45 @@ mod tests {
         )
         .expect("second");
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn summary_preview_keeps_fresh_local_items_in_window() {
+        let local_wayfarer_id = item(0xaa);
+        let payload = crate::aethos_core::protocol::build_envelope_payload_b64_from_utf8(
+            &item(0xbb),
+            "preview",
+            &[7u8; 32],
+        )
+        .expect("payload");
+
+        let mut candidates = Vec::new();
+        for index in 0..MAX_SUMMARY_PREVIEW_ITEMS {
+            candidates.push(gossip_store_sqlite::StoredItemRecord {
+                item_id: format!("{:064x}", index + 1),
+                envelope_b64: payload.clone(),
+                expiry_unix_ms: 9_999_999_999,
+                hop_count: 5,
+                recorded_at_unix_ms: 100,
+            });
+        }
+
+        let fresh_item_id = format!("{:064x}", u128::MAX);
+        candidates.push(gossip_store_sqlite::StoredItemRecord {
+            item_id: fresh_item_id.clone(),
+            envelope_b64: payload,
+            expiry_unix_ms: 9_999_999_999,
+            hop_count: 0,
+            recorded_at_unix_ms: 10_000,
+        });
+
+        let preview = build_summary_preview_item_ids_from_candidates(
+            candidates,
+            Some(local_wayfarer_id.as_str()),
+        );
+
+        assert_eq!(preview.len(), MAX_SUMMARY_PREVIEW_ITEMS);
+        assert!(preview.contains(&fresh_item_id));
     }
 
     #[test]
