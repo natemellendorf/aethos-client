@@ -278,12 +278,16 @@ Relay terminals and startup details should follow the `aethos-relay` README setu
 
 ## Local gossip sync (direct peer path)
 
-- Gossip sync runs in the background and uses UDP broadcast on port `47655`.
+- Gossip sync runs in the background and uses a stable UDP listener on port `47655`.
+- Discovery candidates may arrive from multicast, IPv4 broadcast, or Bonjour. When the same endpoint is observed by multiple bearers, desktop now prefers multicast first, then IPv4 broadcast, then Bonjour.
+- Aethos LAN encounters are convergence sessions, not single-transfer sessions.
 - A single peer encounter MAY contain multiple SUMMARY/RELAY_INGEST -> REQUEST -> TRANSFER -> RECEIPT rounds until convergence or bounded stop conditions.
+- Transfer completion is item-level progress. It does not imply encounter completion.
 - Clients SHOULD drain within one encounter (instead of waiting for next HELLO cadence) while enforcing round/time/byte/no-progress/timeout budgets.
+- Convergence now includes a quiet-check and idle-grace phase so app-layer follow-up work such as `/ping -> /pong` can stay on the same peer session instead of depending on rediscovery.
 - Gossip wire schema remains GossipV1 (`HELLO`, `SUMMARY`, `REQUEST`, `TRANSFER`, `RECEIPT`, `RELAY_INGEST`) with no frame-format changes.
 - Active durable gossip storage uses SQLite (`gossip-object-store.sqlite3`) with indexed selection/pruning and transactional import/record paths.
-- In-memory per-peer encounter state tracks requested/accepted IDs, progress streak, elapsed time/bytes, and explicit stop reason; this state is not persisted.
+- In-memory per-peer encounter state tracks convergence phase, requested/accepted IDs, progress streak, quiet rounds, elapsed time/bytes, and explicit stop reason; this state is not persisted.
 - One-time migration: if SQLite store is absent and legacy `gossip-object-store.json` exists, it is imported then renamed to `gossip-object-store.json.bak`.
 - Use LAN/private network segments only for this mode. Inventory metadata is visible to peers that can receive local gossip traffic.
 

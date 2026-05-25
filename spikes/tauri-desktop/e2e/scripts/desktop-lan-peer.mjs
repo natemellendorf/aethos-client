@@ -48,6 +48,10 @@ const LOOPBACK_ONLY = String(args["loopback-only"] || "0");
 const LOCALHOST_FANOUT = String(args["localhost-fanout"] || "1");
 const EAGER_UNICAST = String(args["eager-unicast"] || "1");
 const DISABLE_LAN_TCP = String(args["disable-lan-tcp"] || "1");
+const DIAGNOSTICS_RUN_ID = String(args["diagnostics-run-id"] || process.env.AETHOS_DIAGNOSTICS_RUN_ID || RUN_ID);
+const DIAGNOSTICS_COLLECTOR_URL = String(
+  args["diagnostics-collector-url"] || process.env.AETHOS_DIAGNOSTICS_COLLECTOR_URL || ""
+).trim();
 
 const cleanupFns = [];
 
@@ -289,6 +293,7 @@ async function openTauriSession(stateRoot, socketPath) {
     AETHOS_GOSSIP_LOOPBACK_ONLY: LOOPBACK_ONLY,
     AETHOS_STRUCTURED_LOGS: process.env.AETHOS_STRUCTURED_LOGS || "1",
     AETHOS_E2E_RUN_ID: RUN_ID,
+    AETHOS_DIAGNOSTICS_RUN_ID: DIAGNOSTICS_RUN_ID,
     AETHOS_E2E: "1",
     AETHOS_E2E_TEST_CASE_ID: "desktop-lan-peer",
     AETHOS_E2E_SCENARIO: "ios-desktop-lan",
@@ -297,6 +302,10 @@ async function openTauriSession(stateRoot, socketPath) {
     AETHOS_E2E_FORCE_VERBOSE: "1",
     AETHOS_E2E_FORCE_GOSSIP: "1"
   };
+
+  if (DIAGNOSTICS_COLLECTOR_URL) {
+    env.AETHOS_DIAGNOSTICS_COLLECTOR_URL = DIAGNOSTICS_COLLECTOR_URL;
+  }
 
   const driver = await launchTauriSession({
     application: TAURI_BIN,
@@ -314,7 +323,11 @@ async function openTauriSession(stateRoot, socketPath) {
       `--aethos-gossip-loopback-only=${LOOPBACK_ONLY}`,
       "--aethos-e2e-disable-relay=1",
       "--aethos-e2e-force-verbose=1",
-      "--aethos-e2e-force-gossip=1"
+      "--aethos-e2e-force-gossip=1",
+      `--aethos-diagnostics-run-id=${DIAGNOSTICS_RUN_ID}`,
+      ...(DIAGNOSTICS_COLLECTOR_URL
+        ? [`--aethos-diagnostics-collector-url=${DIAGNOSTICS_COLLECTOR_URL}`]
+        : [])
     ]
   });
 

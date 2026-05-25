@@ -109,6 +109,8 @@ use media_v1::{
     send_media_manifest_and_chunks as media_send_manifest_and_chunks, MediaMessageProcess,
     PendingMediaControlKind, PendingMediaControlUnicast,
 };
+#[cfg(feature = "e2e-testing")]
+use tauri_plugin_playwright;
 
 const SHARE_QR_FILE_NAME: &str = "share-wayfarer-qr.png";
 const CHAT_SNAPSHOT_EVENT: &str = "chat_snapshot";
@@ -130,6 +132,7 @@ const LAN_ENCOUNTER_MAX_NO_PROGRESS_STREAK: usize = 2;
 const LAN_ENCOUNTER_MAX_TIME_MS: u64 = 3_000;
 const LAN_ENCOUNTER_MAX_BYTES: u64 = 2_000_000;
 const LAN_ENCOUNTER_IDLE_BACKOFF_MS: u64 = 70;
+const LAN_ENCOUNTER_IDLE_GRACE_MS: u64 = 1_500;
 const BONJOUR_HELLO_COOLDOWN_MS: u64 = 3_000;
 const GOSSIP_UDP_SOCKET_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const E2E_UDP_TRANSFER_FRAME_MAX_BYTES_DEFAULT: usize = 32 * 1024;
@@ -190,6 +193,10 @@ impl DiscoveryBearerSource for BonjourDiscoveryCandidateSource {
                         peer_identity: None,
                         discovered_via: DiscoveryBearer::Bonjour,
                         observed_at_unix_ms: now_unix_ms(),
+                        first_observed_at_unix_ms: now_unix_ms(),
+                        last_observed_at_unix_ms: now_unix_ms(),
+                        route_priority: DiscoveryBearer::Bonjour.priority(),
+                        route_stale: false,
                         signal_quality_hint: None,
                     });
                 }
@@ -228,7 +235,8 @@ impl DiscoveryBearerSource for IPv4BroadcastDiscoveryCandidateSource {
     fn poll_candidates(&mut self) -> Vec<DiscoveryCandidate> {
         if let Some(restart_deadline) = self.restart_after {
             if Instant::now() >= restart_deadline {
-                self.discovery = IPv4BroadcastDiscovery::new(self.port, self.local_endpoints.clone());
+                self.discovery =
+                    IPv4BroadcastDiscovery::new(self.port, self.local_endpoints.clone());
                 self.restart_after = None;
                 log_info("ipv4_broadcast_discovery_restarted");
             }
@@ -248,6 +256,10 @@ impl DiscoveryBearerSource for IPv4BroadcastDiscoveryCandidateSource {
                         peer_identity: None,
                         discovered_via: DiscoveryBearer::IPv4Broadcast,
                         observed_at_unix_ms: now_unix_ms(),
+                        first_observed_at_unix_ms: now_unix_ms(),
+                        last_observed_at_unix_ms: now_unix_ms(),
+                        route_priority: DiscoveryBearer::IPv4Broadcast.priority(),
+                        route_stale: false,
                         signal_quality_hint: None,
                     });
                 }
@@ -306,6 +318,10 @@ impl DiscoveryBearerSource for MulticastDiscoveryCandidateSource {
                         peer_identity: None,
                         discovered_via: DiscoveryBearer::Multicast,
                         observed_at_unix_ms: now_unix_ms(),
+                        first_observed_at_unix_ms: now_unix_ms(),
+                        last_observed_at_unix_ms: now_unix_ms(),
+                        route_priority: DiscoveryBearer::Multicast.priority(),
+                        route_stale: false,
                         signal_quality_hint: None,
                     });
                 }
@@ -582,9 +598,29 @@ impl EncounterStopReason {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncounterConvergencePhase {
+    ActiveConverging,
+    QuietCheck,
+    ConvergedIdle,
+    Disconnected,
+}
+
+impl EncounterConvergencePhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ActiveConverging => "active_converging",
+            Self::QuietCheck => "quiet_check",
+            Self::ConvergedIdle => "converged_idle",
+            Self::Disconnected => "disconnected",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct GossipEncounterState {
     peer_identity: String,
+    phase: EncounterConvergencePhase,
     start: Instant,
     last_progress: Instant,
     rounds: usize,
@@ -592,7 +628,10 @@ struct GossipEncounterState {
     accepted_item_ids: BTreeSet<String>,
     bytes_imported: u64,
     no_progress_streak: usize,
+    quiet_rounds_completed: u32,
     stop_reason: Option<EncounterStopReason>,
+    finished_at: Option<Instant>,
+    discard_after: Option<Instant>,
 }
 
 impl GossipEncounterState {
@@ -600,6 +639,7 @@ impl GossipEncounterState {
         let now = Instant::now();
         Self {
             peer_identity,
+            phase: EncounterConvergencePhase::ActiveConverging,
             start: now,
             last_progress: now,
             rounds: 0,
@@ -607,7 +647,10 @@ impl GossipEncounterState {
             accepted_item_ids: BTreeSet::new(),
             bytes_imported: 0,
             no_progress_streak: 0,
+            quiet_rounds_completed: 0,
             stop_reason: None,
+            finished_at: None,
+            discard_after: None,
         }
     }
 
@@ -641,6 +684,10 @@ impl GossipEncounterState {
     fn mark_progress(&mut self) {
         self.last_progress = Instant::now();
         self.no_progress_streak = 0;
+        self.phase = EncounterConvergencePhase::ActiveConverging;
+        self.stop_reason = None;
+        self.finished_at = None;
+        self.discard_after = None;
     }
 
     fn mark_no_progress(&mut self) {
@@ -651,7 +698,28 @@ impl GossipEncounterState {
         if self.stop_reason.is_some() {
             return;
         }
+        let now = Instant::now();
+        if self.should_start_idle_grace(reason) {
+            self.phase = EncounterConvergencePhase::QuietCheck;
+            log_verbose(&format!(
+                "gossip_encounter_quiet_check_started: trigger={} peer={} reason={} phase={} requested={} accepted={}",
+                trigger,
+                self.peer_identity,
+                reason.as_str(),
+                self.phase.as_str(),
+                self.requested_item_ids.len(),
+                self.accepted_item_ids.len()
+            ));
+            self.quiet_rounds_completed = self.quiet_rounds_completed.saturating_add(1);
+            self.phase = EncounterConvergencePhase::ConvergedIdle;
+        } else {
+            self.phase = EncounterConvergencePhase::Disconnected;
+        }
         self.stop_reason = Some(reason);
+        self.finished_at = Some(now);
+        self.discard_after = self
+            .should_start_idle_grace(reason)
+            .then_some(now + Duration::from_millis(LAN_ENCOUNTER_IDLE_GRACE_MS));
         log_verbose(&format!(
             "gossip_encounter_end: trigger={} peer={} rounds={} requested={} accepted={} bytes_imported={} stop_reason={} elapsed_ms={}",
             trigger,
@@ -663,6 +731,60 @@ impl GossipEncounterState {
             reason.as_str(),
             self.elapsed_ms()
         ));
+        if let Some(discard_after) = self.discard_after {
+            log_verbose(&format!(
+                "gossip_encounter_idle_grace_started: trigger={} peer={} stop_reason={} phase={} quiet_rounds={} grace_ms={}",
+                trigger,
+                self.peer_identity,
+                reason.as_str(),
+                self.phase.as_str(),
+                self.quiet_rounds_completed,
+                discard_after.saturating_duration_since(now).as_millis()
+            ));
+        }
+    }
+
+    fn should_start_idle_grace(&self, reason: EncounterStopReason) -> bool {
+        matches!(
+            reason,
+            EncounterStopReason::NoMoreWanted
+                | EncounterStopReason::PeerReturnedNoUsefulItems
+                | EncounterStopReason::NoProgressStreakExceeded
+        ) && (!self.requested_item_ids.is_empty() || !self.accepted_item_ids.is_empty())
+    }
+
+    fn should_prune_now(&self, now: Instant) -> bool {
+        match self.discard_after {
+            Some(discard_after) => now >= discard_after,
+            None => self.stop_reason.is_some(),
+        }
+    }
+
+    fn can_resume_from_followup(&self, now: Instant) -> bool {
+        self.stop_reason.is_some()
+            && self
+                .discard_after
+                .is_some_and(|discard_after| now < discard_after)
+    }
+
+    fn resume_from_followup(&mut self, trigger: &str) {
+        if self.stop_reason.is_none() {
+            return;
+        }
+        let previous_phase = self.phase;
+        log_verbose(&format!(
+            "gossip_encounter_resumed_before_prune: trigger={} peer={} previous_phase={} requested={} accepted={} bytes_imported={}",
+            trigger,
+            self.peer_identity,
+            previous_phase.as_str(),
+            self.requested_item_ids.len(),
+            self.accepted_item_ids.len(),
+            self.bytes_imported
+        ));
+        self.phase = EncounterConvergencePhase::ActiveConverging;
+        self.stop_reason = None;
+        self.finished_at = None;
+        self.discard_after = None;
     }
 }
 
@@ -686,7 +808,13 @@ fn ensure_udp_peer_encounter<'a>(
 ) -> &'a mut GossipEncounterState {
     let should_reset = if let Some(existing) = encounters.get_mut(key) {
         if existing.stop_reason.is_some() {
-            true
+            let now = Instant::now();
+            if existing.can_resume_from_followup(now) {
+                existing.resume_from_followup("udp_peer_activity");
+                false
+            } else {
+                true
+            }
         } else if existing.elapsed_ms() >= LAN_ENCOUNTER_MAX_TIME_MS as u128
             || last_seen_by_peer.get(key).is_some_and(|last_seen| {
                 last_seen.elapsed() > Duration::from_millis(LAN_ENCOUNTER_MAX_TIME_MS)
@@ -740,7 +868,7 @@ fn prune_finished_udp_encounters(
             encounter.finish(EncounterStopReason::PeerTimeout, "udp_peer_idle");
         }
 
-        if encounter.stop_reason.is_some() {
+        if encounter.stop_reason.is_some() && encounter.should_prune_now(now) {
             finished.push((
                 peer_ip.clone(),
                 encounter.peer_identity.clone(),
@@ -750,7 +878,7 @@ fn prune_finished_udp_encounters(
         }
     }
 
-    for (peer_ip, peer_identity, transferred_items, bytes_imported) in finished {
+    for (peer_ip, peer_identity, _transferred_items, bytes_imported) in finished {
         if let Some(candidate_id) = peer_addr_by_node
             .get(&peer_identity)
             .map(|addr| addr.to_string())
@@ -769,8 +897,6 @@ fn prune_finished_udp_encounters(
                         TransitionReason::InitialSelection,
                         transition_at_unix_ms,
                     );
-                    encounter_manager
-                        .mark_transfer_completed(transferred_items, transition_at_unix_ms);
                 }
                 encounter_manager.close(transition_at_unix_ms);
             }
@@ -3081,6 +3207,9 @@ fn start_gossip_worker_if_needed(initial_enabled: bool, initial_ble_discovery_en
                     set_gossip_event("active");
                     log_verbose("gossip_inventory_broadcasted");
                 }
+                if force_announce {
+                    gossip_nudge_known_peers(&socket, &peer_addr_by_node);
+                }
                 last_inventory_broadcast = Instant::now();
             }
 
@@ -3133,6 +3262,15 @@ fn start_gossip_worker_if_needed(initial_enabled: bool, initial_ble_discovery_en
                 .map(|identity| identity.wayfarer_id)
                 .unwrap_or_else(|_| "unknown-local-peer".to_string());
             for candidate in discovery_candidate_pipeline.poll() {
+                log_info(&format!(
+                    "lan_route_selected endpoint={} bearer={} priority={} first_seen_unix_ms={} last_seen_unix_ms={} stale={}",
+                    candidate.peer_endpoint,
+                    discovery_bearer_label(&candidate.discovered_via),
+                    candidate.route_priority,
+                    candidate.first_observed_at_unix_ms,
+                    candidate.last_observed_at_unix_ms,
+                    candidate.route_stale
+                ));
                 let resolved = BonjourResolvedPeer {
                     fullname: candidate.candidate_id.clone(),
                     endpoint: candidate.peer_endpoint,
@@ -3603,6 +3741,38 @@ fn gossip_broadcast_inventory(socket: &UdpSocket) -> Result<(), String> {
     Ok(())
 }
 
+fn gossip_nudge_known_peers(socket: &UdpSocket, peer_addr_by_node: &HashMap<String, SocketAddr>) {
+    let summary = build_gossip_summary_frame(now_unix_ms()).ok();
+    let ingest = build_gossip_relay_ingest_frame(now_unix_ms()).ok();
+    let mut seen_addrs = BTreeSet::new();
+
+    for peer_addr in peer_addr_by_node.values() {
+        if !seen_addrs.insert(*peer_addr) {
+            continue;
+        }
+        if let Some(summary) = summary.as_ref() {
+            let _ = send_gossip_frame(
+                socket,
+                &peer_addr.ip().to_string(),
+                peer_addr.port(),
+                summary,
+            );
+        }
+        if let Some(ingest) = ingest.as_ref() {
+            let _ = send_gossip_frame(
+                socket,
+                &peer_addr.ip().to_string(),
+                peer_addr.port(),
+                ingest,
+            );
+        }
+        log_verbose(&format!(
+            "gossip_known_peer_nudged: peer={} reason=local_outbox_or_followup",
+            peer_addr
+        ));
+    }
+}
+
 fn handle_gossip_frame(
     socket: &UdpSocket,
     raw: &[u8],
@@ -3921,6 +4091,18 @@ fn handle_gossip_frame(
             let accepted_after = encounter.accepted_item_ids.len();
             let accepted_delta = accepted_after.saturating_sub(accepted_before);
             encounter.bytes_imported = encounter.bytes_imported.saturating_add(transfer_bytes);
+            if accepted_delta > 0 {
+                if let Some(encounter_manager) = lan_encounters.get_mut(&source_key) {
+                    let transition_at_unix_ms = now_unix_ms();
+                    encounter_manager.set_transfer_bearer(
+                        BearerAdapter::LanDatagram,
+                        TransitionReason::InitialSelection,
+                        transition_at_unix_ms,
+                    );
+                    encounter_manager
+                        .mark_transfer_completed(accepted_delta, transition_at_unix_ms);
+                }
+            }
 
             if !result.rejected_items.is_empty() {
                 let mut reasons = std::collections::BTreeMap::<String, usize>::new();
@@ -4083,7 +4265,64 @@ fn handle_gossip_frame(
                 encounter.no_progress_streak
             ));
         }
-        GossipSyncFrame::Receipt(_receipt) => {}
+        GossipSyncFrame::Receipt(receipt) => {
+            let encounter = ensure_udp_peer_encounter(
+                udp_encounters,
+                udp_last_seen_by_peer,
+                &source_ip_key,
+                peer_node_by_addr
+                    .get(&source_key)
+                    .or_else(|| peer_node_by_addr.get(&source_ip_key))
+                    .cloned()
+                    .unwrap_or_else(|| source_ip_key.clone()),
+            );
+            let useful = receipt
+                .received
+                .iter()
+                .filter(|item_id| encounter.requested_item_ids.contains(*item_id))
+                .count();
+            if useful > 0 {
+                encounter.mark_progress();
+            } else {
+                encounter.mark_no_progress();
+            }
+            log_verbose(&format!(
+                "gossip_encounter_round: transport=udp trigger=receipt peer={} round={} frame=RECEIPT received={} useful={} requested={} accepted={} bytes_imported={} no_progress_streak={}",
+                encounter.peer_identity,
+                encounter.rounds,
+                receipt.received.len(),
+                useful,
+                encounter.requested_item_ids.len(),
+                encounter.accepted_item_ids.len(),
+                encounter.bytes_imported,
+                encounter.no_progress_streak
+            ));
+
+            let relay_ingest_candidates = udp_relay_ingest_candidates_by_peer
+                .get(&source_ip_key)
+                .cloned()
+                .unwrap_or_default();
+            let summary_ref = udp_latest_summary_by_peer
+                .get(&source_ip_key)
+                .cloned()
+                .unwrap_or(crate::aethos_core::gossip_sync::SummaryFrame {
+                    bloom_filter: vec![0u8; crate::aethos_core::gossip_sync::BLOOM_FILTER_BYTES],
+                    item_count: relay_ingest_candidates.len() as u64,
+                    preview_item_ids: Some(relay_ingest_candidates.clone()),
+                    preview_cursor: relay_ingest_candidates.last().cloned(),
+                });
+
+            let _ = drain_udp_peer_reconciliation_round(
+                socket,
+                source,
+                &summary_ref,
+                summary_ref.preview_item_ids.as_deref().unwrap_or(&[]),
+                recent_outbound_request_by_peer,
+                encounter,
+                runtime,
+                "udp_receipt_followup",
+            );
+        }
         _ => {}
     }
 
@@ -5771,11 +6010,24 @@ fn glyph_5x7(ch: char) -> [u8; 7] {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .setup(|app| {
-            let _ = APP_HANDLE.set(app.handle().clone());
-            Ok(())
-        })
+    let builder = tauri::Builder::default().setup(|app| {
+        let _ = APP_HANDLE.set(app.handle().clone());
+        Ok(())
+    });
+
+    #[cfg(feature = "e2e-testing")]
+    let builder = {
+        let socket_path = std::env::var("TAURI_PLAYWRIGHT_SOCKET")
+            .ok()
+            .filter(|p| !p.trim().is_empty());
+        let config = match socket_path {
+            Some(path) => tauri_plugin_playwright::PluginConfig::new().socket_path(path),
+            None => tauri_plugin_playwright::PluginConfig::default(),
+        };
+        builder.plugin(tauri_plugin_playwright::init_with_config(config))
+    };
+
+    builder
         .invoke_handler(tauri::generate_handler![
             app_diagnostics,
             app_version,
@@ -6539,6 +6791,98 @@ mod tests {
             encounter.stop_reason,
             Some(EncounterStopReason::NoMoreWanted)
         ));
+        assert!(encounter.discard_after.is_some());
+        assert_eq!(encounter.phase, EncounterConvergencePhase::ConvergedIdle);
+        assert_eq!(encounter.quiet_rounds_completed, 1);
+    }
+
+    #[test]
+    fn udp_receipt_followup_keeps_encounter_active_for_more_convergence_work() {
+        let socket = UdpSocket::bind(("127.0.0.1", 0)).expect("bind udp socket");
+        let receiver = UdpSocket::bind(("127.0.0.1", 0)).expect("bind receiver udp");
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(800)))
+            .expect("set receiver timeout");
+        let runtime = GossipRuntime::new(true, true);
+        let source = receiver.local_addr().expect("receiver addr");
+        let item_id =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let next_item =
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
+        let summary = GossipSyncFrame::Summary(crate::aethos_core::gossip_sync::SummaryFrame {
+            bloom_filter: crate::aethos_core::gossip_sync::build_bloom_filter(
+                std::slice::from_ref(&next_item),
+            )
+            .expect("build bloom"),
+            item_count: 1,
+            preview_item_ids: Some(vec![next_item.clone()]),
+            preview_cursor: Some(next_item.clone()),
+        });
+        let receipt = GossipSyncFrame::Receipt(ReceiptFrame {
+            received: vec![item_id.clone()],
+        });
+        let raw = serialize_gossip_frame(&receipt).expect("serialize receipt");
+
+        let mut peer_node_by_addr = HashMap::from([
+            (source.to_string(), "peer-wayfarer".to_string()),
+            (source.ip().to_string(), "peer-wayfarer".to_string()),
+        ]);
+        let mut peer_addr_by_node = HashMap::from([("peer-wayfarer".to_string(), source)]);
+        let mut peer_tcp_capable_by_ip = HashMap::new();
+        let mut tcp_backoff_until_by_ip = HashMap::new();
+        let mut lan_encounters = HashMap::new();
+        let mut udp_encounters = HashMap::new();
+        let mut encounter = new_udp_peer_encounter("peer-wayfarer".to_string());
+        encounter.requested_item_ids.insert(item_id);
+        udp_encounters.insert(source.ip().to_string(), encounter);
+        let mut udp_last_seen_by_peer = HashMap::from([(source.ip().to_string(), Instant::now())]);
+        let mut udp_latest_summary_by_peer = HashMap::from([(
+            source.ip().to_string(),
+            match summary {
+                GossipSyncFrame::Summary(summary) => summary,
+                _ => unreachable!(),
+            },
+        )]);
+        let mut udp_relay_ingest_candidates_by_peer = HashMap::new();
+        let mut recent_served_request_by_peer = HashMap::new();
+        let mut recent_outbound_request_by_peer = HashMap::new();
+
+        handle_gossip_frame(
+            &socket,
+            &raw,
+            source,
+            &mut peer_node_by_addr,
+            &mut peer_addr_by_node,
+            &mut peer_tcp_capable_by_ip,
+            &mut tcp_backoff_until_by_ip,
+            &mut lan_encounters,
+            &mut udp_encounters,
+            &mut udp_last_seen_by_peer,
+            &mut udp_latest_summary_by_peer,
+            &mut udp_relay_ingest_candidates_by_peer,
+            &mut recent_served_request_by_peer,
+            &mut recent_outbound_request_by_peer,
+            &runtime,
+        )
+        .expect("handle receipt");
+
+        let encounter = udp_encounters
+            .get(&source.ip().to_string())
+            .expect("encounter should remain active");
+        assert_eq!(encounter.phase, EncounterConvergencePhase::ActiveConverging);
+        assert!(encounter.stop_reason.is_none());
+
+        let mut buf = [0u8; 65_535];
+        let (len, _) = receiver
+            .recv_from(&mut buf)
+            .expect("receive followup request");
+        let frame = parse_gossip_frame(&buf[..len]).expect("parse request");
+        match frame {
+            GossipSyncFrame::Request(request) => {
+                assert_eq!(request.want, vec![next_item]);
+            }
+            other => panic!("expected REQUEST, got {other:?}"),
+        }
     }
 
     #[test]
@@ -6739,7 +7083,7 @@ mod tests {
     }
 
     #[test]
-    fn finished_udp_encounter_prune_discards_route_and_request_state() {
+    fn finished_udp_encounter_prune_discards_route_and_request_state_after_grace_expiry() {
         let mut peer_node_by_addr = HashMap::from([
             (
                 "192.168.1.8".to_string(),
@@ -6777,7 +7121,10 @@ mod tests {
         let mut finished = new_udp_peer_encounter(
             "peer-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
         );
+        finished.requested_item_ids.insert("item-1".to_string());
+        finished.accepted_item_ids.insert("item-1".to_string());
         finished.finish(EncounterStopReason::NoMoreWanted, "test_finish");
+        finished.discard_after = Some(Instant::now() - Duration::from_millis(1));
         udp_encounters.insert("192.168.1.8".to_string(), finished);
         let mut recent_served_request_by_peer =
             HashMap::from([("192.168.1.8".to_string(), (123, Instant::now()))]);
@@ -6808,6 +7155,116 @@ mod tests {
         assert!(tcp_backoff_until_by_ip.is_empty());
         assert!(recent_served_request_by_peer.is_empty());
         assert!(recent_outbound_request_by_peer.is_empty());
+    }
+
+    #[test]
+    fn finished_udp_encounter_grace_keeps_route_state_until_idle_expires() {
+        let mut peer_node_by_addr = HashMap::from([(
+            "192.168.1.8".to_string(),
+            "peer-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        )]);
+        let mut peer_addr_by_node = HashMap::from([(
+            "peer-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            "192.168.1.8:47655".parse().expect("parse addr"),
+        )]);
+        let mut peer_tcp_capable_by_ip = HashMap::from([("192.168.1.8".to_string(), true)]);
+        let mut tcp_backoff_until_by_ip = HashMap::new();
+        let mut lan_encounters = HashMap::new();
+        let mut udp_encounters = HashMap::new();
+        let mut udp_last_seen_by_peer =
+            HashMap::from([("192.168.1.8".to_string(), Instant::now())]);
+        let mut udp_latest_summary_by_peer = HashMap::new();
+        let mut udp_relay_ingest_candidates_by_peer = HashMap::new();
+        let mut finished = new_udp_peer_encounter(
+            "peer-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        );
+        finished.requested_item_ids.insert("item-1".to_string());
+        finished.accepted_item_ids.insert("item-1".to_string());
+        finished.finish(EncounterStopReason::NoMoreWanted, "test_finish");
+        udp_encounters.insert("192.168.1.8".to_string(), finished);
+        let mut recent_served_request_by_peer = HashMap::new();
+        let mut recent_outbound_request_by_peer = HashMap::new();
+
+        prune_finished_udp_encounters(
+            &mut peer_node_by_addr,
+            &mut peer_addr_by_node,
+            &mut peer_tcp_capable_by_ip,
+            &mut tcp_backoff_until_by_ip,
+            &mut lan_encounters,
+            &mut udp_encounters,
+            &mut udp_last_seen_by_peer,
+            &mut udp_latest_summary_by_peer,
+            &mut udp_relay_ingest_candidates_by_peer,
+            &mut recent_served_request_by_peer,
+            &mut recent_outbound_request_by_peer,
+        );
+
+        assert!(udp_encounters.contains_key("192.168.1.8"));
+        assert_eq!(
+            udp_encounters.get("192.168.1.8").map(|enc| enc.phase),
+            Some(EncounterConvergencePhase::ConvergedIdle)
+        );
+        assert!(peer_node_by_addr.contains_key("192.168.1.8"));
+        assert!(peer_addr_by_node
+            .contains_key("peer-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert!(peer_tcp_capable_by_ip.contains_key("192.168.1.8"));
+    }
+
+    #[test]
+    fn idle_grace_encounter_resumes_as_active_on_followup_peer_activity() {
+        let mut encounters = HashMap::new();
+        let mut last_seen = HashMap::new();
+        let key = "192.168.1.8";
+        let mut encounter = new_udp_peer_encounter(
+            "peer-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        );
+        encounter.requested_item_ids.insert("item-1".to_string());
+        encounter.accepted_item_ids.insert("item-1".to_string());
+        encounter.finish(EncounterStopReason::NoMoreWanted, "test_finish");
+        encounters.insert(key.to_string(), encounter);
+
+        let resumed = ensure_udp_peer_encounter(
+            &mut encounters,
+            &mut last_seen,
+            key,
+            "peer-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        );
+
+        assert_eq!(resumed.phase, EncounterConvergencePhase::ActiveConverging);
+        assert!(resumed.stop_reason.is_none());
+        assert!(resumed.discard_after.is_none());
+    }
+
+    #[test]
+    fn expired_idle_grace_creates_fresh_encounter_on_new_peer_activity() {
+        let mut encounters = HashMap::new();
+        let mut last_seen = HashMap::new();
+        let key = "192.168.1.8";
+        let mut encounter = new_udp_peer_encounter(
+            "peer-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        );
+        encounter.requested_item_ids.insert("item-1".to_string());
+        encounter.accepted_item_ids.insert("item-1".to_string());
+        encounter.finish(EncounterStopReason::NoMoreWanted, "test_finish");
+        encounter.discard_after = Some(Instant::now() - Duration::from_millis(1));
+        encounters.insert(key.to_string(), encounter);
+
+        let resumed = ensure_udp_peer_encounter(
+            &mut encounters,
+            &mut last_seen,
+            key,
+            "peer-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+        );
+
+        assert_eq!(resumed.phase, EncounterConvergencePhase::ActiveConverging);
+        assert!(resumed.stop_reason.is_none());
+        assert!(resumed.discard_after.is_none());
+        assert_eq!(
+            resumed.peer_identity,
+            "peer-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        assert!(resumed.requested_item_ids.is_empty());
+        assert!(resumed.accepted_item_ids.is_empty());
     }
 
     #[test]

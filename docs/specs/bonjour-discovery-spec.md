@@ -105,6 +105,8 @@ Peer identity (such as wayfarer_id or signing keys) MUST NOT be exposed in mDNS 
 
 As mDNS operates on the local network segment only, implementations MUST NOT assume discovery results are authenticated. Gossip synchronization initiated after discovery MUST use its own authentication and verification mechanisms, such as a HELLO frame with a signed identity.
 
+When multicast discovery is available in a desktop or iOS runtime, Bonjour SHOULD be treated as fallback and hint-only discovery rather than the primary route of truth. Bonjour endpoints MAY become stale and MUST be validated through a fresh `HELLO` before they are trusted for convergence traffic.
+
 ## 8. Platform Implementation Notes
 
 - **Rust (reference)**: Uses the `mdns-sd` crate. Typical flow involves `ServiceDaemon::new()`, `.browse()`, and `ServiceInfo::new().enable_addr_auto().register()`.

@@ -2,11 +2,23 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+const ROUTE_STALE_AFTER_MS: u64 = 15_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiscoveryBearer {
     Bonjour,
     IPv4Broadcast,
     Multicast,
+}
+
+impl DiscoveryBearer {
+    pub fn priority(self) -> u8 {
+        match self {
+            Self::Multicast => 0,
+            Self::IPv4Broadcast => 1,
+            Self::Bonjour => 2,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -16,7 +28,17 @@ pub struct DiscoveryCandidate {
     pub peer_identity: Option<String>,
     pub discovered_via: DiscoveryBearer,
     pub observed_at_unix_ms: u64,
+    pub first_observed_at_unix_ms: u64,
+    pub last_observed_at_unix_ms: u64,
+    pub route_priority: u8,
+    pub route_stale: bool,
     pub signal_quality_hint: Option<f32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RouteObservation {
+    first_seen_at_unix_ms: u64,
+    last_seen_at_unix_ms: u64,
 }
 
 pub trait DiscoveryBearerSource {
@@ -27,7 +49,7 @@ pub struct DiscoveryCandidatePipeline {
     bearers: Vec<Box<dyn DiscoveryBearerSource>>,
     local_endpoints: Vec<IpAddr>,
     dedup_window_ms: u64,
-    last_seen: HashMap<String, u64>,
+    observations: HashMap<String, RouteObservation>,
     disabled: bool,
 }
 
@@ -45,7 +67,7 @@ impl DiscoveryCandidatePipeline {
             bearers,
             local_endpoints,
             dedup_window_ms: 500,
-            last_seen: HashMap::new(),
+            observations: HashMap::new(),
             disabled,
         }
     }
@@ -56,8 +78,7 @@ impl DiscoveryCandidatePipeline {
         }
 
         let now_ms = unix_now_ms();
-        let mut results: Vec<DiscoveryCandidate> = Vec::new();
-        let mut seen_this_poll: HashMap<String, bool> = HashMap::new();
+        let mut selected_this_poll: HashMap<String, DiscoveryCandidate> = HashMap::new();
 
         for bearer in &mut self.bearers {
             let candidates = bearer.poll_candidates();
@@ -66,21 +87,58 @@ impl DiscoveryCandidatePipeline {
                     continue;
                 }
 
-                let id = &candidate.candidate_id;
+                let id = candidate.candidate_id.clone();
 
-                if seen_this_poll.contains_key(id) {
-                    continue;
-                }
-
-                let last = self.last_seen.get(id).copied().unwrap_or(u64::MAX);
+                let last = self
+                    .observations
+                    .get(&id)
+                    .map(|value| value.last_seen_at_unix_ms)
+                    .unwrap_or(u64::MAX);
                 if last != u64::MAX && now_ms.saturating_sub(last) < self.dedup_window_ms {
                     continue;
                 }
 
-                seen_this_poll.insert(id.clone(), true);
-                self.last_seen.insert(id.clone(), now_ms);
-                results.push(candidate);
+                let observation = self
+                    .observations
+                    .get(&id)
+                    .copied()
+                    .unwrap_or(RouteObservation {
+                        first_seen_at_unix_ms: candidate.observed_at_unix_ms,
+                        last_seen_at_unix_ms: candidate.observed_at_unix_ms,
+                    });
+                let mut candidate = candidate;
+                candidate.first_observed_at_unix_ms = observation.first_seen_at_unix_ms;
+                candidate.last_observed_at_unix_ms = now_ms;
+                candidate.route_priority = candidate.discovered_via.priority();
+                candidate.route_stale =
+                    now_ms.saturating_sub(observation.last_seen_at_unix_ms) >= ROUTE_STALE_AFTER_MS;
+
+                match selected_this_poll.get(&id) {
+                    Some(existing)
+                        if existing.discovered_via.priority()
+                            <= candidate.discovered_via.priority() => {}
+                    _ => {
+                        selected_this_poll.insert(id, candidate);
+                    }
+                }
             }
+        }
+
+        let mut results: Vec<DiscoveryCandidate> = selected_this_poll.into_values().collect();
+        results.sort_by(|lhs, rhs| {
+            lhs.discovered_via
+                .priority()
+                .cmp(&rhs.discovered_via.priority())
+                .then_with(|| lhs.candidate_id.cmp(&rhs.candidate_id))
+        });
+        for candidate in &results {
+            self.observations.insert(
+                candidate.candidate_id.clone(),
+                RouteObservation {
+                    first_seen_at_unix_ms: candidate.first_observed_at_unix_ms,
+                    last_seen_at_unix_ms: now_ms,
+                },
+            );
         }
 
         results
@@ -128,6 +186,10 @@ mod tests {
             peer_identity: None,
             discovered_via: bearer,
             observed_at_unix_ms: unix_now_ms(),
+            first_observed_at_unix_ms: unix_now_ms(),
+            last_observed_at_unix_ms: unix_now_ms(),
+            route_priority: bearer.priority(),
+            route_stale: false,
             signal_quality_hint: None,
         }
     }
@@ -145,6 +207,64 @@ mod tests {
         let mut pipeline = DiscoveryCandidatePipeline::new(bearers, vec![]);
         let results = pipeline.poll();
         assert_eq!(results.len(), 1);
+        assert_eq!(results[0].discovered_via, DiscoveryBearer::IPv4Broadcast);
+        assert_eq!(
+            results[0].route_priority,
+            DiscoveryBearer::IPv4Broadcast.priority()
+        );
+    }
+
+    #[test]
+    fn multicast_candidate_is_preferred_over_bonjour_for_same_endpoint() {
+        let bonjour = make_candidate("192.168.1.20", 47655, DiscoveryBearer::Bonjour);
+        let multicast = make_candidate("192.168.1.20", 47655, DiscoveryBearer::Multicast);
+
+        let bearers: Vec<Box<dyn DiscoveryBearerSource>> = vec![
+            Box::new(StubBearer::new(vec![bonjour])),
+            Box::new(StubBearer::new(vec![multicast])),
+        ];
+
+        let mut pipeline = DiscoveryCandidatePipeline::new(bearers, vec![]);
+        let results = pipeline.poll();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].discovered_via, DiscoveryBearer::Multicast);
+        assert_eq!(
+            results[0].route_priority,
+            DiscoveryBearer::Multicast.priority()
+        );
+    }
+
+    #[test]
+    fn poll_results_are_sorted_by_bearer_priority() {
+        let bonjour = make_candidate("192.168.1.22", 47655, DiscoveryBearer::Bonjour);
+        let broadcast = make_candidate("192.168.1.21", 47655, DiscoveryBearer::IPv4Broadcast);
+        let multicast = make_candidate("192.168.1.20", 47655, DiscoveryBearer::Multicast);
+
+        let bearers: Vec<Box<dyn DiscoveryBearerSource>> = vec![
+            Box::new(StubBearer::new(vec![bonjour])),
+            Box::new(StubBearer::new(vec![broadcast])),
+            Box::new(StubBearer::new(vec![multicast])),
+        ];
+
+        let mut pipeline = DiscoveryCandidatePipeline::new(bearers, vec![]);
+        let results = pipeline.poll();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].discovered_via, DiscoveryBearer::Multicast);
+        assert_eq!(results[1].discovered_via, DiscoveryBearer::IPv4Broadcast);
+        assert_eq!(results[2].discovered_via, DiscoveryBearer::Bonjour);
+    }
+
+    #[test]
+    fn candidate_retains_route_observation_timestamps() {
+        let c = make_candidate("192.168.1.20", 47655, DiscoveryBearer::Multicast);
+        let initial_observed = c.observed_at_unix_ms;
+        let bearers: Vec<Box<dyn DiscoveryBearerSource>> = vec![Box::new(StubBearer::new(vec![c]))];
+        let mut pipeline = DiscoveryCandidatePipeline::new(bearers, vec![]);
+        let results = pipeline.poll();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].first_observed_at_unix_ms, initial_observed);
+        assert!(results[0].last_observed_at_unix_ms >= initial_observed);
+        assert!(!results[0].route_stale);
     }
 
     #[test]

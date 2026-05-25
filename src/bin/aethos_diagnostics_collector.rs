@@ -3,6 +3,7 @@
 mod aethos_core;
 
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::time::Duration;
 
 use aethos_core::diagnostics::{
@@ -17,7 +18,8 @@ use axum::{Json, Router};
 use clap::Parser;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sqlx::{FromRow, SqlitePool};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
+use sqlx::{ConnectOptions, FromRow, SqlitePool};
 use tokio::time::interval;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -28,7 +30,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 #[derive(Debug, Parser)]
 #[command(name = "aethos-diagnostics-collector")]
 struct Args {
-    #[arg(long, default_value = "127.0.0.1:9774")]
+    #[arg(long, default_value = "0.0.0.0:9774")]
     listen: String,
     #[arg(long, default_value = "sqlite://aethos-diagnostics.sqlite3")]
     database_url: String,
@@ -95,7 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
-    let pool = SqlitePool::connect(&args.database_url).await?;
+    let pool = connect_pool(&args.database_url).await?;
     init_db(&pool).await?;
     let state = AppState { pool: pool.clone() };
     spawn_retention_task(pool, args.retention_hours);
@@ -122,6 +124,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!(%addr, "diagnostics collector listening");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn connect_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
+    let options = SqliteConnectOptions::from_str(database_url)?
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .busy_timeout(Duration::from_secs(10))
+        .log_statements(tracing::log::LevelFilter::Debug);
+
+    SqlitePoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect_with(options)
+        .await
 }
 
 async fn init_db(pool: &SqlitePool) -> Result<(), sqlx::Error> {
@@ -267,6 +284,20 @@ async fn ingest_events(
     let mut transaction = state.pool.begin().await.map_err(internal_error)?;
     let mut accepted = 0usize;
     for event in &request.events {
+        sqlx::query(
+            "INSERT OR IGNORE INTO diagnostics_runs (
+                run_id, app, platform, status, created_at_utc, expires_at_utc, scenario, test_case_id, metadata_json
+            ) VALUES (?, ?, ?, 'active', ?, NULL, NULL, NULL, ?)",
+        )
+        .bind(&event.run_id)
+        .bind(&event.app)
+        .bind(&event.platform)
+        .bind(&event.timestamp_utc)
+        .bind(json!({"source": "event-ingest-placeholder"}).to_string())
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal_error)?;
+
         sqlx::query(
             "INSERT OR REPLACE INTO diagnostics_events (
                 event_id, schema_version, run_id, session_id, encounter_id, timestamp_utc,
@@ -436,7 +467,9 @@ fn event_row_to_event(row: EventRow) -> DiagnosticEvent {
 }
 
 fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
-    (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+    let message = error.to_string();
+    error!(error = %message, "diagnostics collector request failed");
+    (StatusCode::INTERNAL_SERVER_ERROR, message)
 }
 
 fn not_found() -> (StatusCode, String) {
@@ -562,6 +595,30 @@ mod tests {
             .iter()
             .any(|item| item.missing == "ui.projection.succeeded"));
         assert_eq!(summary.0.item_ids_received, vec!["item-1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn ingest_events_creates_missing_run_placeholder() {
+        let state = test_state().await;
+        let ingest = ingest_events(
+            State(state.clone()),
+            Json(DiagnosticsEventIngestRequest {
+                events: vec![sample_event("event-1", "request.sent", "request", Some("item-1"))],
+            }),
+        )
+        .await
+        .expect("ingest event before explicit run create");
+
+        assert_eq!(ingest.0.accepted, 1);
+        let fetched = get_run(State(state), Path("run-test".to_string()))
+            .await
+            .expect("fetch placeholder run");
+        assert_eq!(fetched.0.app, "aethos-ios");
+        assert_eq!(fetched.0.platform, "ios");
+        assert_eq!(
+            fetched.0.metadata,
+            Some(json!({"source": "event-ingest-placeholder"}))
+        );
     }
 
     #[tokio::test]

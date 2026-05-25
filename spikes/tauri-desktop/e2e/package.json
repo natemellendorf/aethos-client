@@ -8,7 +8,12 @@
     "test": "npm run preflight && npm run doctor && mocha --timeout 1200000 \"test/**/*.mjs\"",
     "send:wayfarer-media": "npm run preflight && npm run doctor && node scripts/send-wayfarer-media.mjs",
     "inspect:receiver-media": "npm run preflight && npm run doctor && node scripts/inspect-wayfarer-receiver.mjs",
-    "playwright:install": "playwright install chromium"
+    "playwright:install": "playwright install chromium",
+    "test:playwright:browser": "npx playwright test --project=browser-only",
+    "test:playwright:tauri": "npx playwright test --project=tauri",
+    "test:playwright:headed": "npx playwright test --project=browser-only --headed",
+    "test:playwright:report": "npx playwright show-report ../playwright-report",
+    "test:playwright:debug": "npx playwright test --project=browser-only --debug"
   },
   "dependencies": {
     "chai": "^5.2.1",

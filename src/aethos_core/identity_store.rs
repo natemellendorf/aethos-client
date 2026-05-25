@@ -382,6 +382,12 @@ fn contact_aliases_file_path() -> PathBuf {
 }
 
 fn base_data_dir() -> PathBuf {
+    if let Ok(state_dir) = std::env::var("AETHOS_STATE_DIR") {
+        if !state_dir.trim().is_empty() {
+            return PathBuf::from(state_dir);
+        }
+    }
+
     if let Ok(xdg_data_home) = std::env::var("XDG_DATA_HOME") {
         if !xdg_data_home.trim().is_empty() {
             return PathBuf::from(xdg_data_home);
@@ -410,8 +416,9 @@ fn contact_aliases_file_path_for(base_dir: PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        cipher_from_identity, contact_aliases_file_path_for, decode_verifying_key_from_identity,
-        identity_file_path_for, session_cache_file_path_for, sha256_hex_lower, StoredIdentity,
+        base_data_dir, cipher_from_identity, contact_aliases_file_path_for,
+        decode_verifying_key_from_identity, identity_file_path_for, session_cache_file_path_for,
+        sha256_hex_lower, StoredIdentity,
     };
     use base64::Engine;
     use chacha20poly1305::aead::Aead;
@@ -447,6 +454,29 @@ mod tests {
             path,
             PathBuf::from("/tmp/test-data/aethos-linux/contact-aliases.json")
         );
+    }
+
+    #[test]
+    fn base_data_dir_prefers_aethos_state_dir_override() {
+        let original_state_dir = std::env::var("AETHOS_STATE_DIR").ok();
+        let original_xdg_data_home = std::env::var("XDG_DATA_HOME").ok();
+        std::env::set_var("AETHOS_STATE_DIR", "/tmp/aethos-state-override");
+        std::env::set_var("XDG_DATA_HOME", "/tmp/xdg-data-home");
+
+        let resolved = base_data_dir();
+
+        if let Some(value) = original_state_dir {
+            std::env::set_var("AETHOS_STATE_DIR", value);
+        } else {
+            std::env::remove_var("AETHOS_STATE_DIR");
+        }
+        if let Some(value) = original_xdg_data_home {
+            std::env::set_var("XDG_DATA_HOME", value);
+        } else {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+
+        assert_eq!(resolved, PathBuf::from("/tmp/aethos-state-override"));
     }
 
     #[test]

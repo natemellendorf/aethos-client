@@ -399,6 +399,55 @@ pub fn report_from_log(level: &str, message: &str, event_name: &str, fields: Val
         "encounter_bearer_selected" | "encounter_bearer_upgrade_applied" => {
             Some(("bearer.selected", "encounter", "ok", "encounter"))
         }
+        "gossip_encounter_quiet_check_started" => Some((
+            "encounter.quiet_round_started",
+            "encounter",
+            "started",
+            "encounter",
+        )),
+        "gossip_encounter_idle_grace_started" => Some((
+            "encounter.idle_grace_started",
+            "encounter",
+            "started",
+            "encounter",
+        )),
+        "gossip_encounter_resumed_before_prune" => Some((
+            "encounter.idle_grace_cancelled",
+            "encounter",
+            "ok",
+            "encounter",
+        )),
+        "gossip_known_peer_nudged" => Some((
+            "encounter.outbox_work_detected",
+            "encounter",
+            "ok",
+            "encounter",
+        )),
+        "bonjour_advertisement_started" => Some((
+            "lan.bonjour.candidate_created",
+            "discovery",
+            "started",
+            "discovery",
+        )),
+        "bonjour_endpoint_resolved" => Some((
+            "lan.bonjour.candidate_created",
+            "discovery",
+            "ok",
+            "discovery",
+        )),
+        "multicast_discovery_restarted" => {
+            Some(("lan.route.refreshed", "discovery", "ok", "discovery"))
+        }
+        "multicast_discovery_error" => Some((
+            "lan.multicast.join_failed",
+            "discovery",
+            "failed",
+            "discovery",
+        )),
+        "lan_route_selected" => Some(("lan.route.selected", "discovery", "ok", "discovery")),
+        "LAN discovery bearer active" if message.contains("Multicast") => {
+            Some(("lan.multicast.socket_bound", "discovery", "ok", "discovery"))
+        }
         "encounter_closed" | "gossip_encounter_end" | "gossip_tcp_encounter_done" => {
             Some(("encounter.closed", "encounter", "ok", "encounter"))
         }
@@ -414,7 +463,9 @@ pub fn report_from_log(level: &str, message: &str, event_name: &str, fields: Val
         "gossip_transfer_imported_messages" => {
             Some(("inbox.import.succeeded", "import", "ok", "inbox"))
         }
-        "outbound_app_body_built" => Some(("request.planned", "request", "ok", "messaging")),
+        "outbound_app_body_built" | "gossip_record_local_payload_ok" => {
+            Some(("request.planned", "request", "ok", "messaging"))
+        }
         "bonjour_discovery_error"
         | "ble_advertiser_error"
         | "gossip_frame_handle_error"

@@ -55,6 +55,14 @@ pub fn log_verbose(message: &str) {
 }
 
 pub fn app_log_file_path() -> PathBuf {
+    if let Ok(state_dir) = std::env::var("AETHOS_STATE_DIR") {
+        if !state_dir.trim().is_empty() {
+            return Path::new(&state_dir)
+                .join("aethos-linux")
+                .join(APP_LOG_FILE_NAME);
+        }
+    }
+
     if let Ok(xdg_state_home) = std::env::var("XDG_STATE_HOME") {
         if !xdg_state_home.trim().is_empty() {
             return Path::new(&xdg_state_home)
@@ -180,7 +188,9 @@ fn extract_kv_fields(message: &str) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_kv_fields, infer_event_name, structured_logs_enabled};
+    use std::path::PathBuf;
+
+    use super::{app_log_file_path, extract_kv_fields, infer_event_name, structured_logs_enabled};
 
     #[test]
     fn infer_event_name_uses_first_token_without_colon() {
@@ -213,5 +223,31 @@ mod tests {
         assert!(structured_logs_enabled());
         std::env::remove_var("AETHOS_STRUCTURED_LOGS");
         assert!(!structured_logs_enabled());
+    }
+
+    #[test]
+    fn app_log_file_path_prefers_aethos_state_dir_override() {
+        let original_state_dir = std::env::var("AETHOS_STATE_DIR").ok();
+        let original_xdg_state_home = std::env::var("XDG_STATE_HOME").ok();
+        std::env::set_var("AETHOS_STATE_DIR", "/tmp/aethos-log-state");
+        std::env::set_var("XDG_STATE_HOME", "/tmp/xdg-state-home");
+
+        let resolved = app_log_file_path();
+
+        if let Some(value) = original_state_dir {
+            std::env::set_var("AETHOS_STATE_DIR", value);
+        } else {
+            std::env::remove_var("AETHOS_STATE_DIR");
+        }
+        if let Some(value) = original_xdg_state_home {
+            std::env::set_var("XDG_STATE_HOME", value);
+        } else {
+            std::env::remove_var("XDG_STATE_HOME");
+        }
+
+        assert_eq!(
+            resolved,
+            PathBuf::from("/tmp/aethos-log-state/aethos-linux/aethos-linux.log")
+        );
     }
 }

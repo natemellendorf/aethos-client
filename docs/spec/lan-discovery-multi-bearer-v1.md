@@ -6,6 +6,14 @@
 
 This spec captures the cutover state for desktop LAN discovery after the multi-bearer encounter migration. Discovery candidates may arrive from Bonjour, IPv4 broadcast, or multicast, while canonical encounter orchestration owns follow-up control-exchange and transfer decisions.
 
+The current desktop runtime prefers candidates in this order when the same endpoint is observed by multiple bearers during one poll:
+
+1. multicast
+2. IPv4 broadcast
+3. Bonjour
+
+Peer identity is still established by Aethos `HELLO`, not by discovery metadata.
+
 ## Supersedes
 
 - `ac-mbe-01-audit-current-desktop-encounter-paths.md` — audited the legacy desktop encounter/discovery/runtime paths before canonical cutover.

@@ -9,7 +9,9 @@
     "preview": "vite preview --host 127.0.0.1 --port 1420",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
-    "e2e": "AETHOS_E2E=1 npm --prefix e2e test"
+    "e2e": "AETHOS_E2E=1 npm --prefix e2e test",
+    "test:playwright:browser": "npm --prefix e2e run test:playwright:browser",
+    "test:playwright:tauri": "npx tauri build --debug --no-bundle --features e2e-testing && npm --prefix e2e run test:playwright:tauri"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",
