@@ -2,10 +2,19 @@ use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 
 use socket2::{Domain, Protocol, Socket, Type};
+use uuid::Uuid;
 
-pub const AETHOS_MULTICAST_GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
+use crate::aethos_core::aeth_discovery_packet::{
+    AethDiscoveryMessageType, AethDiscoveryPacket, AETH_DISCOVERY_GOSSIP_PORT,
+    AETH_DISCOVERY_IPV4_MULTICAST_GROUP,
+};
 
-pub const AETHOS_MULTICAST_BEACON: [u8; 4] = [0xAE, 0x74, 0x48, 0x53];
+pub const AETHOS_MULTICAST_GROUP: Ipv4Addr = Ipv4Addr::new(
+    AETH_DISCOVERY_IPV4_MULTICAST_GROUP[0],
+    AETH_DISCOVERY_IPV4_MULTICAST_GROUP[1],
+    AETH_DISCOVERY_IPV4_MULTICAST_GROUP[2],
+    AETH_DISCOVERY_IPV4_MULTICAST_GROUP[3],
+);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MulticastResolvedPeer {
@@ -148,10 +157,9 @@ impl ActiveMulticastDiscovery {
         self.poll_count = self.poll_count.wrapping_add(1);
 
         if self.poll_count.is_multiple_of(5) {
-            if let Err(err) = self
-                .socket
-                .send_to(&AETHOS_MULTICAST_BEACON, self.multicast_addr)
-            {
+            let packet =
+                AethDiscoveryPacket::probe(*Uuid::new_v4().as_bytes(), AETH_DISCOVERY_GOSSIP_PORT);
+            if let Err(err) = self.socket.send_to(&packet.encode(), self.multicast_addr) {
                 eprintln!("multicast: beacon send failed: {err}");
             }
         }
@@ -163,7 +171,12 @@ impl ActiveMulticastDiscovery {
                     if self.local_addrs.contains(&src.ip()) {
                         continue;
                     }
-                    if n >= 4 && buf[..4] == AETHOS_MULTICAST_BEACON {
+                    if let Ok(packet) = AethDiscoveryPacket::decode(&buf[..n]) {
+                        if packet.message_type != AethDiscoveryMessageType::Probe
+                            && packet.message_type != AethDiscoveryMessageType::Response
+                        {
+                            continue;
+                        }
                         self.pending
                             .push_back(MulticastDiscoveryEvent::PeerDiscovered { peer_addr: src });
                         self.pending
@@ -200,7 +213,10 @@ mod tests {
     #[test]
     fn disabled_flag_prevents_active_state() {
         unsafe { std::env::set_var("AETHOS_DISABLE_MULTICAST", "1") };
-        let mut bearer = MulticastDiscovery::new(47655, vec![]);
+        let mut bearer = MulticastDiscovery::new(
+            crate::aethos_core::aeth_discovery_packet::AETH_DISCOVERY_MULTICAST_PORT,
+            vec![],
+        );
         let events = bearer.poll();
         unsafe { std::env::remove_var("AETHOS_DISABLE_MULTICAST") };
         assert!(events.is_empty());
@@ -220,7 +236,15 @@ mod tests {
 
     #[test]
     fn multicast_group_address_is_correct() {
-        assert_eq!(AETHOS_MULTICAST_GROUP, Ipv4Addr::new(224, 0, 0, 251));
+        assert_eq!(AETHOS_MULTICAST_GROUP, Ipv4Addr::new(239, 255, 37, 105));
+    }
+
+    #[test]
+    fn multicast_packet_payload_is_aeth_contract() {
+        let packet = AethDiscoveryPacket::probe([0x01; 16], AETH_DISCOVERY_GOSSIP_PORT);
+        let encoded = packet.encode();
+        assert_eq!(encoded.len(), 29);
+        assert_eq!(&encoded[0..4], b"AETH");
     }
 
     #[test]

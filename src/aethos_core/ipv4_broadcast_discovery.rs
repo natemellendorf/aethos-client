@@ -2,9 +2,11 @@ use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 
 use socket2::{Domain, Protocol, Socket, Type};
+use uuid::Uuid;
 
-/// Magic beacon bytes sent/expected on the broadcast channel.
-pub const AETHOS_BROADCAST_BEACON: [u8; 4] = [0xAE, 0x74, 0x48, 0x53];
+use crate::aethos_core::aeth_discovery_packet::{
+    AethDiscoveryMessageType, AethDiscoveryPacket, AETH_DISCOVERY_GOSSIP_PORT,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IPv4BroadcastResolvedPeer {
@@ -107,10 +109,9 @@ impl ActiveIPv4BroadcastDiscovery {
 
         // Send beacon every 5th poll.
         if self.poll_count.is_multiple_of(5) {
-            if let Err(err) = self
-                .socket
-                .send_to(&AETHOS_BROADCAST_BEACON, self.broadcast_addr)
-            {
+            let packet =
+                AethDiscoveryPacket::probe(*Uuid::new_v4().as_bytes(), AETH_DISCOVERY_GOSSIP_PORT);
+            if let Err(err) = self.socket.send_to(&packet.encode(), self.broadcast_addr) {
                 eprintln!("ipv4_broadcast: beacon send failed: {err}");
             }
         }
@@ -124,8 +125,13 @@ impl ActiveIPv4BroadcastDiscovery {
                     if self.local_addrs.contains(&src.ip()) {
                         continue;
                     }
-                    // Only process valid beacon frames.
-                    if n >= 4 && buf[..4] == AETHOS_BROADCAST_BEACON {
+                    // Only process valid AETH discovery frames.
+                    if let Ok(packet) = AethDiscoveryPacket::decode(&buf[..n]) {
+                        if packet.message_type != AethDiscoveryMessageType::Probe
+                            && packet.message_type != AethDiscoveryMessageType::Response
+                        {
+                            continue;
+                        }
                         self.pending
                             .push_back(IPv4BroadcastDiscoveryEvent::PeerDiscovered {
                                 peer_addr: src,
@@ -202,8 +208,15 @@ mod tests {
     }
 
     #[test]
-    fn beacon_bytes_are_correct() {
-        assert_eq!(AETHOS_BROADCAST_BEACON, [0xAE, 0x74, 0x48, 0x53]);
+    fn broadcast_payload_is_aeth_discovery_packet() {
+        let packet = AethDiscoveryPacket::probe([0x01; 16], AETH_DISCOVERY_GOSSIP_PORT);
+        let encoded = packet.encode();
+        assert_eq!(encoded.len(), 29);
+        assert_eq!(&encoded[0..4], b"AETH");
+        assert_eq!(
+            AethDiscoveryPacket::decode(&encoded).unwrap().sender_port,
+            47655
+        );
     }
 
     #[test]

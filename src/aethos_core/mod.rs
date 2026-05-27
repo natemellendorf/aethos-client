@@ -1,3 +1,4 @@
+pub mod aeth_discovery_packet;
 pub mod ble_discovery;
 pub mod bonjour_discovery;
 pub mod diagnostics;
