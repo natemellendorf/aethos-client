@@ -8,13 +8,14 @@ const ROUTE_STALE_AFTER_MS: u64 = 15_000;
 pub enum DiscoveryBearer {
     Bonjour,
     IPv4Broadcast,
-    Multicast,
+    IPv4Multicast,
+    IPv6Multicast,
 }
 
 impl DiscoveryBearer {
     pub fn priority(self) -> u8 {
         match self {
-            Self::Multicast => 0,
+            Self::IPv4Multicast | Self::IPv6Multicast => 0,
             Self::IPv4Broadcast => 1,
             Self::Bonjour => 2,
         }
@@ -179,7 +180,12 @@ mod tests {
     }
 
     fn make_candidate(ip: &str, port: u16, bearer: DiscoveryBearer) -> DiscoveryCandidate {
-        let peer_endpoint: SocketAddr = format!("{ip}:{port}").parse().unwrap();
+        let endpoint = if ip.contains(':') {
+            format!("[{ip}]:{port}")
+        } else {
+            format!("{ip}:{port}")
+        };
+        let peer_endpoint: SocketAddr = endpoint.parse().unwrap();
         DiscoveryCandidate {
             candidate_id: format!("{ip}:{port}"),
             peer_endpoint,
@@ -217,7 +223,7 @@ mod tests {
     #[test]
     fn multicast_candidate_is_preferred_over_bonjour_for_same_endpoint() {
         let bonjour = make_candidate("192.168.1.20", 47655, DiscoveryBearer::Bonjour);
-        let multicast = make_candidate("192.168.1.20", 47655, DiscoveryBearer::Multicast);
+        let multicast = make_candidate("192.168.1.20", 47655, DiscoveryBearer::IPv4Multicast);
 
         let bearers: Vec<Box<dyn DiscoveryBearerSource>> = vec![
             Box::new(StubBearer::new(vec![bonjour])),
@@ -227,10 +233,10 @@ mod tests {
         let mut pipeline = DiscoveryCandidatePipeline::new(bearers, vec![]);
         let results = pipeline.poll();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].discovered_via, DiscoveryBearer::Multicast);
+        assert_eq!(results[0].discovered_via, DiscoveryBearer::IPv4Multicast);
         assert_eq!(
             results[0].route_priority,
-            DiscoveryBearer::Multicast.priority()
+            DiscoveryBearer::IPv4Multicast.priority()
         );
     }
 
@@ -238,7 +244,7 @@ mod tests {
     fn poll_results_are_sorted_by_bearer_priority() {
         let bonjour = make_candidate("192.168.1.22", 47655, DiscoveryBearer::Bonjour);
         let broadcast = make_candidate("192.168.1.21", 47655, DiscoveryBearer::IPv4Broadcast);
-        let multicast = make_candidate("192.168.1.20", 47655, DiscoveryBearer::Multicast);
+        let multicast = make_candidate("192.168.1.20", 47655, DiscoveryBearer::IPv4Multicast);
 
         let bearers: Vec<Box<dyn DiscoveryBearerSource>> = vec![
             Box::new(StubBearer::new(vec![bonjour])),
@@ -249,14 +255,14 @@ mod tests {
         let mut pipeline = DiscoveryCandidatePipeline::new(bearers, vec![]);
         let results = pipeline.poll();
         assert_eq!(results.len(), 3);
-        assert_eq!(results[0].discovered_via, DiscoveryBearer::Multicast);
+        assert_eq!(results[0].discovered_via, DiscoveryBearer::IPv4Multicast);
         assert_eq!(results[1].discovered_via, DiscoveryBearer::IPv4Broadcast);
         assert_eq!(results[2].discovered_via, DiscoveryBearer::Bonjour);
     }
 
     #[test]
     fn candidate_retains_route_observation_timestamps() {
-        let c = make_candidate("192.168.1.20", 47655, DiscoveryBearer::Multicast);
+        let c = make_candidate("192.168.1.20", 47655, DiscoveryBearer::IPv4Multicast);
         let initial_observed = c.observed_at_unix_ms;
         let bearers: Vec<Box<dyn DiscoveryBearerSource>> = vec![Box::new(StubBearer::new(vec![c]))];
         let mut pipeline = DiscoveryCandidatePipeline::new(bearers, vec![]);
@@ -297,7 +303,7 @@ mod tests {
             }
         }
 
-        let c = make_candidate("192.168.1.20", 47655, DiscoveryBearer::Multicast);
+        let c = make_candidate("192.168.1.20", 47655, DiscoveryBearer::IPv4Multicast);
         let bearers: Vec<Box<dyn DiscoveryBearerSource>> =
             vec![Box::new(FailingBearer), Box::new(StubBearer::new(vec![c]))];
 
@@ -328,12 +334,22 @@ mod tests {
 
     #[test]
     fn multicast_bearer_emits_multicast_candidate() {
-        let c = make_candidate("192.168.1.20", 47655, DiscoveryBearer::Multicast);
+        let c = make_candidate("192.168.1.20", 47655, DiscoveryBearer::IPv4Multicast);
         let bearers: Vec<Box<dyn DiscoveryBearerSource>> = vec![Box::new(StubBearer::new(vec![c]))];
         let mut pipeline = DiscoveryCandidatePipeline::new(bearers, vec![]);
         let results = pipeline.poll();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].discovered_via, DiscoveryBearer::Multicast);
+        assert_eq!(results[0].discovered_via, DiscoveryBearer::IPv4Multicast);
+    }
+
+    #[test]
+    fn ipv6_multicast_bearer_emits_distinct_source_type() {
+        let c = make_candidate("fe80::1", 47655, DiscoveryBearer::IPv6Multicast);
+        let bearers: Vec<Box<dyn DiscoveryBearerSource>> = vec![Box::new(StubBearer::new(vec![c]))];
+        let mut pipeline = DiscoveryCandidatePipeline::new(bearers, vec![]);
+        let results = pipeline.poll();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].discovered_via, DiscoveryBearer::IPv6Multicast);
     }
 
     #[test]

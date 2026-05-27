@@ -603,7 +603,12 @@ mod tests {
         let ingest = ingest_events(
             State(state.clone()),
             Json(DiagnosticsEventIngestRequest {
-                events: vec![sample_event("event-1", "request.sent", "request", Some("item-1"))],
+                events: vec![sample_event(
+                    "event-1",
+                    "request.sent",
+                    "request",
+                    Some("item-1"),
+                )],
             }),
         )
         .await
