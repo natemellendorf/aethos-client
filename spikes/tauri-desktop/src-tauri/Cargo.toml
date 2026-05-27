@@ -33,6 +33,7 @@ flume = "0.11"
 mdns-sd = "0.18"
 rusqlite = { version = "0.32", features = ["bundled"] }
 ureq = { version = "2.12", features = ["json"] }
+uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 dbus = "0.9"

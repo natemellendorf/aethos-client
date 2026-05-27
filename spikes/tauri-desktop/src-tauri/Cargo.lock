@@ -48,6 +48,7 @@ dependencies = [
  "tungstenite",
  "ureq",
  "url",
+ "uuid",
  "webbrowser",
 ]
 

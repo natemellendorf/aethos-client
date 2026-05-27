@@ -60,6 +60,7 @@ use crate::aethos_core::ble_discovery::{
 };
 use crate::aethos_core::discovery_candidate_pipeline::{
     DiscoveryBearer, DiscoveryBearerSource, DiscoveryCandidate, DiscoveryCandidatePipeline,
+    DiscoveryPeerIdentityStatus,
 };
 use crate::aethos_core::encounter_orchestration::{
     BearerAdapter, EncounterManager, TransitionReason,
@@ -191,12 +192,19 @@ impl DiscoveryBearerSource for BonjourDiscoveryCandidateSource {
                         candidate_id: resolved.endpoint.to_string(),
                         peer_endpoint: resolved.endpoint,
                         peer_identity: None,
+                        peer_identity_status: DiscoveryPeerIdentityStatus::Unknown,
                         discovered_via: DiscoveryBearer::Bonjour,
+                        listener_port: Some(gossip_lan_port()),
                         observed_at_unix_ms: now_unix_ms(),
                         first_observed_at_unix_ms: now_unix_ms(),
                         last_observed_at_unix_ms: now_unix_ms(),
+                        last_hello_attempt_at_unix_ms: None,
+                        last_hello_success_at_unix_ms: None,
+                        last_hello_failed_at_unix_ms: None,
                         route_priority: DiscoveryBearer::Bonjour.priority(),
                         route_stale: false,
+                        delivery_eligible: false,
+                        hint_only: DiscoveryBearer::Bonjour.is_hint_only(),
                         signal_quality_hint: None,
                     });
                 }
@@ -254,12 +262,19 @@ impl DiscoveryBearerSource for IPv4BroadcastDiscoveryCandidateSource {
                         candidate_id: resolved.peer_addr.to_string(),
                         peer_endpoint: resolved.peer_addr,
                         peer_identity: None,
+                        peer_identity_status: DiscoveryPeerIdentityStatus::Unknown,
                         discovered_via: DiscoveryBearer::IPv4Broadcast,
+                        listener_port: Some(self.port),
                         observed_at_unix_ms: now_unix_ms(),
                         first_observed_at_unix_ms: now_unix_ms(),
                         last_observed_at_unix_ms: now_unix_ms(),
+                        last_hello_attempt_at_unix_ms: None,
+                        last_hello_success_at_unix_ms: None,
+                        last_hello_failed_at_unix_ms: None,
                         route_priority: DiscoveryBearer::IPv4Broadcast.priority(),
                         route_stale: false,
+                        delivery_eligible: false,
+                        hint_only: DiscoveryBearer::IPv4Broadcast.is_hint_only(),
                         signal_quality_hint: None,
                     });
                 }
@@ -316,12 +331,19 @@ impl DiscoveryBearerSource for MulticastDiscoveryCandidateSource {
                         candidate_id: resolved.peer_addr.to_string(),
                         peer_endpoint: resolved.peer_addr,
                         peer_identity: None,
-                        discovered_via: DiscoveryBearer::Multicast,
+                        peer_identity_status: DiscoveryPeerIdentityStatus::Unknown,
+                        discovered_via: DiscoveryBearer::IPv4Multicast,
+                        listener_port: Some(self.port),
                         observed_at_unix_ms: now_unix_ms(),
                         first_observed_at_unix_ms: now_unix_ms(),
                         last_observed_at_unix_ms: now_unix_ms(),
-                        route_priority: DiscoveryBearer::Multicast.priority(),
+                        last_hello_attempt_at_unix_ms: None,
+                        last_hello_success_at_unix_ms: None,
+                        last_hello_failed_at_unix_ms: None,
+                        route_priority: DiscoveryBearer::IPv4Multicast.priority(),
                         route_stale: false,
+                        delivery_eligible: false,
+                        hint_only: DiscoveryBearer::IPv4Multicast.is_hint_only(),
                         signal_quality_hint: None,
                     });
                 }
@@ -3263,12 +3285,31 @@ fn start_gossip_worker_if_needed(initial_enabled: bool, initial_ble_discovery_en
                 .unwrap_or_else(|_| "unknown-local-peer".to_string());
             for candidate in discovery_candidate_pipeline.poll() {
                 log_info(&format!(
-                    "lan_route_selected endpoint={} bearer={} priority={} first_seen_unix_ms={} last_seen_unix_ms={} stale={}",
+                    "lan_route_selected endpoint={} source_subtype={} listener_port={} priority={} first_seen_unix_ms={} last_seen_unix_ms={} last_hello_attempt_unix_ms={} last_hello_success_unix_ms={} last_hello_failed_unix_ms={} identity_status={} delivery_eligible={} hint_only={} stale={}",
                     candidate.peer_endpoint,
                     discovery_bearer_label(&candidate.discovered_via),
+                    candidate
+                        .listener_port
+                        .map(|port| port.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
                     candidate.route_priority,
                     candidate.first_observed_at_unix_ms,
                     candidate.last_observed_at_unix_ms,
+                    candidate
+                        .last_hello_attempt_at_unix_ms
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    candidate
+                        .last_hello_success_at_unix_ms
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    candidate
+                        .last_hello_failed_at_unix_ms
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    candidate.peer_identity_status.as_str(),
+                    candidate.delivery_eligible,
+                    candidate.hint_only,
                     candidate.route_stale
                 ));
                 let resolved = BonjourResolvedPeer {
@@ -3288,6 +3329,16 @@ fn start_gossip_worker_if_needed(initial_enabled: bool, initial_ble_discovery_en
                     discovery_bearer_to_encounter_bearer(&candidate.discovered_via),
                     candidate.observed_at_unix_ms,
                 );
+                log_verbose(&format!(
+                    "lan_discovery_hello_attempt source_subtype={} endpoint={} listener_port={} last_hello_attempt_unix_ms={}",
+                    discovery_bearer_label(&candidate.discovered_via),
+                    candidate.peer_endpoint,
+                    candidate
+                        .listener_port
+                        .map(|port| port.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    now_unix_ms()
+                ));
                 if let Err(err) = maybe_trigger_bonjour_hello(
                     &socket,
                     &resolved,
@@ -3296,9 +3347,14 @@ fn start_gossip_worker_if_needed(initial_enabled: bool, initial_ble_discovery_en
                     &mut recent_bonjour_hello_by_peer,
                 ) {
                     log_error(&format!(
-                        "lan_discovery_hello_send_failed bearer={} endpoint={} error={}",
+                        "lan_discovery_hello_send_failed source_subtype={} endpoint={} listener_port={} last_hello_failed_unix_ms={} error={}",
                         discovery_bearer_label(&candidate.discovered_via),
                         candidate.peer_endpoint,
+                        candidate
+                            .listener_port
+                            .map(|port| port.to_string())
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        now_unix_ms(),
                         err
                     ));
                 }
@@ -3420,9 +3476,10 @@ fn create_discovery_candidate_pipeline() -> DiscoveryCandidatePipeline {
 
 fn discovery_bearer_label(bearer: &DiscoveryBearer) -> &'static str {
     match bearer {
-        DiscoveryBearer::Bonjour => "Bonjour",
-        DiscoveryBearer::IPv4Broadcast => "IPv4Broadcast",
-        DiscoveryBearer::Multicast => "Multicast",
+        DiscoveryBearer::Bonjour => "bonjour",
+        DiscoveryBearer::IPv4Broadcast => "ipv4_broadcast",
+        DiscoveryBearer::IPv4Multicast => "ipv4_multicast",
+        DiscoveryBearer::IPv6Multicast => "ipv6_multicast",
     }
 }
 
@@ -3430,7 +3487,9 @@ fn discovery_bearer_to_encounter_bearer(bearer: &DiscoveryBearer) -> BearerAdapt
     match bearer {
         DiscoveryBearer::Bonjour => BearerAdapter::LanDatagram,
         DiscoveryBearer::IPv4Broadcast => BearerAdapter::LanBroadcast,
-        DiscoveryBearer::Multicast => BearerAdapter::LanMulticast,
+        DiscoveryBearer::IPv4Multicast | DiscoveryBearer::IPv6Multicast => {
+            BearerAdapter::LanMulticast
+        }
     }
 }
 
@@ -3844,6 +3903,15 @@ fn handle_gossip_frame(
                 source_ip_key,
                 peer_node_by_addr.len(),
                 tcp_capable
+            ));
+            log_info(&format!(
+                "lan_route_hello_confirmed endpoint={} source_ip={} peer_identity={} identity_status={} delivery_eligible={} last_hello_success_unix_ms={}",
+                source,
+                source_ip_key,
+                hello.node_id,
+                DiscoveryPeerIdentityStatus::Verified.as_str(),
+                true,
+                now_unix_ms()
             ));
             if let Ok(summary) = build_gossip_summary_frame(now_unix_ms()) {
                 let _ =

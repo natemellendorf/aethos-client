@@ -20,6 +20,36 @@ impl DiscoveryBearer {
             Self::Bonjour => 2,
         }
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bonjour => "bonjour",
+            Self::IPv4Broadcast => "ipv4_broadcast",
+            Self::IPv4Multicast => "ipv4_multicast",
+            Self::IPv6Multicast => "ipv6_multicast",
+        }
+    }
+
+    pub fn is_hint_only(self) -> bool {
+        self == Self::Bonjour
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscoveryPeerIdentityStatus {
+    Unknown,
+    Claimed,
+    Verified,
+}
+
+impl DiscoveryPeerIdentityStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Claimed => "claimed",
+            Self::Verified => "verified",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -27,12 +57,19 @@ pub struct DiscoveryCandidate {
     pub candidate_id: String,
     pub peer_endpoint: SocketAddr,
     pub peer_identity: Option<String>,
+    pub peer_identity_status: DiscoveryPeerIdentityStatus,
     pub discovered_via: DiscoveryBearer,
+    pub listener_port: Option<u16>,
     pub observed_at_unix_ms: u64,
     pub first_observed_at_unix_ms: u64,
     pub last_observed_at_unix_ms: u64,
+    pub last_hello_attempt_at_unix_ms: Option<u64>,
+    pub last_hello_success_at_unix_ms: Option<u64>,
+    pub last_hello_failed_at_unix_ms: Option<u64>,
     pub route_priority: u8,
     pub route_stale: bool,
+    pub delivery_eligible: bool,
+    pub hint_only: bool,
     pub signal_quality_hint: Option<f32>,
 }
 
@@ -190,12 +227,19 @@ mod tests {
             candidate_id: format!("{ip}:{port}"),
             peer_endpoint,
             peer_identity: None,
+            peer_identity_status: DiscoveryPeerIdentityStatus::Unknown,
             discovered_via: bearer,
+            listener_port: Some(port),
             observed_at_unix_ms: unix_now_ms(),
             first_observed_at_unix_ms: unix_now_ms(),
             last_observed_at_unix_ms: unix_now_ms(),
+            last_hello_attempt_at_unix_ms: None,
+            last_hello_success_at_unix_ms: None,
+            last_hello_failed_at_unix_ms: None,
             route_priority: bearer.priority(),
             route_stale: false,
+            delivery_eligible: false,
+            hint_only: bearer.is_hint_only(),
             signal_quality_hint: None,
         }
     }
@@ -271,6 +315,53 @@ mod tests {
         assert_eq!(results[0].first_observed_at_unix_ms, initial_observed);
         assert!(results[0].last_observed_at_unix_ms >= initial_observed);
         assert!(!results[0].route_stale);
+    }
+
+    #[test]
+    fn candidate_preserves_source_attribution_metadata() {
+        let results = DiscoveryCandidatePipeline::new(
+            vec![Box::new(StubBearer::new(vec![make_candidate(
+                "192.168.1.20",
+                47655,
+                DiscoveryBearer::IPv4Broadcast,
+            )]))],
+            vec![],
+        )
+        .poll();
+
+        assert_eq!(results.len(), 1);
+        let candidate = &results[0];
+        assert_eq!(candidate.discovered_via, DiscoveryBearer::IPv4Broadcast);
+        assert_eq!(candidate.discovered_via.as_str(), "ipv4_broadcast");
+        assert_eq!(candidate.listener_port, Some(47655));
+        assert_eq!(
+            candidate.peer_identity_status,
+            DiscoveryPeerIdentityStatus::Unknown
+        );
+        assert_eq!(candidate.peer_identity_status.as_str(), "unknown");
+        assert_eq!(candidate.last_hello_attempt_at_unix_ms, None);
+        assert_eq!(candidate.last_hello_success_at_unix_ms, None);
+        assert_eq!(candidate.last_hello_failed_at_unix_ms, None);
+        assert!(!candidate.delivery_eligible);
+        assert!(!candidate.hint_only);
+    }
+
+    #[test]
+    fn bonjour_candidate_is_hint_only() {
+        let results = DiscoveryCandidatePipeline::new(
+            vec![Box::new(StubBearer::new(vec![make_candidate(
+                "192.168.1.20",
+                47655,
+                DiscoveryBearer::Bonjour,
+            )]))],
+            vec![],
+        )
+        .poll();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].discovered_via.as_str(), "bonjour");
+        assert!(results[0].hint_only);
+        assert!(!results[0].delivery_eligible);
     }
 
     #[test]
