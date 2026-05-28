@@ -305,6 +305,29 @@ mod tests {
     }
 
     #[test]
+    fn ipv6_multicast_and_broadcast_are_selected_before_bonjour_hints() {
+        let bonjour = make_candidate("192.168.1.22", 47655, DiscoveryBearer::Bonjour);
+        let broadcast = make_candidate("192.168.1.21", 47655, DiscoveryBearer::IPv4Broadcast);
+        let ipv6_multicast = make_candidate("fe80::1", 47655, DiscoveryBearer::IPv6Multicast);
+
+        let bearers: Vec<Box<dyn DiscoveryBearerSource>> = vec![
+            Box::new(StubBearer::new(vec![bonjour])),
+            Box::new(StubBearer::new(vec![broadcast])),
+            Box::new(StubBearer::new(vec![ipv6_multicast])),
+        ];
+
+        let mut pipeline = DiscoveryCandidatePipeline::new(bearers, vec![]);
+        let results = pipeline.poll();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].discovered_via, DiscoveryBearer::IPv6Multicast);
+        assert_eq!(results[1].discovered_via, DiscoveryBearer::IPv4Broadcast);
+        assert_eq!(results[2].discovered_via, DiscoveryBearer::Bonjour);
+        assert!(!results[0].hint_only);
+        assert!(!results[1].hint_only);
+        assert!(results[2].hint_only);
+    }
+
+    #[test]
     fn candidate_retains_route_observation_timestamps() {
         let c = make_candidate("192.168.1.20", 47655, DiscoveryBearer::IPv4Multicast);
         let initial_observed = c.observed_at_unix_ms;
