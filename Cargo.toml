@@ -36,7 +36,7 @@ qrcode = "0.14"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 rqrr = "0.9"
 rusqlite = { version = "0.32", features = ["bundled"] }
-socket2 = "0.5"
+socket2 = { version = "0.5", features = ["all"] }
 
 flume = "0.11"
 mdns-sd = "0.18"

@@ -3459,6 +3459,16 @@ fn create_bonjour_discovery() -> BonjourLanDiscovery {
 
 fn create_discovery_candidate_pipeline() -> DiscoveryCandidatePipeline {
     let local_endpoints = local_ipv4_addrs();
+    let pipeline_local_endpoints = if gossip_localhost_fanout_enabled() || gossip_loopback_only_enabled()
+    {
+        local_endpoints
+            .iter()
+            .copied()
+            .filter(|addr| !addr.is_loopback())
+            .collect()
+    } else {
+        local_endpoints.clone()
+    };
     let gossip_port = gossip_lan_port();
     let bearers: Vec<Box<dyn DiscoveryBearerSource>> = vec![
         Box::new(BonjourDiscoveryCandidateSource::new()),
@@ -3471,7 +3481,7 @@ fn create_discovery_candidate_pipeline() -> DiscoveryCandidatePipeline {
             local_endpoints.clone(),
         )),
     ];
-    DiscoveryCandidatePipeline::new(bearers, local_endpoints)
+    DiscoveryCandidatePipeline::new(bearers, pipeline_local_endpoints)
 }
 
 fn discovery_bearer_label(bearer: &DiscoveryBearer) -> &'static str {
@@ -3734,6 +3744,13 @@ fn bind_gossip_socket() -> Result<UdpSocket, String> {
     socket
         .set_reuse_address(true)
         .map_err(|err| format!("set_reuse_address failed: {err}"))?;
+    #[cfg(all(
+        unix,
+        not(any(target_os = "solaris", target_os = "illumos", target_os = "cygwin"))
+    ))]
+    socket
+        .set_reuse_port(true)
+        .map_err(|err| format!("set_reuse_port failed: {err}"))?;
     let buffer_bytes = gossip_udp_socket_buffer_bytes();
     let _ = socket.set_recv_buffer_size(buffer_bytes);
     let _ = socket.set_send_buffer_size(buffer_bytes);
