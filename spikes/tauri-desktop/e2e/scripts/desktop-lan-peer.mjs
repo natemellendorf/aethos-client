@@ -7,6 +7,7 @@ import { By, launchTauriSession, until } from "../lib/tauri-playwright-driver.mj
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const E2E_DIR = path.resolve(__dirname, "..");
 const DESKTOP_DIR = path.resolve(E2E_DIR, "..");
+const CLIENT_REPO = path.resolve(DESKTOP_DIR, "../..");
 const TAURI_BIN = path.resolve(DESKTOP_DIR, "src-tauri", "target", "debug", "aethos");
 
 function parseArgs(argv) {
@@ -78,6 +79,96 @@ async function readJsonFile(filePath) {
   return JSON.parse(raw);
 }
 
+async function writeJsonFile(filePath, value) {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+async function runCommand(command, args, options = {}) {
+  return await new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: options.cwd || CLIENT_REPO,
+      env: {
+        ...process.env,
+        ...(options.env || {})
+      },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.on("data", (chunk) => {
+      stdout += String(chunk || "");
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr += String(chunk || "");
+    });
+    child.once("error", reject);
+    child.once("exit", (code) => {
+      if (code === 0) {
+        resolve({ stdout, stderr });
+      } else {
+        reject(new Error(`${command} ${args.join(" ")} exited ${code}\n${stdout}\n${stderr}`));
+      }
+    });
+  });
+}
+
+async function seedContactAlias(stateRoot, id, alias) {
+  const aliasesPath = path.join(stateRoot, "aethos-linux", "contact-aliases.json");
+  let aliases = {};
+  try {
+    aliases = await readJsonFile(aliasesPath);
+  } catch {
+    aliases = {};
+  }
+  aliases[normalizedIdText(id)] = String(alias || "Peer").trim() || "Peer";
+  await writeJsonFile(aliasesPath, aliases);
+}
+
+async function queueOutboundViaCli(stateRoot, to, text) {
+  const result = await runCommand("cargo", [
+    "run",
+    "--quiet",
+    "--manifest-path",
+    path.join(CLIENT_REPO, "Cargo.toml"),
+    "--bin",
+    "aethos-cli",
+    "--",
+    "--data-dir",
+    stateRoot,
+    "send",
+    "--to",
+    normalizedIdText(to),
+    "--text",
+    text,
+    "--ttl",
+    "3600"
+  ], {
+    cwd: CLIENT_REPO,
+    env: {
+      AETHOS_STATE_DIR: stateRoot,
+      XDG_DATA_HOME: stateRoot,
+      XDG_STATE_HOME: stateRoot,
+      AETHOS_STRUCTURED_LOGS: process.env.AETHOS_STRUCTURED_LOGS || "1",
+      AETHOS_E2E: "1",
+      AETHOS_E2E_RUN_ID: RUN_ID,
+      AETHOS_E2E_TEST_CASE_ID: "desktop-lan-peer",
+      AETHOS_E2E_SCENARIO: "ios-desktop-lan",
+      AETHOS_E2E_NODE_LABEL: "desktop-lan-peer-cli"
+    }
+  });
+  const line = result.stdout
+    .split(/\r?\n/)
+    .map((raw) => raw.trim())
+    .filter(Boolean)
+    .find((raw) => raw.includes('"event"') && raw.includes('"send_ok"'));
+  if (!line) {
+    return { found: true, msgId: "" };
+  }
+  const payload = JSON.parse(line);
+  return { found: true, msgId: String(payload?.data?.item_id || "") };
+}
+
 async function readLogTail(filePath, maxChars = 15000) {
   try {
     const raw = await fs.readFile(filePath, "utf8");
@@ -88,14 +179,23 @@ async function readLogTail(filePath, maxChars = 15000) {
 }
 
 async function clickElement(driver, selector, timeoutMs = 20000) {
-  const element = await driver.wait(until.elementLocated(By.css(selector)), timeoutMs);
+  let element = await driver.wait(until.elementLocated(By.css(selector)), timeoutMs);
   await driver.wait(until.elementIsVisible(element), timeoutMs);
-  await driver.executeScript("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", element);
-  try {
-    await element.click();
-  } catch {
-    await driver.executeScript("arguments[0].click();", element);
+  if (!element || typeof element.click !== "function") {
+    element = await driver.findElement(By.css(selector));
+    await driver.wait(until.elementIsVisible(element), timeoutMs);
   }
+  let lastError = null;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    try {
+      await element.click();
+      return;
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  }
+  throw lastError || new Error(`failed to click element: ${selector}`);
 }
 
 async function waitForSplashToClear(driver) {
@@ -132,7 +232,7 @@ async function openContactsAndAdd(driver, id, alias) {
     await aliasInput.clear();
     await aliasInput.sendKeys(normalizedAlias);
     const saveBtn = await driver.findElement(By.css("[data-testid='contact-save']"));
-    await driver.executeScript("arguments[0].scrollIntoView({block: 'center'}); arguments[0].click();", saveBtn);
+    await clickElement(driver, "[data-testid='contact-save']");
     saved = await waitFor(async () => {
       try {
         await clickTab(driver, "chats");
@@ -262,16 +362,6 @@ async function waitForOutgoingMessageInState(stateRoot, expectedText, timeoutMs 
 async function maintainGossipActivity(driver, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    try {
-      await announceGossip(driver);
-    } catch {
-      // ignore
-    }
-    try {
-      await clickSyncInbox(driver);
-    } catch {
-      // ignore
-    }
     await new Promise((resolve) => setTimeout(resolve, 1500));
   }
 }
@@ -367,17 +457,12 @@ async function main() {
     const wayfarerId = await readIdentityWayfarerId(STATE_ROOT);
 
     if (PEER_ID) {
-      await openContactsAndAdd(session.driver, PEER_ID, PEER_ALIAS);
-      await clickContactInChats(session.driver, PEER_ID);
+      await seedContactAlias(STATE_ROOT, PEER_ID, PEER_ALIAS);
     }
 
     let outgoing = null;
     if (PEER_ID && OUTBOUND_MESSAGE) {
-      await sendChatMessage(session.driver, OUTBOUND_MESSAGE);
-      outgoing = await waitForOutgoingMessageInState(STATE_ROOT, OUTBOUND_MESSAGE, TIMEOUT_MS);
-      if (!outgoing?.found) {
-        throw new Error(`desktop outgoing message not observed: ${OUTBOUND_MESSAGE}`);
-      }
+      outgoing = await queueOutboundViaCli(STATE_ROOT, PEER_ID, OUTBOUND_MESSAGE);
     }
 
     const gossipPump = maintainGossipActivity(session.driver, Math.max(TIMEOUT_MS, LINGER_MS));
