@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
@@ -130,6 +130,8 @@ pub struct PersistedChatState {
     #[serde(alias = "new_contacts")]
     #[serde(default)]
     pub new_contacts: Vec<String>,
+    #[serde(default)]
+    pub auto_pong_by_inbound_ping_item_id: BTreeMap<String, String>,
     pub threads: BTreeMap<String, Vec<ChatMessage>>,
 }
 
@@ -138,6 +140,7 @@ impl Default for PersistedChatState {
         Self {
             selected_contact: None,
             new_contacts: Vec::new(),
+            auto_pong_by_inbound_ping_item_id: BTreeMap::new(),
             threads: BTreeMap::new(),
         }
     }
@@ -429,6 +432,23 @@ fn normalize_settings(settings: &mut AppSettings) {
 pub fn normalize_chat_state(chat: &mut PersistedChatState) {
     chat.new_contacts.sort();
     chat.new_contacts.dedup();
+
+    let inbound_ping_item_ids: BTreeSet<String> = chat
+        .threads
+        .values()
+        .flat_map(|thread| {
+            thread
+                .iter()
+                .filter(|message| {
+                    matches!(message.direction, ChatDirection::Incoming)
+                        && message.text.trim() == "/ping"
+                })
+                .map(|message| message.msg_id.clone())
+        })
+        .collect();
+
+    chat.auto_pong_by_inbound_ping_item_id
+        .retain(|inbound_item_id, _| inbound_ping_item_ids.contains(inbound_item_id));
 }
 
 fn normalize_encounter_activity_state(state: &mut EncounterActivityState) {

@@ -5224,7 +5224,7 @@ fn merge_pulled_messages(
         .map(|identity| identity.wayfarer_id);
     let author_signing_seed = load_local_signing_key_seed().ok();
 
-    let mut auto_pong_targets = BTreeSet::new();
+    let mut auto_pong_targets: Vec<(String, String)> = Vec::new();
     let mut outcome = MergePulledOutcome::default();
     for pulled in pulled_messages {
         if let (Some(local_wayfarer_id), Some(author_signing_seed)) =
@@ -5287,13 +5287,22 @@ fn merge_pulled_messages(
 
                 let seen_on_insert =
                     chat.selected_contact.as_deref() == Some(sender_label.as_str());
+                let inbound_ping_item_id = pulled.item_id.clone();
                 let thread = chat.threads.entry(sender_label.clone()).or_default();
                 let exists = thread.iter().any(|existing| {
-                    existing.msg_id == pulled.item_id
+                    existing.msg_id == inbound_ping_item_id
                         || (pulled.manifest_id_hex.is_some()
                             && existing.manifest_id_hex == pulled.manifest_id_hex)
                 });
                 if exists {
+                    if is_valid_wayfarer_id(&sender_label)
+                        && is_ping_only_chat_text(chat_payload.text.as_str())
+                    {
+                        log_info(&format!(
+                            "auto_pong_suppressed: inbound_ping_item_id={} sender_peer_id={} reason=duplicate_inbound_ping_already_in_thread",
+                            inbound_ping_item_id, sender_label
+                        ));
+                    }
                     continue;
                 }
 
@@ -5323,9 +5332,18 @@ fn merge_pulled_messages(
                     && is_ping_only_chat_text(
                         thread.last().map(|msg| msg.text.as_str()).unwrap_or(""),
                     )
-                    && !thread_has_recent_outgoing_pong(thread)
                 {
-                    auto_pong_targets.insert(sender_label.clone());
+                    if chat
+                        .auto_pong_by_inbound_ping_item_id
+                        .contains_key(&inbound_ping_item_id)
+                    {
+                        log_info(&format!(
+                            "auto_pong_suppressed: inbound_ping_item_id={} sender_peer_id={} reason=already_handled_inbound_ping",
+                            inbound_ping_item_id, sender_label
+                        ));
+                    } else {
+                        auto_pong_targets.push((sender_label.clone(), inbound_ping_item_id));
+                    }
                 }
 
                 if chat.selected_contact.is_none() {
@@ -5366,11 +5384,11 @@ fn merge_pulled_messages(
         }
     }
 
-    for target in auto_pong_targets {
-        if let Err(err) = queue_auto_pong_message(chat, &target) {
+    for (target, inbound_ping_item_id) in auto_pong_targets {
+        if let Err(err) = queue_auto_pong_message(chat, &target, &inbound_ping_item_id) {
             log_info(&format!(
-                "auto_pong_queue_failed: to={} error={}",
-                target, err
+                "auto_pong_queue_failed: inbound_ping_item_id={} to={} error={}",
+                inbound_ping_item_id, target, err
             ));
         } else {
             outcome.chat_changed = true;
@@ -5387,16 +5405,11 @@ fn is_ping_only_chat_text(text: &str) -> bool {
     text.trim() == "/ping"
 }
 
-fn thread_has_recent_outgoing_pong(thread: &[ChatMessage]) -> bool {
-    let now = now_unix_secs();
-    thread.iter().rev().any(|message| {
-        matches!(message.direction, ChatDirection::Outgoing)
-            && message.text.trim() == "/pong"
-            && now.saturating_sub(message.created_at_unix) <= 30
-    })
-}
-
-fn queue_auto_pong_message(chat: &mut PersistedChatState, wayfarer_id: &str) -> Result<(), String> {
+fn queue_auto_pong_message(
+    chat: &mut PersistedChatState,
+    wayfarer_id: &str,
+    inbound_ping_item_id: &str,
+) -> Result<(), String> {
     if !is_valid_wayfarer_id(wayfarer_id) {
         return Ok(());
     }
@@ -5446,10 +5459,12 @@ fn queue_auto_pong_message(chat: &mut PersistedChatState, wayfarer_id: &str) -> 
         media: None,
     });
     sort_thread_messages(thread);
+    chat.auto_pong_by_inbound_ping_item_id
+        .insert(inbound_ping_item_id.to_string(), item_id.clone());
 
     log_info(&format!(
-        "auto_pong_queued: to={} item_id={} ttl_s={}",
-        wayfarer_id, item_id, settings.message_ttl_seconds
+        "auto_pong_queued: inbound_ping_item_id={} sender_peer_id={} generated_pong_item_id={} ttl_s={}",
+        inbound_ping_item_id, wayfarer_id, item_id, settings.message_ttl_seconds
     ));
 
     Ok(())
@@ -6693,6 +6708,124 @@ mod tests {
             assert!(thread.iter().any(|msg| {
                 matches!(msg.direction, ChatDirection::Outgoing) && msg.text.trim() == "/pong"
             }));
+            assert_eq!(chat.auto_pong_by_inbound_ping_item_id.len(), 1);
+        });
+    }
+
+    #[test]
+    fn merge_pulled_messages_queues_distinct_auto_pongs_for_distinct_ping_items() {
+        let _lock = shared_test_env_lock().lock().expect("lock");
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aethos-tauri-test-auto-pong-distinct-{}",
+            rand::random::<u64>()
+        ));
+
+        with_state_dir(&temp_dir, || {
+            let _ = ensure_local_identity().expect("ensure identity");
+            let mut chat = PersistedChatState::default();
+            let mut contacts = BTreeMap::new();
+            let sender = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            let ping_a = build_wayfarer_chat_body("/ping", now_unix_ms()).expect("build ping a");
+            let ping_b = build_wayfarer_chat_body("/ping", now_unix_ms().saturating_add(1))
+                .expect("build ping b");
+            let pulled = vec![
+                crate::relay::client::EncounterMessagePreview {
+                    author_wayfarer_id: Some(sender.to_string()),
+                    session_peer: None,
+                    transport_peer: None,
+                    item_id: "f111111111111111111111111111111111111111111111111111111111111111"
+                        .to_string(),
+                    body_bytes: ping_a,
+                    text: String::new(),
+                    received_at_unix: now_unix_secs(),
+                    manifest_id_hex: None,
+                },
+                crate::relay::client::EncounterMessagePreview {
+                    author_wayfarer_id: Some(sender.to_string()),
+                    session_peer: None,
+                    transport_peer: None,
+                    item_id: "f222222222222222222222222222222222222222222222222222222222222222"
+                        .to_string(),
+                    body_bytes: ping_b,
+                    text: String::new(),
+                    received_at_unix: now_unix_secs(),
+                    manifest_id_hex: None,
+                },
+            ];
+
+            merge_pulled_messages(&mut chat, &mut contacts, pulled);
+
+            let thread = chat.threads.get(sender).expect("thread should exist");
+            let outgoing_pongs: Vec<&ChatMessage> = thread
+                .iter()
+                .filter(|msg| {
+                    matches!(msg.direction, ChatDirection::Outgoing) && msg.text.trim() == "/pong"
+                })
+                .collect();
+            assert_eq!(
+                outgoing_pongs.len(),
+                2,
+                "each distinct ping should queue a pong"
+            );
+            assert_ne!(
+                outgoing_pongs[0].msg_id, outgoing_pongs[1].msg_id,
+                "distinct auto-pongs must have distinct item IDs"
+            );
+            assert_eq!(chat.auto_pong_by_inbound_ping_item_id.len(), 2);
+        });
+    }
+
+    #[test]
+    fn merge_pulled_messages_does_not_duplicate_auto_pong_for_same_ping_item() {
+        let _lock = shared_test_env_lock().lock().expect("lock");
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aethos-tauri-test-auto-pong-idempotent-{}",
+            rand::random::<u64>()
+        ));
+
+        with_state_dir(&temp_dir, || {
+            let _ = ensure_local_identity().expect("ensure identity");
+            let mut chat = PersistedChatState::default();
+            let mut contacts = BTreeMap::new();
+            let sender = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            let ping = build_wayfarer_chat_body("/ping", now_unix_ms()).expect("build ping");
+            let pulled = vec![crate::relay::client::EncounterMessagePreview {
+                author_wayfarer_id: Some(sender.to_string()),
+                session_peer: None,
+                transport_peer: None,
+                item_id: "f333333333333333333333333333333333333333333333333333333333333333"
+                    .to_string(),
+                body_bytes: ping.clone(),
+                text: String::new(),
+                received_at_unix: now_unix_secs(),
+                manifest_id_hex: None,
+            }];
+
+            merge_pulled_messages(&mut chat, &mut contacts, pulled.clone());
+            merge_pulled_messages(&mut chat, &mut contacts, pulled);
+
+            let thread = chat.threads.get(sender).expect("thread should exist");
+            let incoming_pings = thread
+                .iter()
+                .filter(|msg| {
+                    matches!(msg.direction, ChatDirection::Incoming) && msg.text.trim() == "/ping"
+                })
+                .count();
+            let outgoing_pongs = thread
+                .iter()
+                .filter(|msg| {
+                    matches!(msg.direction, ChatDirection::Outgoing) && msg.text.trim() == "/pong"
+                })
+                .count();
+            assert_eq!(
+                incoming_pings, 1,
+                "duplicate inbound object should not duplicate insert"
+            );
+            assert_eq!(
+                outgoing_pongs, 1,
+                "duplicate inbound object should not duplicate auto-pong"
+            );
+            assert_eq!(chat.auto_pong_by_inbound_ping_item_id.len(), 1);
         });
     }
 

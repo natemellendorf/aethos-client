@@ -187,6 +187,39 @@ async function waitForOutgoingMessageInState(stateRoot, expectedText) {
   }, 120000, 700);
 }
 
+async function waitForOutgoingMessageCountInState(stateRoot, expectedText, expectedCount, timeoutMs = 120000) {
+  const chatPath = path.join(stateRoot, "chat-history.json");
+  return waitFor(async () => {
+    try {
+      const chat = await readJsonFile(chatPath);
+      const matches = [];
+      for (const thread of Object.values(chat?.threads || {})) {
+        for (const msg of thread || []) {
+          if (msg?.direction === "Outgoing" && String(msg?.text || "") === expectedText) {
+            matches.push({
+              msgId: msg?.msgId || "",
+              threadKey:
+                Object.keys(chat?.threads || {}).find((key) =>
+                  (chat.threads[key] || []).some((m) => m?.msgId === msg?.msgId)
+                ) || ""
+            });
+          }
+        }
+      }
+      if (matches.length >= expectedCount) {
+        return {
+          found: true,
+          count: matches.length,
+          messages: matches
+        };
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }, timeoutMs, 700);
+}
+
 async function incomingMessagesByPrefix(stateRoot, prefix) {
   const chatPath = path.join(stateRoot, "chat-history.json");
   const chat = await readJsonFile(chatPath);
@@ -1097,6 +1130,78 @@ describe("dual instance gossip e2e", function () {
 
       const pongInboundOnA = await waitForIncomingMessageInState(a.stateRoot, "/pong");
       expect(Boolean(pongInboundOnA?.found)).to.equal(true);
+    } finally {
+      await closeSession(a);
+      await closeSession(b);
+    }
+  });
+
+  it("auto-responds once per distinct /ping object and suppresses duplicate object reprocessing", async function () {
+    this.timeout(TEST_TIMEOUT_MS);
+
+    let a;
+    let b;
+    try {
+      a = await openTauriSession("a", stateRootPath("ping-repeat-a"), SOCKET_A);
+      b = await openTauriSession("b", stateRootPath("ping-repeat-b"), SOCKET_B);
+
+      await waitForSplashToClear(a.driver);
+      await waitForSplashToClear(b.driver);
+
+      const idA = await readIdentityWayfarerId(a.stateRoot);
+      const idB = await readIdentityWayfarerId(b.stateRoot);
+      expect(idA).to.not.equal(idB);
+
+      await openContactsAndAdd(a.driver, idB, "Peer B");
+      await openContactsAndAdd(b.driver, idA, "Peer A");
+      await clickContactInChats(a.driver, idB);
+      await clickContactInChats(b.driver, idA);
+
+      await sendChatMessage(a.driver, "/ping");
+      await clickSyncInbox(a.driver);
+      await clickSyncInbox(b.driver);
+      const firstPingInboundOnB = await waitForIncomingMessageInState(b.stateRoot, "/ping");
+      expect(Boolean(firstPingInboundOnB?.found)).to.equal(true);
+
+      await sendChatMessage(a.driver, "/ping");
+      await clickSyncInbox(a.driver);
+      await clickSyncInbox(b.driver);
+
+      const pongOutboundCountOnB = await waitForOutgoingMessageCountInState(b.stateRoot, "/pong", 2, 180000);
+      expect(Boolean(pongOutboundCountOnB?.found)).to.equal(true);
+      const firstPongId = String(pongOutboundCountOnB?.messages?.[0]?.msgId || "");
+      const secondPongId = String(pongOutboundCountOnB?.messages?.[1]?.msgId || "");
+      expect(firstPongId.length > 0 && secondPongId.length > 0).to.equal(true);
+      expect(firstPongId).to.not.equal(secondPongId);
+
+      await clickSyncInbox(a.driver);
+      await clickSyncInbox(b.driver);
+
+      const chatA = await readJsonFile(path.join(a.stateRoot, "chat-history.json"));
+      const inboundPongsOnA = [];
+      for (const thread of Object.values(chatA?.threads || {})) {
+        for (const msg of thread || []) {
+          if (msg?.direction === "Incoming" && String(msg?.text || "") === "/pong") {
+            inboundPongsOnA.push(String(msg?.msgId || ""));
+          }
+        }
+      }
+      const uniqueInboundPongIds = new Set(inboundPongsOnA.filter((id) => id.length > 0));
+      expect(uniqueInboundPongIds.size).to.be.at.least(2);
+
+      const chatB = await readJsonFile(path.join(b.stateRoot, "chat-history.json"));
+      const autoPongMap = chatB?.autoPongByInboundPingItemId || {};
+      expect(Object.keys(autoPongMap).length).to.be.at.least(2);
+      const mappedPongIds = new Set(Object.values(autoPongMap).map((id) => String(id || "")).filter((id) => id.length > 0));
+      expect(mappedPongIds.size).to.be.at.least(2);
+
+      const logTailB = await readLogTail(b.logPath, 120000);
+      const queuedMatches = logTailB.match(/auto_pong_queued: inbound_ping_item_id=.* generated_pong_item_id=/g) || [];
+      expect(queuedMatches.length).to.be.at.least(2);
+
+      const duplicateSuppressed = /auto_pong_suppressed: inbound_ping_item_id=.* reason=duplicate_inbound_ping_already_in_thread/.test(logTailB)
+        || /auto_pong_suppressed: inbound_ping_item_id=.* reason=already_handled_inbound_ping/.test(logTailB);
+      expect(duplicateSuppressed).to.equal(true);
     } finally {
       await closeSession(a);
       await closeSession(b);
